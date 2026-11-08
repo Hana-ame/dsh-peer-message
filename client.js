@@ -185,6 +185,32 @@ window.__ModuleLoader__.load({
       '.pm-peer-error{color:var(--dsw-alias-state-error-primary,#ef4444);font-size:11px;margin-top:4px;}',
     ].join('');
 
+    // ── 侧栏未读徽标共享 store ──────────────────────────────────────────
+    // Panel 与 sidebar 图标是两棵独立的 React 子树（一个在 main，一个在
+    // sidebar.panellist），不能共享 props/state。用模块级发布/订阅把好友
+    // 未读总数推给 sidebar 图标：panel 在每次 state 持久化时 publish，
+    // 图标 subscribe 后 setState 触发重渲染。
+    const pmUnreadStore = {
+      total: 0,
+      listeners: new Set(),
+      publish(total) {
+        if (total === this.total) return;
+        this.total = total;
+        for (const fn of this.listeners) { try { fn(total); } catch (e) { /* ignore */ } }
+      },
+      subscribe(fn) {
+        this.listeners.add(fn);
+        // 订阅时立即推送当前值，避免 mount 顺序问题（panel 先 publish 后图标才订阅）
+        try { fn(this.total); } catch (e) { /* ignore */ }
+        return () => { this.listeners.delete(fn); };
+      },
+    };
+
+    // 计算好友未读总数（面板内使用）
+    function computeUnreadTotal(friends) {
+      return (friends || []).reduce((sum, f) => sum + (f.unread || 0), 0);
+    }
+
     // ── 工具函数 ────────────────────────────────────────────────────────
     function avatarColor(id) {
       let hash = 0;
@@ -198,12 +224,16 @@ window.__ModuleLoader__.load({
       return id.length > 8 ? id.slice(0, 8) : id;
     }
 
-    // 校验 peer id 格式：必须带合法前缀且在长度区间内（防恶意/伪造 id）。
+    // 校验 peer id 格式：必须带合法前缀、在长度区间内、且只含 base36/连字符
+    // （防恶意/伪造 id，阻断 HTML/JS 注入、路径穿越、空格等非法字节）。
+    const PEER_ID_BODY_RE = /^[a-z0-9-]+$/;
     function isValidPeerId(id) {
       if (!id || typeof id !== 'string') return false;
       if (!id.startsWith(PEER_ID_PREFIX)) return false;
       const len = id.length;
-      return len >= PEER_ID_MIN_LEN && len <= PEER_ID_MAX_LEN;
+      if (len < PEER_ID_MIN_LEN || len > PEER_ID_MAX_LEN) return false;
+      if (!PEER_ID_BODY_RE.test(id.slice(PEER_ID_PREFIX.length))) return false;
+      return true;
     }
 
     // 清洗入站/出站文本：强制字符串、剥离控制字符、截断到上限（防超大 payload）。
@@ -266,6 +296,12 @@ window.__ModuleLoader__.load({
       activeRef.current = activeFriend;
       myIdRef.current = myId;
 
+      // 挂载时发布初始未读总数（loadState 可能已有未读消息）
+      React.useEffect(() => {
+        pmUnreadStore.publish(computeUnreadTotal(stateRef.current.friends));
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, []);
+
       // toast
       const showToast = React.useCallback((msg) => {
         setToast(msg);
@@ -278,6 +314,8 @@ window.__ModuleLoader__.load({
         setState(prev => {
           const next = typeof updater === 'function' ? updater(prev) : updater;
           saveState(next);
+          // 同步侧栏未读徽标（panel 与 sidebar 图标是独立子树）
+          pmUnreadStore.publish(computeUnreadTotal(next.friends));
           return next;
         });
       }, []);
@@ -789,14 +827,34 @@ window.__ModuleLoader__.load({
 
     // ── 侧边栏图标组件 ─────────────────────────────────────────────────
     function PeerMessageIcon({ size, active }) {
-      return h('svg', {
-        viewBox: '0 0 24 24', width: size || 18, height: size || 18,
-        fill: 'none', stroke: 'currentColor', strokeWidth: 1.8,
-        strokeLinecap: 'round', strokeLinejoin: 'round',
-        style: { display: 'block', opacity: active ? 1 : 0.85 },
-      },
-        h('path', { d: 'M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z' }),
-        h('path', { d: 'M8 10h.01M12 10h.01M16 10h.01' }),
+      // 初始未读总数：直接从 localStorage 读取（panel 未挂载时也能显示正确徽标），
+      // 再订阅 store 接收 panel persist 的后续更新。
+      const [unread, setUnread] = React.useState(() => {
+        try {
+          const st = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+          return computeUnreadTotal(st && st.friends);
+        } catch (e) { return 0; }
+      });
+      React.useEffect(() => pmUnreadStore.subscribe(setUnread), []);
+      return h('span', { style: { position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' } },
+        h('svg', {
+          viewBox: '0 0 24 24', width: size || 18, height: size || 18,
+          fill: 'none', stroke: 'currentColor', strokeWidth: 1.8,
+          strokeLinecap: 'round', strokeLinejoin: 'round',
+          style: { display: 'block', opacity: active ? 1 : 0.85 },
+        },
+          h('path', { d: 'M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z' }),
+          h('path', { d: 'M8 10h.01M12 10h.01M16 10h.01' }),
+        ),
+        unread > 0 ? h('span', {
+          style: {
+            position: 'absolute', top: -4, right: -6,
+            minWidth: 15, height: 15, padding: '0 4px',
+            borderRadius: 8, background: 'var(--dsw-alias-state-error-primary,#ef4444)',
+            color: '#fff', fontSize: 9, fontWeight: 600, lineHeight: '15px',
+            textAlign: 'center', boxSizing: 'border-box',
+          },
+        }, unread > 99 ? '99+' : String(unread)) : null,
       );
     }
 

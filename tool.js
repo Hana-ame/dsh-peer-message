@@ -33,7 +33,7 @@ export const inject = ['tools'];
  * them. The agent-team / schedule tools are registered in the agent's OWN
  * layer and cannot be removed by `restrict` (an architectural limit).
  */
-const DENY_GLOBAL = [
+export const DENY_GLOBAL = [
   // Browser automation (dsh-browser, Host plane).
   'browser_open', 'browser_navigate', 'browser_click', 'browser_type',
   'browser_select', 'browser_screenshot', 'browser_eval', 'browser_get_html',

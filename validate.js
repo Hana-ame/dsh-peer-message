@@ -10,6 +10,9 @@
 /** Legal peer ID prefix. */
 export const PEER_ID_PREFIX = 'dsh-pm-';
 
+/** Legal peer ID body charset: lowercase base36 plus the dash separator. */
+const PEER_ID_BODY_RE = /^[a-z0-9-]+$/;
+
 /**
  * Legal peer ID length bounds. Real IDs look like `dsh-pm-<8rand>-<6ts>`
  * (~24 chars), so the lower bound of 16 rejects a bare 7-char prefix.
@@ -29,7 +32,12 @@ export function isValidPeerId(id) {
   if (!id || typeof id !== 'string') return false;
   if (!id.startsWith(PEER_ID_PREFIX)) return false;
   const len = id.length;
-  return len >= PEER_ID_MIN_LEN && len <= PEER_ID_MAX_LEN;
+  if (len < PEER_ID_MIN_LEN || len > PEER_ID_MAX_LEN) return false;
+  // Reject any character outside the legal lowercase-base36/dash body: this
+  // blocks HTML/JS injection payloads, path traversal, spaces, and other
+  // unexpected bytes that a well-formed PeerJS ID never contains.
+  if (!PEER_ID_BODY_RE.test(id.slice(PEER_ID_PREFIX.length))) return false;
+  return true;
 }
 
 /**
