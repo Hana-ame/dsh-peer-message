@@ -168,7 +168,8 @@ window.__ModuleLoader__.load({
       '.pm-modal{background:var(--dsw-alias-bg-overlay,var(--dsw-alias-bg-layer-1,#fff));border-radius:12px;padding:24px;width:320px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,.3);display:flex;flex-direction:column;gap:16px;align-items:center;}',
       '.pm-modal-title{font-size:15px;font-weight:600;}',
       '.pm-modal-close{position:absolute;top:10px;right:10px;}',
-      '.pm-qr-box{padding:12px;background:#fff;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.2));}',
+      // QR 背景/前景跟随主题：浅色=白底黑块，深色=深底浅块（反色），避免深色模式白盒刺眼。
+      '.pm-qr-box{padding:12px;background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.08));color:var(--dsw-alias-label-primary,inherit);border-radius:8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.2));}',
       '.pm-modal-id{font-family:monospace;font-size:12px;word-break:break-all;text-align:center;color:var(--dsw-alias-label-secondary,inherit);background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.08));padding:8px 12px;border-radius:6px;width:100%;}',
       '.pm-modal-btns{display:flex;gap:8px;width:100%;}',
       '.pm-btn{padding:6px 16px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.3));background:transparent;color:var(--dsw-alias-label-primary,inherit);font-size:12px;cursor:pointer;flex:1;}',
@@ -647,7 +648,7 @@ window.__ModuleLoader__.load({
             let svgStr = `<svg xmlns="http://www.w3.org/2000/svg" width="${count*cellSize}" height="${count*cellSize}" viewBox="0 0 ${count} ${count}" shape-rendering="crispEdges">`;
             for (let r = 0; r < count; r++) {
               for (let c = 0; c < count; c++) {
-                if (qr.isDark(r, c)) svgStr += `<rect x="${c}" y="${r}" width="1" height="1" fill="#000"/>`;
+                if (qr.isDark(r, c)) svgStr += `<rect x="${c}" y="${r}" width="1" height="1" fill="currentColor"/>`;
               }
             }
             svgStr += '</svg>';
