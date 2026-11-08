@@ -41,6 +41,17 @@ window.__ModuleLoader__.load({
     const PANEL_ID = 'peer-message';
     const STORAGE_KEY = 'dsh-peer-message-state-v1';
 
+    // ── 安全边界（攻防加固） ────────────────────────────────────────────
+    // 最大单条文本长度；超过则截断，防止超大 payload 撑爆内存/渲染。
+    const MAX_TEXT_LEN = 4096;
+    // 合法 peer id 前缀；不符合的入站/出站 id 直接拒绝。
+    const PEER_ID_PREFIX = 'dsh-pm-';
+    // 合法 peer id 最小/最大长度（如 dsh-pm-<rand8>-<ts>）。
+    const PEER_ID_MIN_LEN = 8;
+    const PEER_ID_MAX_LEN = 64;
+    // 只接受已知好友的连接（防陌生/恶意 peer 未经邀请即连入）。
+    const ALLOW_STRANGER_CONN = false;
+
     // 默认 PeerJS 云服务器；可通过 config 覆盖
     const DEFAULT_PEER_CONFIG = {
       debug: 1,
@@ -65,6 +76,18 @@ window.__ModuleLoader__.load({
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
       } catch (e) { /* ignore */ }
+    }
+
+    // 固定 Peer ID：首次生成后存入 localStorage，跨页面刷新/重启不变
+    const PEER_ID_KEY = 'dsh-peer-message-peer-id-v1';
+    function getStablePeerId() {
+      let id = null;
+      try { id = localStorage.getItem(PEER_ID_KEY); } catch (e) { /* ignore */ }
+      if (!id) {
+        id = 'dsh-pm-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36);
+        try { localStorage.setItem(PEER_ID_KEY, id); } catch (e) { /* ignore */ }
+      }
+      return id;
     }
 
     // 把一条投递失败的消息放回 host 队列（POST 回 /api/pm-outbox）
@@ -171,6 +194,22 @@ window.__ModuleLoader__.load({
       return id.length > 8 ? id.slice(0, 8) : id;
     }
 
+    // 校验 peer id 格式：必须带合法前缀且在长度区间内（防恶意/伪造 id）。
+    function isValidPeerId(id) {
+      if (!id || typeof id !== 'string') return false;
+      if (!id.startsWith(PEER_ID_PREFIX)) return false;
+      const len = id.length;
+      return len >= PEER_ID_MIN_LEN && len <= PEER_ID_MAX_LEN;
+    }
+
+    // 清洗入站/出站文本：强制字符串、剥离控制字符、截断到上限（防超大 payload）。
+    function sanitizeText(text) {
+      if (typeof text !== 'string') return '';
+      // eslint-disable-next-line no-control-regex
+      const clean = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '');
+      return clean.slice(0, MAX_TEXT_LEN);
+    }
+
     function fmtTime(ts) {
       const d = new Date(ts);
       const now = new Date();
@@ -265,7 +304,7 @@ window.__ModuleLoader__.load({
         let peer = null;
 
         try {
-          peer = new window.Peer(DEFAULT_PEER_CONFIG);
+          peer = new window.Peer(getStablePeerId(), DEFAULT_PEER_CONFIG);
         } catch (err) {
           setPeerStatus('error');
           setPeerError(String(err?.message || err));
@@ -285,6 +324,12 @@ window.__ModuleLoader__.load({
         peer.on('connection', (conn) => {
           if (disposed) return;
           const remoteId = conn.peer;
+          // 攻防加固：非好友白名单的连接一律拒绝（防陌生/恶意 peer 连入）。
+          if (!ALLOW_STRANGER_CONN && !stateRef.current.friends.some(f => f.id === remoteId)) {
+            showToast(`拒绝陌生连接「${shortId(remoteId)}」`);
+            try { conn.close(); } catch (e) { /* ignore */ }
+            return;
+          }
           conn.on('open', () => {
             setConns(prev => ({ ...prev, [remoteId]: conn }));
             setState(prev => {
@@ -339,12 +384,15 @@ window.__ModuleLoader__.load({
       // 处理收到消息
       function handleIncoming(remoteId, data) {
         if (typeof data === 'string') {
+          // 攻防加固：清洗并截断入站文本（防超大 payload / 控制字符注入）。
+          const text = sanitizeText(data);
+          if (!text) return; // 空或全控制字符 → 丢弃
           persist(prev => {
             const msgs = prev.messages[remoteId] || [];
-            msgs.push({ from: 'them', text: data, ts: Date.now() });
+            msgs.push({ from: 'them', text, ts: Date.now() });
             const friends = [...prev.friends];
             const idx = friends.findIndex(f => f.id === remoteId);
-            if (idx >= 0) friends[idx] = { ...friends[idx], lastMsg: data, lastTs: Date.now(), unread: (friends[idx].unread || 0) + 1, online: true };
+            if (idx >= 0) friends[idx] = { ...friends[idx], lastMsg: text, lastTs: Date.now(), unread: (friends[idx].unread || 0) + 1, online: true };
             const next = { ...prev, messages: { ...prev.messages, [remoteId]: msgs }, friends };
             saveState(next);
             return next;
@@ -382,6 +430,11 @@ window.__ModuleLoader__.load({
       const addFriend = React.useCallback((targetId) => {
         const id = (targetId || addId).trim();
         if (!id) return;
+        // 攻防加固：校验 peer id 格式（防恶意/超长 id）。
+        if (!isValidPeerId(id)) {
+          showToast('ID 格式不合法（需以 ' + PEER_ID_PREFIX + ' 开头）');
+          return;
+        }
         if (id === myIdRef.current) {
           showToast('不能添加自己');
           return;
@@ -424,7 +477,7 @@ window.__ModuleLoader__.load({
 
       // 发送消息
       const sendMessage = React.useCallback(() => {
-        const text = draft.trim();
+        const text = sanitizeText(draft.trim());
         const target = activeRef.current;
         if (!text || !target) return;
         const conn = connsRef.current[target];
@@ -452,7 +505,11 @@ window.__ModuleLoader__.load({
       // 投递一条 agent 队列消息：确保好友存在、连接可用，然后发送并持久化
       const deliverQueued = React.useCallback(async (item) => {
         const target = item.to;
-        if (!target || !item.text) return;
+        // 攻防加固：校验目标 id 格式 + 清洗文本（防恶意 id / 超大 payload）。
+        if (!target || !isValidPeerId(target)) return;
+        const safeText = sanitizeText(item.text);
+        if (!safeText) return;
+        item.text = safeText;
         // 确保好友在列表中
         setState(prev => {
           const friends = [...prev.friends];
