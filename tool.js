@@ -14,6 +14,7 @@
  */
 
 import { pushItem } from './outbox.js';
+import { isValidPeerId, sanitizeText } from './validate.js';
 
 export const inject = ['tools'];
 
@@ -74,14 +75,22 @@ export function apply(ctx) {
           type: 'text',
           text: value.queued
             ? `P2P message queued for delivery to peer ${_args.to}`
-            : 'P2P message queue failed',
+            : 'P2P message not queued (invalid peer ID or empty text)',
         },
       ],
     },
     async execute(args) {
+      // Reject malformed peer IDs and strip/truncate the text (same policy as
+      // the browser panel) so the agent cannot queue invalid or oversized
+      // payloads that would later fail delivery.
+      if (!isValidPeerId(args.to)) {
+        return { queued: false, messageId: '' };
+      }
+      const text = sanitizeText(args.text);
+      if (!text) return { queued: false, messageId: '' };
       const messageId =
         'm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
-      pushItem({ id: messageId, to: args.to, text: args.text });
+      pushItem({ id: messageId, to: args.to, text });
       return { queued: true, messageId };
     },
   });

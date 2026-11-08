@@ -21,6 +21,7 @@
     "./client": "./client.js",
     "./tool": "./tool.js",
     "./outbox": "./outbox.js",
+    "./validate": "./validate.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
@@ -29,6 +30,7 @@
     "client.js",
     "tool.js",
     "outbox.js",
+    "validate.js",
     "locale",
     "cordis.patch.yml"
   ],

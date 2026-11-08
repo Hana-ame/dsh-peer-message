@@ -95,6 +95,7 @@ reloads.
 | `tool.js` | Preset plugin — `pm_send` tool + tool-surface restriction |
 | `client.js` | Client plugin — chat panel UI, PeerJS, persistence |
 | `outbox.js` | Shared outbound queue module |
+| `validate.js` | Shared peer-ID / text validation and sanitization |
 | `locale/en.json`, `locale/zh.json` | UI strings |
 | `cordis.patch.yml` | Bundle patch (declares the `peer-message` Host row) |
 
