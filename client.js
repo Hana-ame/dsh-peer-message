@@ -46,8 +46,9 @@ window.__ModuleLoader__.load({
     const MAX_TEXT_LEN = 4096;
     // 合法 peer id 前缀；不符合的入站/出站 id 直接拒绝。
     const PEER_ID_PREFIX = 'dsh-pm-';
-    // 合法 peer id 最小/最大长度（如 dsh-pm-<rand8>-<ts>）。
-    const PEER_ID_MIN_LEN = 8;
+    // 合法 peer id 最小/最大长度。真实 id 形如 dsh-pm-<8rand>-<6ts> ≈ 24 字符，
+    // 因此下限取 16（大于前缀 dsh-pm- 的 7 字符），防止 7 字符纯前缀误通过。
+    const PEER_ID_MIN_LEN = 16;
     const PEER_ID_MAX_LEN = 64;
     // 只接受已知好友的连接（防陌生/恶意 peer 未经邀请即连入）。
     const ALLOW_STRANGER_CONN = false;
