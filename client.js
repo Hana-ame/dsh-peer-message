@@ -105,6 +105,8 @@ window.__ModuleLoader__.load({
     // ── CSS 样式（仿 QQ/微信，使用主题 token） ──────────────────────────
     const CSS = [
       '.pm-root{display:flex;height:100%;width:100%;overflow:hidden;background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);font-size:13px;line-height:1.5;}',
+      // 统一 border-box：输入框 width:100%/flex:1 含内边距与边框，防止内容溢出撑宽。
+      '.pm-root,.pm-root *{box-sizing:border-box;}',
 
       // 左侧好友列表
       '.pm-sidebar{width:280px;min-width:280px;border-right:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.2));display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1,transparent);}',
