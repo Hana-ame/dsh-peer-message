@@ -1,0 +1,49 @@
+{
+  "name": "dsh-peer-message",
+  "version": "0.1.0",
+  "description": "PeerJS 互联的全局消息插件：仿 QQ/微信的聊天界面，支持通过字符串 ID 或二维码发现并连接好友。",
+  "author": "nanaka",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "peerjs",
+    "messaging",
+    "chat"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./tool": "./tool.js",
+    "./outbox": "./outbox.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "tool.js",
+    "outbox.js",
+    "locale",
+    "cordis.patch.yml"
+  ],
+  "main": "./index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  }
+}

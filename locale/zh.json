@@ -1,0 +1,4 @@
+{
+  "meta.title": "P2P 消息",
+  "meta.description": "PeerJS 互联的全局消息插件：仿 QQ/微信的聊天界面，支持通过字符串 ID 或二维码发现并连接好友。"
+}

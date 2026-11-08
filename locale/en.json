@@ -1,0 +1,4 @@
+{
+  "meta.title": "P2P Messages",
+  "meta.description": "PeerJS-based global messaging plugin: a QQ/WeChat-style chat UI with friend discovery via string ID or QR code."
+}
