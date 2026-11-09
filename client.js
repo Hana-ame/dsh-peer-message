@@ -50,13 +50,31 @@ window.__ModuleLoader__.load({
     // 因此下限取 16（大于前缀 dsh-pm- 的 7 字符），防止 7 字符纯前缀误通过。
     const PEER_ID_MIN_LEN = 16;
     const PEER_ID_MAX_LEN = 64;
-    // 只接受已知好友的连接（防陌生/恶意 peer 未经邀请即连入）。
-    const ALLOW_STRANGER_CONN = false;
     // 攻防加固：资源上限，防恶意洪泛撑爆 localStorage/内存。
     const MAX_MSGS_PER_FRIEND = 500;   // 每好友消息历史上限
     const MAX_FRIENDS = 100;           // 好友数上限
     const MAX_NAME_LEN = 32;           // hello 握手昵称长度上限
     const MAX_DELIVERY_TRIES = 10;     // agent 队列投递重试上限（防无限回环）
+
+    // ── 后台运行开关（持久化到 localStorage，面板关闭也生效） ────────────
+    const SETTINGS_KEY = 'dsh-peer-message-settings-v1';
+    const DEFAULT_SETTINGS = { allowBroadcast: false, allowIncoming: true };
+    function loadSettings() {
+      try {
+        const raw = localStorage.getItem(SETTINGS_KEY);
+        if (raw) {
+          const s = JSON.parse(raw);
+          return {
+            allowBroadcast: typeof s.allowBroadcast === 'boolean' ? s.allowBroadcast : DEFAULT_SETTINGS.allowBroadcast,
+            allowIncoming: typeof s.allowIncoming === 'boolean' ? s.allowIncoming : DEFAULT_SETTINGS.allowIncoming,
+          };
+        }
+      } catch (e) { /* ignore */ }
+      return Object.assign({}, DEFAULT_SETTINGS);
+    }
+    function saveSettings(s) {
+      try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch (e) { /* ignore */ }
+    }
 
     // 默认 PeerJS 云服务器；可通过 config 覆盖
     const DEFAULT_PEER_CONFIG = {
@@ -188,6 +206,11 @@ window.__ModuleLoader__.load({
       // 加载态
       '.pm-loading{flex:1;display:flex;align-items:center;justify-content:center;color:var(--dsw-alias-label-secondary,inherit);font-size:14px;}',
       '.pm-peer-error{color:var(--dsw-alias-state-error-primary,#ef4444);font-size:11px;margin-top:4px;}',
+      // 后台开关行：紧凑、主题色跟随。
+      '.pm-toggle-row{margin-top:8px;}',
+      '.pm-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;}',
+      '.pm-toggle input{accent-color:var(--dsw-alias-brand-primary,#3b82f6);cursor:pointer;}',
+      '.pm-toggle-text{font-size:11px;color:var(--dsw-alias-label-secondary,inherit);}',
     ].join('');
 
     // ── 侧栏未读徽标共享 store ──────────────────────────────────────────
@@ -300,6 +323,7 @@ window.__ModuleLoader__.load({
       listeners: new Set(),
       toast: '',
       toastTimer: null,
+      settings: loadSettings(), // 后台开关：广播/接收新连接（持久化，随快照下发面板）
 
       // ── 订阅协议（useSyncExternalStore） ─────────────────────────────
       subscribe(fn) {
@@ -314,6 +338,7 @@ window.__ModuleLoader__.load({
             peerStatus: this.peerStatus,
             peerError: this.peerError,
             toast: this.toast,
+            settings: this.settings,
             version: this.version,
           };
         }
@@ -381,6 +406,7 @@ window.__ModuleLoader__.load({
       stop() {
         if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
         if (this.reconnectTimer) { clearInterval(this.reconnectTimer); this.reconnectTimer = null; }
+        if (this.reconnectTimer2) { clearTimeout(this.reconnectTimer2); this.reconnectTimer2 = null; }
         for (const id of Object.keys(this.conns)) {
           try { this.conns[id].close(); } catch (e) { /* ignore */ }
         }
@@ -413,6 +439,7 @@ window.__ModuleLoader__.load({
           this.myId = id;
           this.peerStatus = 'online';
           this.peerError = '';
+          this.reconnectAttempts = 0; // 重连成功，清零退避计数
           this.conns = {};
           this.emit();
           // 上线即主动连接所有已知好友（后台自动重连）。
@@ -434,6 +461,7 @@ window.__ModuleLoader__.load({
             this.peerStatus = 'error';
             this.peerError = '信令服务器连接失败：' + (err && err.message || type);
             this.emit();
+            this.scheduleReconnect();
           } else if (type === 'peer-unavailable') {
             // 目标不在线：清理进行中的连接记录，让下轮重连可重试。
             for (const id of Object.keys(this.conns)) {
@@ -443,10 +471,8 @@ window.__ModuleLoader__.load({
           } else if (type === 'disconnected') {
             this.peerStatus = 'offline';
             this.peerError = '';
-            if (peer && !peer.destroyed) {
-              try { peer.reconnect(); } catch (e) { /* ignore */ }
-            }
             this.emit();
+            this.scheduleReconnect();
           } else {
             this.peerError = type || String(err && err.message || err);
             this.emit();
@@ -456,10 +482,36 @@ window.__ModuleLoader__.load({
         peer.on('close', () => {
           this.peerStatus = 'closed';
           this.emit();
+          this.scheduleReconnect();
         });
       },
 
-      // 入站连接：id 合法性 + 好友白名单（面板不打开也照常处理）。
+      // 信令断线自动重连（后台自愈）：指数退避 2s→30s，最多 5 次；
+      // 成功 open 或手动 stop 后清零。面板不打开也要能自己恢复。
+      scheduleReconnect() {
+        if (!this.started) return;
+        this.reconnectAttempts = this.reconnectAttempts || 0;
+        if (this.reconnectAttempts >= 5) {
+          this.peerError = this.peerError || '信令连接已断开，打开消息面板或刷新页面重试';
+          this.emit();
+          return;
+        }
+        const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempts), 30000);
+        this.reconnectAttempts++;
+        if (this.reconnectTimer2) clearTimeout(this.reconnectTimer2);
+        this.reconnectTimer2 = setTimeout(() => {
+          this.reconnectTimer2 = null;
+          if (!this.started) return;
+          if (this.peer && this.peer.open) { this.reconnectAttempts = 0; return; }
+          try { if (this.peer && !this.peer.destroyed) this.peer.destroy(); } catch (e) { /* ignore */ }
+          this.peer = null;
+          this.peerStatus = 'connecting';
+          this.emit();
+          this.initPeer();
+        }, delay);
+      },
+
+      // 入站连接：id 合法性 + 接收开关 + 白名单/广播开关（面板不打开也照常处理）。
       handleIncomingConn(conn) {
         const remoteId = conn.peer;
         // 攻防加固：入站 id 必须合法格式，否则直接关闭。
@@ -467,7 +519,14 @@ window.__ModuleLoader__.load({
           try { conn.close(); } catch (e) { /* ignore */ }
           return;
         }
-        if (!ALLOW_STRANGER_CONN && !this.state.friends.some(f => f.id === remoteId)) {
+        // 总闸：不接收新连接时一律拒绝（已建立连接不受影响）。
+        if (!this.settings.allowIncoming) {
+          this.showToast('已拒收新连接「' + shortId(remoteId) + '」');
+          try { conn.close(); } catch (e) { /* ignore */ }
+          return;
+        }
+        // 白名单/广播：非好友时，仅在开启广播的情况下自动加为好友。
+        if (!this.settings.allowBroadcast && !this.state.friends.some(f => f.id === remoteId)) {
           this.showToast('拒绝陌生连接「' + shortId(remoteId) + '」');
           try { conn.close(); } catch (e) { /* ignore */ }
           return;
@@ -486,6 +545,20 @@ window.__ModuleLoader__.load({
         conn.on('data', (data) => this.handleData(remoteId, data));
         conn.on('close', () => this.handleClose(remoteId));
         conn.on('error', () => this.handleClose(remoteId));
+      },
+
+      // 开关写入入口：持久化 + 广播快照（面板 UI 调用）。
+      setAllowBroadcast(on) {
+        this.settings = Object.assign({}, this.settings, { allowBroadcast: !!on });
+        saveSettings(this.settings);
+        this.showToast(on ? '已开启广播：陌生 peer 可发现并加你为好友' : '已关闭广播');
+        this.emit();
+      },
+      setAllowIncoming(on) {
+        this.settings = Object.assign({}, this.settings, { allowIncoming: !!on });
+        saveSettings(this.settings);
+        this.showToast(on ? '已开启接收新连接' : '已关闭接收新连接：已建立连接不受影响');
+        this.emit();
       },
 
       // 入站数据：文本消息清洗 + hello 握手昵称清洗。
@@ -730,6 +803,7 @@ window.__ModuleLoader__.load({
       const peerStatus = snap.peerStatus;
       const peerError = snap.peerError;
       const toast = snap.toast;
+      const settings = snap.settings || { allowBroadcast: false, allowIncoming: true };
 
       const [activeFriend, setActiveFriend] = React.useState(null);
       const [search, setSearch] = React.useState('');
@@ -785,6 +859,19 @@ window.__ModuleLoader__.load({
               h('button', { className: 'pm-icon-btn', title: '显示二维码', onClick: () => setShowQR(true), disabled: !myId }, '▦'),
             ),
             peerError ? h('div', { className: 'pm-peer-error' }, peerError) : null,
+            // 后台运行开关（持久化；面板关闭时由 pmService 继续生效）
+            h('div', { className: 'pm-toggle-row' },
+              h('label', { className: 'pm-toggle' },
+                h('input', { type: 'checkbox', checked: settings.allowBroadcast, onChange: e => pmService.setAllowBroadcast(e.target.checked) }),
+                h('span', { className: 'pm-toggle-text' }, '广播：', settings.allowBroadcast ? '开（可被陌生 peer 发现并加好友）' : '关'),
+              ),
+            ),
+            h('div', { className: 'pm-toggle-row' },
+              h('label', { className: 'pm-toggle' },
+                h('input', { type: 'checkbox', checked: settings.allowIncoming, onChange: e => pmService.setAllowIncoming(e.target.checked) }),
+                h('span', { className: 'pm-toggle-text' }, '接收新连接：', settings.allowIncoming ? '开' : '关（已建立连接不受影响）'),
+              ),
+            ),
           ),
           h('div', { className: 'pm-search' },
             h('input', { className: 'pm-search-input', placeholder: '搜索好友', value: search, onChange: e => setSearch(e.target.value) }),
