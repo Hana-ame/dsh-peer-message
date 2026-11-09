@@ -52,6 +52,11 @@ window.__ModuleLoader__.load({
     const PEER_ID_MAX_LEN = 64;
     // 只接受已知好友的连接（防陌生/恶意 peer 未经邀请即连入）。
     const ALLOW_STRANGER_CONN = false;
+    // 攻防加固：资源上限，防恶意洪泛撑爆 localStorage/内存。
+    const MAX_MSGS_PER_FRIEND = 500;   // 每好友消息历史上限
+    const MAX_FRIENDS = 100;           // 好友数上限
+    const MAX_NAME_LEN = 32;           // hello 握手昵称长度上限
+    const MAX_DELIVERY_TRIES = 10;     // agent 队列投递重试上限（防无限回环）
 
     // 默认 PeerJS 云服务器；可通过 config 覆盖
     const DEFAULT_PEER_CONFIG = {
@@ -244,6 +249,13 @@ window.__ModuleLoader__.load({
       return clean.slice(0, MAX_TEXT_LEN);
     }
 
+    // 昵称清洗：非字符串一律拒绝（防恶意对象/数组打崩渲染），字符串清洗并截断。
+    function sanitizeName(name) {
+      if (typeof name !== 'string') return null;
+      const clean = name.replace(/\s+/g, ' ').trim().slice(0, MAX_NAME_LEN);
+      return clean || null;
+    }
+
     function fmtTime(ts) {
       const d = new Date(ts);
       const now = new Date();
@@ -268,442 +280,498 @@ window.__ModuleLoader__.load({
       });
     }
 
-    // ── 主组件 ──────────────────────────────────────────────────────────
+    // ── 模块级后台服务 ──────────────────────────────────────────────────
+    // 核心修正：PeerJS 加载、Peer 实例、连接监听、入站消息、agent 队列轮询
+    // 全部在模块级单例里，apply() 时即启动——不依赖消息面板是否打开。
+    // 面板只是订阅服务快照的视图；面板不打开也照样收消息、投递 agent 消息。
+    const pmService = {
+      state: loadState(),          // {friends, messages}，每次变更同步 localStorage
+      myId: '',                    // 本端 PeerJS id（peer open 后回填）
+      peerStatus: 'connecting',    // connecting | online | offline | error | closed
+      peerError: '',
+      conns: {},                   // id -> DataConnection
+      peer: null,
+      pollTimer: null,
+      reconnectTimer: null,
+      polling: false,
+      started: false,
+      version: 0,
+      _snap: null,
+      listeners: new Set(),
+      toast: '',
+      toastTimer: null,
+
+      // ── 订阅协议（useSyncExternalStore） ─────────────────────────────
+      subscribe(fn) {
+        this.listeners.add(fn);
+        return () => { this.listeners.delete(fn); };
+      },
+      getSnapshot() {
+        if (!this._snap) {
+          this._snap = {
+            state: this.state,
+            myId: this.myId,
+            peerStatus: this.peerStatus,
+            peerError: this.peerError,
+            toast: this.toast,
+            version: this.version,
+          };
+        }
+        return this._snap;
+      },
+      emit() {
+        this.version++;
+        this._snap = null;
+        for (const fn of this.listeners) { try { fn(); } catch (e) { /* ignore */ } }
+      },
+
+      showToast(msg) {
+        this.toast = msg;
+        if (this.toastTimer) clearTimeout(this.toastTimer);
+        this.toastTimer = setTimeout(() => { this.toast = ''; this.emit(); }, 2500);
+        this.emit();
+      },
+
+      // state 变更唯一入口：写 localStorage + 推未读徽标 + 广播。
+      // 攻防加固：写前强制好友数/每好友消息数上限，防恶意洪泛撑爆存储。
+      update(mutator) {
+        const prev = this.state;
+        const next = mutator(prev);
+        if (next === prev) return;
+        if (Array.isArray(next.friends) && next.friends.length > MAX_FRIENDS) {
+          next.friends = next.friends.slice(-MAX_FRIENDS);
+        }
+        if (next.messages) {
+          let messages = next.messages;
+          for (const id of Object.keys(messages)) {
+            const msgs = messages[id];
+            if (Array.isArray(msgs) && msgs.length > MAX_MSGS_PER_FRIEND) {
+              messages = Object.assign({}, messages);
+              messages[id] = msgs.slice(-MAX_MSGS_PER_FRIEND);
+            }
+          }
+          next.messages = messages;
+        }
+        this.state = next;
+        saveState(next);
+        pmUnreadStore.publish(computeUnreadTotal(next.friends));
+        this.emit();
+      },
+
+      // ── 生命周期 ─────────────────────────────────────────────────────
+      start() {
+        if (this.started) return;
+        this.started = true;
+        // 侧栏徽标初值（后台服务启动即发布，不等面板挂载）。
+        pmUnreadStore.publish(computeUnreadTotal(this.state.friends));
+        this.emit();
+        loadPeerJS().then(() => this.initPeer()).catch(err => {
+          this.peerStatus = 'error';
+          this.peerError = 'PeerJS 加载失败: ' + String(err && err.message || err);
+          this.emit();
+        });
+        // agent 队列轮询：面板不打开也照常排水投递（消息要跑在后台）。
+        this.pollTimer = setInterval(() => this.drainOutbox(), 1000);
+        // 慢速后台重连：每 30s 重试不在线的好友。
+        this.reconnectTimer = setInterval(() => {
+          if (this.peer && this.peer.open) this.reconnectAll();
+        }, 30000);
+      },
+
+      stop() {
+        if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
+        if (this.reconnectTimer) { clearInterval(this.reconnectTimer); this.reconnectTimer = null; }
+        for (const id of Object.keys(this.conns)) {
+          try { this.conns[id].close(); } catch (e) { /* ignore */ }
+        }
+        this.conns = {};
+        if (this.peer) { try { this.peer.destroy(); } catch (e) { /* ignore */ } }
+        this.peer = null;
+        this.myId = '';
+        this.peerStatus = 'connecting';
+        this.peerError = '';
+        this.toast = '';
+        this.started = false;
+        this._snap = null;
+        this.emit();
+      },
+
+      initPeer() {
+        if (!this.started) return;
+        let peer = null;
+        try {
+          peer = new window.Peer(getStablePeerId(), DEFAULT_PEER_CONFIG);
+        } catch (err) {
+          this.peerStatus = 'error';
+          this.peerError = String(err && err.message || err);
+          this.emit();
+          return;
+        }
+        this.peer = peer;
+
+        peer.on('open', (id) => {
+          this.myId = id;
+          this.peerStatus = 'online';
+          this.peerError = '';
+          this.conns = {};
+          this.emit();
+          // 上线即主动连接所有已知好友（后台自动重连）。
+          this.reconnectAll();
+          this.drainOutbox();
+        });
+
+        peer.on('connection', (conn) => {
+          this.handleIncomingConn(conn);
+        });
+
+        peer.on('error', (err) => {
+          const type = err && err.type;
+          if (type === 'unavailable-id') {
+            this.peerStatus = 'error';
+            this.peerError = 'ID 被占用，请刷新页面重试';
+            this.emit();
+          } else if (type === 'network' || type === 'server-error') {
+            this.peerStatus = 'error';
+            this.peerError = '信令服务器连接失败：' + (err && err.message || type);
+            this.emit();
+          } else if (type === 'peer-unavailable') {
+            // 目标不在线：清理进行中的连接记录，让下轮重连可重试。
+            for (const id of Object.keys(this.conns)) {
+              if (!this.conns[id].open) delete this.conns[id];
+            }
+            this.emit();
+          } else if (type === 'disconnected') {
+            this.peerStatus = 'offline';
+            this.peerError = '';
+            if (peer && !peer.destroyed) {
+              try { peer.reconnect(); } catch (e) { /* ignore */ }
+            }
+            this.emit();
+          } else {
+            this.peerError = type || String(err && err.message || err);
+            this.emit();
+          }
+        });
+
+        peer.on('close', () => {
+          this.peerStatus = 'closed';
+          this.emit();
+        });
+      },
+
+      // 入站连接：id 合法性 + 好友白名单（面板不打开也照常处理）。
+      handleIncomingConn(conn) {
+        const remoteId = conn.peer;
+        // 攻防加固：入站 id 必须合法格式，否则直接关闭。
+        if (!isValidPeerId(remoteId)) {
+          try { conn.close(); } catch (e) { /* ignore */ }
+          return;
+        }
+        if (!ALLOW_STRANGER_CONN && !this.state.friends.some(f => f.id === remoteId)) {
+          this.showToast('拒绝陌生连接「' + shortId(remoteId) + '」');
+          try { conn.close(); } catch (e) { /* ignore */ }
+          return;
+        }
+        conn.on('open', () => {
+          this.conns[remoteId] = conn;
+          this.update(prev => {
+            const friends = prev.friends.slice();
+            const idx = friends.findIndex(f => f.id === remoteId);
+            if (idx >= 0) friends[idx] = Object.assign({}, friends[idx], { online: true });
+            else friends.push({ id: remoteId, name: shortId(remoteId), online: true, unread: 0, lastMsg: '', lastTs: Date.now() });
+            return Object.assign({}, prev, { friends });
+          });
+          this.showToast('「' + shortId(remoteId) + '」已连接');
+        });
+        conn.on('data', (data) => this.handleData(remoteId, data));
+        conn.on('close', () => this.handleClose(remoteId));
+        conn.on('error', () => this.handleClose(remoteId));
+      },
+
+      // 入站数据：文本消息清洗 + hello 握手昵称清洗。
+      handleData(remoteId, data) {
+        if (typeof data === 'string') {
+          // 攻防加固：清洗并截断入站文本（防超大 payload / 控制字符注入）。
+          const text = sanitizeText(data);
+          if (!text) return; // 空或全控制字符 → 丢弃
+          this.update(prev => {
+            const idx = prev.friends.findIndex(f => f.id === remoteId);
+            if (idx < 0) return prev; // 非好友（或已删除）：丢弃
+            const friends = prev.friends.slice();
+            friends[idx] = Object.assign({}, friends[idx], {
+              lastMsg: text, lastTs: Date.now(),
+              unread: (friends[idx].unread || 0) + 1, online: true,
+            });
+            const msgs = (prev.messages[remoteId] || []).concat([{ from: 'them', text, ts: Date.now() }]);
+            const messages = Object.assign({}, prev.messages);
+            messages[remoteId] = msgs;
+            return Object.assign({}, prev, { friends, messages });
+          });
+        } else if (data && typeof data === 'object') {
+          if (data.type === 'hello') {
+            // 攻防加固：昵称非字符串/空 → 丢弃，绝不写进 state（防对象打崩渲染）。
+            const name = sanitizeName(data.name);
+            if (!name) return;
+            this.update(prev => {
+              const idx = prev.friends.findIndex(f => f.id === remoteId);
+              if (idx < 0) return prev;
+              const friends = prev.friends.slice();
+              friends[idx] = Object.assign({}, friends[idx], { name });
+              return Object.assign({}, prev, { friends });
+            });
+          }
+        }
+      },
+
+      handleClose(remoteId) {
+        delete this.conns[remoteId];
+        this.update(prev => {
+          if (!prev.friends.some(f => f.id === remoteId && f.online)) return prev;
+          const friends = prev.friends.map(f => f.id === remoteId ? Object.assign({}, f, { online: false }) : f);
+          return Object.assign({}, prev, { friends });
+        });
+      },
+
+      // 上线后重连所有好友（后台自动连接，不需要打开面板）。
+      reconnectAll() {
+        for (const f of this.state.friends) {
+          if (!isValidPeerId(f.id)) continue;
+          if (this.conns[f.id]) continue; // 已连接或连接中
+          this.connectTo(f.id, { silent: true });
+        }
+      },
+
+      connectTo(id, opts) {
+        opts = opts || {};
+        const peer = this.peer;
+        if (!peer || !peer.open) return false;
+        if (this.conns[id]) return !!this.conns[id].open; // 进行中或已连上
+        const conn = peer.connect(id, { reliable: true });
+        this.conns[id] = conn;
+        conn.on('open', () => {
+          this.update(prev => {
+            const friends = prev.friends.map(f => f.id === id ? Object.assign({}, f, { online: true }) : f);
+            return Object.assign({}, prev, { friends });
+          });
+          try { conn.send({ type: 'hello', name: '我' }); } catch (e) { /* ignore */ }
+          if (!opts.silent) this.showToast('已连接「' + shortId(id) + '」');
+        });
+        conn.on('data', (data) => this.handleData(id, data));
+        conn.on('close', () => this.handleClose(id));
+        conn.on('error', () => this.handleClose(id));
+        return true;
+      },
+
+      ensureFriend(id) {
+        if (this.state.friends.some(f => f.id === id)) return;
+        this.update(prev => {
+          if (prev.friends.some(f => f.id === id)) return prev;
+          const friends = prev.friends.concat([{ id, name: shortId(id), online: false, unread: 0, lastMsg: '', lastTs: Date.now() }]);
+          return Object.assign({}, prev, { friends });
+        });
+      },
+
+      // agent 队列排水：从 host 取回 pm_send 排队的消息并投递。
+      // 面板不打开也照常运行（这就是“消息要跑在后台”的核心）。
+      async drainOutbox() {
+        if (this.polling) return;
+        if (!this.peer || !this.peer.open) return; // peer 未就绪：留在 host 队列，不丢
+        this.polling = true;
+        try {
+          const res = await fetch('/api/pm-outbox', { method: 'GET' });
+          if (res.ok) {
+            const data = await res.json();
+            const items = Array.isArray(data && data.items) ? data.items : [];
+            for (const item of items) await this.deliverQueued(item);
+          }
+        } catch (e) { /* 静默：轮询失败下次重试 */ }
+        this.polling = false;
+      },
+
+      async deliverQueued(item) {
+        const target = item && item.to;
+        // 攻防加固：host 队列可能被任意本地进程写入，投递前必须校验。
+        if (!target || !isValidPeerId(target)) return; // 恶意/畸形 id：丢弃
+        const safeText = sanitizeText(item.text);
+        if (!safeText) return;
+        const tries = ((item.tries || 0) + 1);
+        this.ensureFriend(target); // agent 可向任意合法 id 发消息
+        const conn = this.conns[target];
+        if (!conn || !conn.open) {
+          this.connectTo(target, { silent: true });
+          // 对方不在线：放回队列（带上重试计数），超过上限则放弃。
+          if (tries < MAX_DELIVERY_TRIES) outboxPush(Object.assign({}, item, { text: safeText, tries }));
+          else this.showToast('P2P 消息多次投递失败，已放弃');
+          return;
+        }
+        try {
+          conn.send(safeText);
+        } catch (e) {
+          if (tries < MAX_DELIVERY_TRIES) outboxPush(Object.assign({}, item, { text: safeText, tries }));
+          else this.showToast('P2P 消息多次投递失败，已放弃');
+          return;
+        }
+        this.update(prev => {
+          const msgs = (prev.messages[target] || []).concat([{ from: 'me', text: safeText, ts: Date.now() }]);
+          const friends = prev.friends.map(f => f.id === target ? Object.assign({}, f, { lastMsg: safeText, lastTs: Date.now() }) : f);
+          const messages = Object.assign({}, prev.messages);
+          messages[target] = msgs;
+          return Object.assign({}, prev, { friends, messages });
+        });
+        this.showToast('已投递 agent 消息');
+      },
+
+      // ── 面板调用的操作 ───────────────────────────────────────────────
+      addFriend(targetId) {
+        const id = (targetId || '').trim();
+        if (!id) return;
+        if (!isValidPeerId(id)) {
+          this.showToast('ID 格式不合法（需以 ' + PEER_ID_PREFIX + ' 开头）');
+          return;
+        }
+        if (id === this.myId) {
+          this.showToast('不能添加自己');
+          return;
+        }
+        this.ensureFriend(id);
+        this.connectTo(id);
+      },
+
+      removeFriend(id) {
+        const conn = this.conns[id];
+        if (conn) { try { conn.close(); } catch (e) { /* ignore */ } }
+        delete this.conns[id];
+        this.update(prev => {
+          const friends = prev.friends.filter(f => f.id !== id);
+          const messages = Object.assign({}, prev.messages);
+          delete messages[id];
+          return { friends, messages };
+        });
+      },
+
+      sendMessage(id, draft) {
+        const text = sanitizeText(draft);
+        if (!text || !id) return false;
+        const conn = this.conns[id];
+        if (!conn || !conn.open) { this.showToast('对方不在线，消息无法送达'); return false; }
+        try {
+          conn.send(text);
+        } catch (e) {
+          this.showToast('发送失败');
+          return false;
+        }
+        this.update(prev => {
+          const msgs = (prev.messages[id] || []).concat([{ from: 'me', text, ts: Date.now() }]);
+          const friends = prev.friends.map(f => f.id === id ? Object.assign({}, f, { lastMsg: text, lastTs: Date.now() }) : f);
+          const messages = Object.assign({}, prev.messages);
+          messages[id] = msgs;
+          return Object.assign({}, prev, { friends, messages });
+        });
+        return true;
+      },
+
+      markRead(id) {
+        this.update(prev => {
+          if (!prev.friends.some(f => f.id === id && (f.unread || 0) > 0)) return prev;
+          const friends = prev.friends.map(f => f.id === id ? Object.assign({}, f, { unread: 0 }) : f);
+          return Object.assign({}, prev, { friends });
+        });
+      },
+    };
+
+    // 攻防演练/调试钩子：从浏览器控制台可直接检查后台服务状态。
+    window.__DSH_PM_SERVICE__ = pmService;
+
+    // ── React 订阅 hook ────────────────────────────────────────────────
+    function usePmService() {
+      if (React.useSyncExternalStore) {
+        return React.useSyncExternalStore(
+          (cb) => pmService.subscribe(cb),
+          () => pmService.getSnapshot(),
+        );
+      }
+      // 旧版 React 兜底
+      const [snap, setSnap] = React.useState(() => pmService.getSnapshot());
+      React.useEffect(() => pmService.subscribe(() => setSnap(pmService.getSnapshot())), []);
+      return snap;
+    }
+
+    // ── 二维码渲染组件 ──────────────────────────────────────────────────
+    function QRCodeView({ value }) {
+      const [svg, setSvg] = React.useState('');
+      React.useEffect(() => {
+        let cancelled = false;
+        loadQRCode().then(qrcode => {
+          if (cancelled || !qrcode || !value) return;
+          const qr = qrcode(0, 'M');
+          qr.addData(value || '');
+          qr.make();
+          const cellSize = 4;
+          const count = qr.getModuleCount();
+          let svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="' + (count * cellSize) + '" height="' + (count * cellSize) + '" viewBox="0 0 ' + count + ' ' + count + '" shape-rendering="crispEdges">';
+          for (let r = 0; r < count; r++) {
+            for (let c = 0; c < count; c++) {
+              if (qr.isDark(r, c)) svgStr += '<rect x="' + c + '" y="' + r + '" width="1" height="1" fill="currentColor"/>';
+            }
+          }
+          svgStr += '</svg>';
+          setSvg(svgStr);
+        }).catch(() => setSvg(''));
+        return () => { cancelled = true; };
+      }, [value]);
+      return h('div', { className: 'pm-qr-box', dangerouslySetInnerHTML: { __html: svg || '<div style="width:120px;height:120px;display:flex;align-items:center;justify-content:center;color:#999;font-size:12px">加载中…</div>' } });
+    }
+
+    // ── 主面板（纯视图，网络全在 pmService） ─────────────────────────────
     function PeerMessagePanel() {
-      const [myId, setMyId] = React.useState('');
-      const [peerStatus, setPeerStatus] = React.useState('connecting'); // connecting | online | error | closed
-      const [peerError, setPeerError] = React.useState('');
-      const [state, setState] = React.useState(loadState);
+      const snap = usePmService();
+      const state = snap.state;
+      const myId = snap.myId;
+      const peerStatus = snap.peerStatus;
+      const peerError = snap.peerError;
+      const toast = snap.toast;
+
       const [activeFriend, setActiveFriend] = React.useState(null);
       const [search, setSearch] = React.useState('');
       const [addId, setAddId] = React.useState('');
       const [draft, setDraft] = React.useState('');
       const [showQR, setShowQR] = React.useState(false);
-      const [toast, setToast] = React.useState('');
-      const [peerLibLoaded, setPeerLibLoaded] = React.useState(false);
-      const [conns, setConns] = React.useState({}); // id -> DataConnection
       const chatRef = React.useRef(null);
 
-      const peerRef = React.useRef(null);
-      const stateRef = React.useRef(state);
-      const connsRef = React.useRef(conns);
-      const activeRef = React.useRef(activeFriend);
-      const myIdRef = React.useRef(myId);
-      const toastTimer = React.useRef(null);
-
-      stateRef.current = state;
-      connsRef.current = conns;
-      activeRef.current = activeFriend;
-      myIdRef.current = myId;
-
-      // 挂载时发布初始未读总数（loadState 可能已有未读消息）
+      // 活跃好友被删除时自动清空选择
       React.useEffect(() => {
-        pmUnreadStore.publish(computeUnreadTotal(stateRef.current.friends));
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-      }, []);
-
-      // toast
-      const showToast = React.useCallback((msg) => {
-        setToast(msg);
-        if (toastTimer.current) clearTimeout(toastTimer.current);
-        toastTimer.current = setTimeout(() => setToast(''), 2500);
-      }, []);
-
-      // 持久化 state
-      const persist = React.useCallback((updater) => {
-        setState(prev => {
-          const next = typeof updater === 'function' ? updater(prev) : updater;
-          saveState(next);
-          // 同步侧栏未读徽标（panel 与 sidebar 图标是独立子树）
-          pmUnreadStore.publish(computeUnreadTotal(next.friends));
-          return next;
-        });
-      }, []);
+        if (activeFriend && !state.friends.some(f => f.id === activeFriend)) setActiveFriend(null);
+      }, [state.friends, activeFriend]);
 
       // 自动滚动到底部
       React.useEffect(() => {
         if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
       }, [state.messages, activeFriend]);
 
-      // 加载 PeerJS
-      React.useEffect(() => {
-        let cancelled = false;
-        loadPeerJS().then(() => {
-          if (!cancelled) setPeerLibLoaded(true);
-        }).catch(err => {
-          if (!cancelled) {
-            setPeerStatus('error');
-            setPeerError(String(err?.message || err));
-          }
-        });
-        return () => { cancelled = true; };
-      }, []);
-
-      // 初始化 Peer 连接
-      React.useEffect(() => {
-        if (!peerLibLoaded) return;
-        let disposed = false;
-        let peer = null;
-
-        try {
-          peer = new window.Peer(getStablePeerId(), DEFAULT_PEER_CONFIG);
-        } catch (err) {
-          setPeerStatus('error');
-          setPeerError(String(err?.message || err));
-          return;
-        }
-
-        peerRef.current = peer;
-
-        peer.on('open', (id) => {
-          if (disposed) return;
-          setMyId(id);
-          setPeerStatus('online');
-          // 自动连接：对之前请求但未完成的好友重试
-          connsRef.current = {};
-        });
-
-        peer.on('connection', (conn) => {
-          if (disposed) return;
-          const remoteId = conn.peer;
-          // 攻防加固：非好友白名单的连接一律拒绝（防陌生/恶意 peer 连入）。
-          if (!ALLOW_STRANGER_CONN && !stateRef.current.friends.some(f => f.id === remoteId)) {
-            showToast(`拒绝陌生连接「${shortId(remoteId)}」`);
-            try { conn.close(); } catch (e) { /* ignore */ }
-            return;
-          }
-          conn.on('open', () => {
-            setConns(prev => ({ ...prev, [remoteId]: conn }));
-            setState(prev => {
-              const friends = [...prev.friends];
-              const idx = friends.findIndex(f => f.id === remoteId);
-              if (idx >= 0) friends[idx] = { ...friends[idx], online: true };
-              else friends.push({ id: remoteId, name: shortId(remoteId), online: true, unread: 0, lastMsg: '', lastTs: Date.now() });
-              const next = { ...prev, friends };
-              saveState(next);
-              return next;
-            });
-            showToast(`「${shortId(remoteId)}」请求连接已接受`);
-          });
-          conn.on('data', (data) => handleIncoming(remoteId, data));
-          conn.on('close', () => handleClose(remoteId));
-          conn.on('error', () => handleClose(remoteId));
-        });
-
-        peer.on('error', (err) => {
-          if (disposed) return;
-          if (err?.type === 'unavailable-id') {
-            setPeerStatus('error');
-            setPeerError('ID 被占用，请刷新页面重试');
-          } else if (err?.type === 'peer-unavailable') {
-            showToast('对方不在线，无法连接');
-          } else if (err?.type === 'network' || err?.type === 'server-error') {
-            setPeerStatus('error');
-            setPeerError('信令服务器连接失败：' + (err?.message || err?.type));
-          } else if (err?.type === 'disconnected') {
-            setPeerStatus('offline');
-            setPeerError('');
-            if (peer && !peer.destroyed) {
-              // 尝试重连
-              try { peer.reconnect(); } catch (e) { /* ignore */ }
-            }
-          } else {
-            setPeerError(err?.type || String(err?.message || err));
-          }
-        });
-
-        peer.on('close', () => {
-          if (!disposed) setPeerStatus('closed');
-        });
-
-        return () => {
-          disposed = true;
-          try { peer.destroy(); } catch (e) { /* ignore */ }
-          peerRef.current = null;
-        };
-      }, [peerLibLoaded]);
-
-      // 处理收到消息
-      function handleIncoming(remoteId, data) {
-        if (typeof data === 'string') {
-          // 攻防加固：清洗并截断入站文本（防超大 payload / 控制字符注入）。
-          const text = sanitizeText(data);
-          if (!text) return; // 空或全控制字符 → 丢弃
-          persist(prev => {
-            const msgs = prev.messages[remoteId] || [];
-            msgs.push({ from: 'them', text, ts: Date.now() });
-            const friends = [...prev.friends];
-            const idx = friends.findIndex(f => f.id === remoteId);
-            if (idx >= 0) friends[idx] = { ...friends[idx], lastMsg: text, lastTs: Date.now(), unread: (friends[idx].unread || 0) + 1, online: true };
-            const next = { ...prev, messages: { ...prev.messages, [remoteId]: msgs }, friends };
-            saveState(next);
-            return next;
-          });
-        } else if (data && typeof data === 'object') {
-          // 处理握手/元数据（如昵称）
-          if (data.type === 'hello' && data.name) {
-            persist(prev => {
-              const friends = [...prev.friends];
-              const idx = friends.findIndex(f => f.id === remoteId);
-              if (idx >= 0) friends[idx] = { ...friends[idx], name: data.name };
-              return { ...prev, friends };
-            });
-          }
-        }
-      }
-
-      // 处理断开
-      function handleClose(remoteId) {
-        setConns(prev => {
-          const next = { ...prev };
-          delete next[remoteId];
-          return next;
-        });
-        setState(prev => {
-          const friends = prev.friends.map(f => f.id === remoteId ? { ...f, online: false } : f);
-          const next = { ...prev, friends };
-          saveState(next);
-          return next;
-        });
-        showToast(`「${shortId(remoteId)}」已离线`);
-      }
-
-      // 添加好友（连接）
-      const addFriend = React.useCallback((targetId) => {
-        const id = (targetId || addId).trim();
-        if (!id) return;
-        // 攻防加固：校验 peer id 格式（防恶意/超长 id）。
-        if (!isValidPeerId(id)) {
-          showToast('ID 格式不合法（需以 ' + PEER_ID_PREFIX + ' 开头）');
-          return;
-        }
-        if (id === myIdRef.current) {
-          showToast('不能添加自己');
-          return;
-        }
-        // 先加入列表（离线状态）
-        persist(prev => {
-          const friends = [...prev.friends];
-          const idx = friends.findIndex(f => f.id === id);
-          if (idx >= 0) friends[idx] = { ...friends[idx] };
-          else friends.push({ id, name: shortId(id), online: false, unread: 0, lastMsg: '', lastTs: Date.now() });
-          const next = { ...prev, friends };
-          saveState(next);
-          return next;
-        });
-
-        // 发起连接
-        const peer = peerRef.current;
-        if (peer && peer.open) {
-          const conn = peer.connect(id, { reliable: true });
-          conn.on('open', () => {
-            setConns(prev => ({ ...prev, [id]: conn }));
-            setState(prev => {
-              const friends = prev.friends.map(f => f.id === id ? { ...f, online: true } : f);
-              const next = { ...prev, friends };
-              saveState(next);
-              return next;
-            });
-            // 发送握手
-            conn.send({ type: 'hello', name: '我' });
-            showToast(`已连接「${shortId(id)}」`);
-          });
-          conn.on('data', (data) => handleIncoming(id, data));
-          conn.on('close', () => handleClose(id));
-          conn.on('error', () => handleClose(id));
-        } else {
-          showToast('Peer 未就绪，请稍后再试');
-        }
-        setAddId('');
-      }, [addId, persist, showToast]);
-
-      // 发送消息
-      const sendMessage = React.useCallback(() => {
-        const text = sanitizeText(draft.trim());
-        const target = activeRef.current;
-        if (!text || !target) return;
-        const conn = connsRef.current[target];
-        if (!conn || !conn.open) {
-          showToast('对方不在线，无法发送');
-          return;
-        }
-        try {
-          conn.send(text);
-        } catch (e) {
-          showToast('发送失败：' + (e?.message || e));
-          return;
-        }
-        persist(prev => {
-          const msgs = prev.messages[target] || [];
-          msgs.push({ from: 'me', text, ts: Date.now() });
-          const friends = prev.friends.map(f => f.id === target ? { ...f, lastMsg: text, lastTs: Date.now() } : f);
-          const next = { ...prev, messages: { ...prev.messages, [target]: msgs }, friends };
-          saveState(next);
-          return next;
-        });
-        setDraft('');
-      }, [draft, persist, showToast]);
-
-      // 投递一条 agent 队列消息：确保好友存在、连接可用，然后发送并持久化
-      const deliverQueued = React.useCallback(async (item) => {
-        const target = item.to;
-        // 攻防加固：校验目标 id 格式 + 清洗文本（防恶意 id / 超大 payload）。
-        if (!target || !isValidPeerId(target)) return;
-        const safeText = sanitizeText(item.text);
-        if (!safeText) return;
-        item.text = safeText;
-        // 确保好友在列表中
-        setState(prev => {
-          const friends = [...prev.friends];
-          const idx = friends.findIndex(f => f.id === target);
-          if (idx >= 0) friends[idx] = { ...friends[idx] };
-          else friends.push({ id: target, name: shortId(target), online: false, unread: 0, lastMsg: '', lastTs: Date.now() });
-          const next = { ...prev, friends };
-          saveState(next);
-          return next;
-        });
-        let conn = connsRef.current[target];
-        if (!conn || !conn.open) {
-          const peer = peerRef.current;
-          if (!peer || !peer.open) return; // 等下次轮询（peer 未就绪）
-          try {
-            conn = peer.connect(target, { reliable: true });
-            await new Promise((resolve, reject) => {
-              const timer = setTimeout(() => reject(new Error('timeout')), 6000);
-              conn.once('open', () => { clearTimeout(timer); resolve(); });
-              conn.once('error', () => { clearTimeout(timer); reject(new Error('error')); });
-            });
-            setConns(prev => ({ ...prev, [target]: conn }));
-            setState(prev => {
-              const friends = prev.friends.map(f => f.id === target ? { ...f, online: true } : f);
-              const next = { ...prev, friends };
-              saveState(next);
-              return next;
-            });
-            conn.on('data', (data) => handleIncoming(target, data));
-            conn.on('close', () => handleClose(target));
-            conn.on('error', () => handleClose(target));
-          } catch (e) {
-            // 连接失败：把消息放回队列（重新入队）避免丢失
-            outboxPush(item);
-            return;
-          }
-        }
-        try {
-          conn.send(item.text);
-        } catch (e) {
-          outboxPush(item);
-          return;
-        }
-        persist(prev => {
-          const msgs = prev.messages[target] || [];
-          msgs.push({ from: 'me', text: item.text, ts: Date.now() });
-          const friends = prev.friends.map(f => f.id === target ? { ...f, lastMsg: item.text, lastTs: Date.now() } : f);
-          const next = { ...prev, messages: { ...prev.messages, [target]: msgs }, friends };
-          saveState(next);
-          return next;
-        });
-        showToast('已投递 agent 消息');
-      }, [persist, showToast]);
-
-      // 轮询 /api/pm-outbox：取回 agent 排队的 P2P 消息
-      React.useEffect(() => {
-        let stopped = false;
-        const poll = async () => {
-          if (stopped) return;
-          try {
-            const res = await fetch('/api/pm-outbox', { method: 'GET' });
-            if (res.ok) {
-              const data = await res.json();
-              const items = Array.isArray(data?.items) ? data.items : [];
-              for (const item of items) await deliverQueued(item);
-            }
-          } catch (e) { /* 静默：轮询失败下次重试 */ }
-        };
-        poll();
-        const timer = setInterval(poll, 600);
-        return () => { stopped = true; clearInterval(timer); };
-      }, [deliverQueued]);
-
-      // 复制 ID
-      const copyMyId = React.useCallback(() => {
-        if (!myIdRef.current) return;
-        copyText(myIdRef.current).then(() => showToast('ID 已复制')).catch(() => showToast('复制失败'));
-      }, [showToast]);
-
-      // 计算过滤后的好友列表
       const filteredFriends = React.useMemo(() => {
         const q = search.trim().toLowerCase();
         let list = state.friends;
         if (q) list = list.filter(f => (f.name || '').toLowerCase().includes(q) || (f.id || '').toLowerCase().includes(q));
-        // 按最近消息时间排序（在线优先）
-        return [...list].sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+        // 按最近消息时间排序
+        return list.slice().sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
       }, [state.friends, search]);
 
-      // 当前活跃好友
       const active = activeFriend ? state.friends.find(f => f.id === activeFriend) : null;
       const activeMsgs = activeFriend ? (state.messages[activeFriend] || []) : [];
 
-      // 选择好友时清未读
-      const selectFriend = React.useCallback((id) => {
+      const selectFriend = (id) => {
         setActiveFriend(id);
-        persist(prev => {
-          const friends = prev.friends.map(f => f.id === id ? { ...f, unread: 0 } : f);
-          const next = { ...prev, friends };
-          saveState(next);
-          return next;
-        });
-      }, [persist]);
+        pmService.markRead(id);
+      };
 
-      // 删除好友
-      const removeFriend = React.useCallback((id) => {
-        const conn = connsRef.current[id];
-        if (conn) { try { conn.close(); } catch (e) { /* ignore */ } }
-        persist(prev => {
-          const friends = prev.friends.filter(f => f.id !== id);
-          const messages = { ...prev.messages };
-          delete messages[id];
-          const next = { ...prev, friends, messages };
-          saveState(next);
-          return next;
-        });
-        if (activeRef.current === id) setActiveFriend(null);
-        showToast('已删除好友');
-      }, [persist, showToast]);
+      const copyMyId = () => {
+        if (!myId) return;
+        copyText(myId).then(() => pmService.showToast('ID 已复制')).catch(() => pmService.showToast('复制失败'));
+      };
 
-      // 渲染二维码
-      function QRCodeView({ value }) {
-        const [svg, setSvg] = React.useState('');
-        React.useEffect(() => {
-          let cancelled = false;
-          loadQRCode().then(qrcode => {
-            if (cancelled || !qrcode || !value) return;
-            const qr = qrcode(0, 'M');
-            qr.addData(value || '');
-            qr.make();
-            const cellSize = 4;
-            const count = qr.getModuleCount();
-            let svgStr = `<svg xmlns="http://www.w3.org/2000/svg" width="${count*cellSize}" height="${count*cellSize}" viewBox="0 0 ${count} ${count}" shape-rendering="crispEdges">`;
-            for (let r = 0; r < count; r++) {
-              for (let c = 0; c < count; c++) {
-                if (qr.isDark(r, c)) svgStr += `<rect x="${c}" y="${r}" width="1" height="1" fill="currentColor"/>`;
-              }
-            }
-            svgStr += '</svg>';
-            setSvg(svgStr);
-          }).catch(() => setSvg(''));
-          return () => { cancelled = true; };
-        }, [value]);
-        return h('div', { className: 'pm-qr-box', dangerouslySetInnerHTML: { __html: svg || '<div style="width:120px;height:120px;display:flex;align-items:center;justify-content:center;color:#999;font-size:12px">加载中…</div>' } });
-      }
-
-      // 侧栏图标（用于 sidebar.panellist）
-      // 实际由外部渲染，这里只是导出逻辑
-
-      // ── 渲染 ──────────────────────────────────────────────────────────
-      if (!peerLibLoaded) {
-        return h('div', { className: 'pm-root' }, h('div', { className: 'pm-loading' }, '正在加载 PeerJS…'));
-      }
+      const trySend = () => {
+        if (pmService.sendMessage(active.id, draft)) setDraft('');
+      };
 
       return h('div', { className: 'pm-root' },
         // 左侧好友列表
@@ -729,7 +797,7 @@ window.__ModuleLoader__.load({
                   key: f.id,
                   className: 'pm-friend-item' + (f.id === activeFriend ? ' active' : ''),
                   onClick: () => selectFriend(f.id),
-                  onContextMenu: (e) => { e.preventDefault(); removeFriend(f.id); },
+                  onContextMenu: (e) => { e.preventDefault(); pmService.removeFriend(f.id); },
                 },
                   h('div', { className: 'pm-avatar', style: { background: avatarColor(f.id) } }, (f.name || shortId(f.id) || '?').slice(0, 1).toUpperCase()),
                   h('div', { className: 'pm-friend-info' },
@@ -741,8 +809,8 @@ window.__ModuleLoader__.load({
                 )),
           ),
           h('div', { className: 'pm-add-friend' },
-            h('input', { className: 'pm-add-input', placeholder: '输入好友 ID 添加', value: addId, onChange: e => setAddId(e.target.value), onKeyDown: e => { if (e.key === 'Enter') addFriend(); } }),
-            h('button', { className: 'pm-add-btn', onClick: () => addFriend(), disabled: !addId.trim() || peerStatus !== 'online' }, '添加'),
+            h('input', { className: 'pm-add-input', placeholder: '输入好友 ID 添加', value: addId, onChange: e => setAddId(e.target.value), onKeyDown: e => { if (e.key === 'Enter') pmService.addFriend(addId); } }),
+            h('button', { className: 'pm-add-btn', onClick: () => pmService.addFriend(addId), disabled: !addId.trim() || peerStatus !== 'online' }, '添加'),
           ),
         ),
 
@@ -765,8 +833,8 @@ window.__ModuleLoader__.load({
                     )),
               ),
               h('div', { className: 'pm-chat-input' },
-                h('textarea', { className: 'pm-chat-textarea', placeholder: active.online ? '输入消息…' : '对方离线，消息无法送达', value: draft, onChange: e => setDraft(e.target.value), onKeyDown: e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }, disabled: !active.online }),
-                h('button', { className: 'pm-send-btn', onClick: sendMessage, disabled: !draft.trim() || !active.online }, '发送'),
+                h('textarea', { className: 'pm-chat-textarea', placeholder: active.online ? '输入消息…' : '对方离线，消息无法送达', value: draft, onChange: e => setDraft(e.target.value), onKeyDown: e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); trySend(); } }, disabled: !active.online }),
+                h('button', { className: 'pm-send-btn', onClick: trySend, disabled: !draft.trim() || !active.online }, '发送'),
               ),
             )
           : h('div', { className: 'pm-chat' },
@@ -898,7 +966,10 @@ window.__ModuleLoader__.load({
         return dispose;
       }, 'peer-message: sidebar icon');
 
-      console.log('[peer-message] client applied: panel "' + PANEL_ID + '" registered');
+      // 启动后台 P2P 服务：页面加载即运行，不依赖消息面板是否打开。
+      pmService.start();
+
+      console.log('[peer-message] client applied: panel "' + PANEL_ID + '" registered, pmService started');
     }
 
     return { inject: ['slots'], apply };
