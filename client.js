@@ -56,25 +56,8 @@ window.__ModuleLoader__.load({
     const MAX_NAME_LEN = 32;           // hello 握手昵称长度上限
     const MAX_DELIVERY_TRIES = 10;     // agent 队列投递重试上限（防无限回环）
 
-    // ── 后台运行开关（持久化到 localStorage，面板关闭也生效） ────────────
-    const SETTINGS_KEY = 'dsh-peer-message-settings-v1';
+    // ── 后台运行开关（随主 state 持久化，面板关闭也生效） ────────────────
     const DEFAULT_SETTINGS = { allowBroadcast: false, allowIncoming: true };
-    function loadSettings() {
-      try {
-        const raw = localStorage.getItem(SETTINGS_KEY);
-        if (raw) {
-          const s = JSON.parse(raw);
-          return {
-            allowBroadcast: typeof s.allowBroadcast === 'boolean' ? s.allowBroadcast : DEFAULT_SETTINGS.allowBroadcast,
-            allowIncoming: typeof s.allowIncoming === 'boolean' ? s.allowIncoming : DEFAULT_SETTINGS.allowIncoming,
-          };
-        }
-      } catch (e) { /* ignore */ }
-      return Object.assign({}, DEFAULT_SETTINGS);
-    }
-    function saveSettings(s) {
-      try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch (e) { /* ignore */ }
-    }
 
     // 默认 PeerJS 云服务器；可通过 config 覆盖
     const DEFAULT_PEER_CONFIG = {
@@ -88,17 +71,42 @@ window.__ModuleLoader__.load({
     };
 
     // ── 持久化 ──────────────────────────────────────────────────────────
+    // 主 state：{ friends, messages, settings }。settings 是后台运行开关
+    // （广播/接收新连接），随 state 一起持久化——面板关闭、页面重启都不丢。
+    function coerceSettings(raw) {
+      const d = DEFAULT_SETTINGS;
+      return {
+        allowBroadcast: raw && typeof raw.allowBroadcast === 'boolean' ? raw.allowBroadcast : d.allowBroadcast,
+        allowIncoming: raw && typeof raw.allowIncoming === 'boolean' ? raw.allowIncoming : d.allowIncoming,
+      };
+    }
+
     function loadState() {
+      let st = { friends: [], messages: {} };
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) return JSON.parse(raw);
+        if (raw) st = JSON.parse(raw) || st;
       } catch (e) { /* ignore */ }
-      return { friends: [], messages: {} }; // friends: [{id, name, lastMsg, unread, online}], messages: {id: [{from, text, ts}]}
+      if (!Array.isArray(st.friends)) st.friends = [];
+      if (!st.messages || typeof st.messages !== 'object') st.messages = {};
+      // 迁移：旧版开关存独立 key（dsh-peer-message-settings-v1），并入主 state 后清掉
+      let migrated = null;
+      try {
+        const raw = localStorage.getItem('dsh-peer-message-settings-v1');
+        if (raw) { migrated = JSON.parse(raw); localStorage.removeItem('dsh-peer-message-settings-v1'); }
+      } catch (e) { /* ignore */ }
+      st.settings = coerceSettings(migrated || st.settings);
+      return st;
     }
 
     function saveState(state) {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        // 只持久化 friends/messages/settings 三个白名单字段，其余内存态丢弃
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+          friends: state.friends,
+          messages: state.messages,
+          settings: state.settings,
+        }));
       } catch (e) { /* ignore */ }
     }
 
@@ -323,7 +331,12 @@ window.__ModuleLoader__.load({
       listeners: new Set(),
       toast: '',
       toastTimer: null,
-      settings: loadSettings(), // 后台开关：广播/接收新连接（持久化，随快照下发面板）
+
+      // settings 派生自 state（loadState/saveState 持久化）：
+      // 开关写入走 update() → saveState，与好友/消息同一条持久化路径。
+      get settings() {
+        return this.state.settings || coerceSettings(null);
+      },
 
       // ── 订阅协议（useSyncExternalStore） ─────────────────────────────
       subscribe(fn) {
@@ -547,18 +560,20 @@ window.__ModuleLoader__.load({
         conn.on('error', () => this.handleClose(remoteId));
       },
 
-      // 开关写入入口：持久化 + 广播快照（面板 UI 调用）。
+      // 开关写入入口：走 update()（saveState 持久化 + 推未读徽标 + 广播快照）。
       setAllowBroadcast(on) {
-        this.settings = Object.assign({}, this.settings, { allowBroadcast: !!on });
-        saveSettings(this.settings);
-        this.showToast(on ? '已开启广播：陌生 peer 可发现并加你为好友' : '已关闭广播');
-        this.emit();
+        const next = !!on;
+        this.update(prev => Object.assign({}, prev, {
+          settings: Object.assign({}, prev.settings || coerceSettings(null), { allowBroadcast: next }),
+        }));
+        this.showToast(next ? '已开启广播：陌生 peer 可发现并加你为好友' : '已关闭广播');
       },
       setAllowIncoming(on) {
-        this.settings = Object.assign({}, this.settings, { allowIncoming: !!on });
-        saveSettings(this.settings);
-        this.showToast(on ? '已开启接收新连接' : '已关闭接收新连接：已建立连接不受影响');
-        this.emit();
+        const next = !!on;
+        this.update(prev => Object.assign({}, prev, {
+          settings: Object.assign({}, prev.settings || coerceSettings(null), { allowIncoming: next }),
+        }));
+        this.showToast(next ? '已开启接收新连接' : '已关闭接收新连接：已建立连接不受影响');
       },
 
       // 入站数据：文本消息清洗 + hello 握手昵称清洗。
