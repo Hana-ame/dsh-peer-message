@@ -74,12 +74,13 @@ window.__ModuleLoader__.load({
     const PERMISSION_MODES = ['deny-all', 'read', 'write', 'readwrite', 'auto'];
     const AUTO_REPLY_PREFIX = '[自动回复] ';
     const REPLY_MODE_LABELS = { off: '关闭', manual: '手动批准', auto: '全自动' };
+    // 选项文案只保留能力描述（“=”右侧），不再重复“只读/只写/全自动”等模式名。
     const REPLY_PERMISSION_LABELS = {
-      'deny-all': '全不允许（禁用所有工具）',
-      read: '只读',
-      write: '只写',
-      readwrite: '读写（限定工作路径）',
-      auto: '全自动（全盘读写 + 免审批）',
+      'deny-all': '禁用一切工具',
+      read: '读/搜/网页',
+      write: '写/编辑',
+      readwrite: '工作路径内读写',
+      auto: '全盘读写且免审批',
     };
 
     function coerceReplyConfig(raw) {
@@ -1090,7 +1091,6 @@ window.__ModuleLoader__.load({
             h('label', { className: 'pm-field-label' }, '回复 Agent 权限'),
             h('select', { className: 'pm-select', 'data-field': 'permission', value: draft.permission, onChange: e => patch({ permission: e.target.value }) },
               PERMISSION_MODES.map(m => h('option', { key: m, value: m }, REPLY_PERMISSION_LABELS[m]))),
-            h('div', { className: 'pm-hint' }, '只读=读/搜/网页；只写=写/编辑；读写=工作路径内读写；全自动=全盘读写且免审批；全不允许=禁用一切工具。'),
             draft.permission === 'auto' ? h('div', { className: 'pm-warn' }, '「全自动」会让模型在无人审批的情况下读写本机文件、执行命令。只对可信对等端使用。') : null,
           ),
 
