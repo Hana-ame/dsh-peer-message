@@ -165,6 +165,20 @@ window.__ModuleLoader__.load({
       '.pm-friend-last{font-size:11px;color:var(--dsw-alias-label-secondary,inherit);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.pm-unread{min-width:18px;height:18px;border-radius:9px;background:var(--dsw-alias-state-error-primary,#ef4444);color:#fff;font-size:10px;display:flex;align-items:center;justify-content:center;padding:0 5px;flex:none;}',
 
+      // 好友右键菜单：右键只打开菜单，删除必须走菜单 + 二次确认，防误删。
+      '.pm-ctx-backdrop{position:fixed;inset:0;z-index:1499;background:transparent;}',
+      '.pm-ctx-menu{position:fixed;z-index:1500;min-width:190px;max-width:260px;padding:6px;border-radius:10px;background:var(--dsw-alias-bg-overlay,var(--dsw-alias-bg-layer-1,#fff));border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.25));box-shadow:0 8px 24px rgba(0,0,0,.22);display:flex;flex-direction:column;gap:2px;}',
+      '.pm-ctx-title{padding:4px 10px 3px;font-size:10px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary,inherit));overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.pm-ctx-item{display:flex;align-items:center;gap:8px;width:100%;padding:7px 10px;border:none;border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary,inherit);font-size:12px;font-family:inherit;text-align:left;cursor:pointer;}',
+      '.pm-ctx-item:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));}',
+      '.pm-ctx-item.danger{color:var(--dsw-alias-state-error-primary,#ef4444);}',
+      '.pm-ctx-item:disabled{opacity:.45;cursor:not-allowed;}',
+      '.pm-ctx-sep{height:1px;margin:4px 6px;background:var(--dsw-alias-border-l1,rgba(127,127,127,.15));}',
+      '.pm-confirm-text{font-size:12px;line-height:1.7;color:var(--dsw-alias-label-secondary,inherit);text-align:center;}',
+      '.pm-confirm-target{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,inherit);text-align:center;word-break:break-all;}',
+      '.pm-btn.danger{background:var(--dsw-alias-state-error-primary,#ef4444);border-color:transparent;color:#fff;}',
+      '.pm-btn.danger:hover{opacity:.9;}',
+
       '.pm-add-friend{display:flex;gap:6px;padding:8px 12px;border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.15));}',
       '.pm-add-input{flex:1;padding:6px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.2));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);font-size:12px;outline:none;}',
       '.pm-add-btn{padding:6px 14px;border-radius:8px;border:none;background:var(--dsw-alias-brand-primary,#3b82f6);color:#fff;font-size:12px;font-weight:500;cursor:pointer;}',
@@ -258,6 +272,15 @@ window.__ModuleLoader__.load({
     function shortId(id) {
       if (!id) return '';
       return id.length > 8 ? id.slice(0, 8) : id;
+    }
+
+    // 右键菜单定位：把客户端坐标夹到视口内（留 8px 边距），
+    // 避免在窗口右/下边缘右键时菜单被裁掉、点不到“删除好友”。
+    function clampMenuPosition(x, y, vw, vh, mw, mh) {
+      const margin = 8;
+      const left = Math.max(margin, Math.min(x, vw - mw - margin));
+      const top = Math.max(margin, Math.min(y, vh - mh - margin));
+      return { left, top };
     }
 
     // 校验 peer id 格式：必须带合法前缀、在长度区间内、且只含 base36/连字符
@@ -825,12 +848,45 @@ window.__ModuleLoader__.load({
       const [addId, setAddId] = React.useState('');
       const [draft, setDraft] = React.useState('');
       const [showQR, setShowQR] = React.useState(false);
+      // 右键菜单：{ id, left, top }。右键只负责开菜单，绝不直接改好友数据。
+      const [ctxMenu, setCtxMenu] = React.useState(null);
+      // 删除确认：{ id, name }。确认框打开前不会有任何 removeFriend 调用。
+      const [confirmDel, setConfirmDel] = React.useState(null);
       const chatRef = React.useRef(null);
 
       // 活跃好友被删除时自动清空选择
       React.useEffect(() => {
         if (activeFriend && !state.friends.some(f => f.id === activeFriend)) setActiveFriend(null);
       }, [state.friends, activeFriend]);
+
+      // 好友在别处被删除时，关闭指向它的右键菜单。
+      React.useEffect(() => {
+        if (ctxMenu && !state.friends.some(f => f.id === ctxMenu.id)) setCtxMenu(null);
+      }, [state.friends, ctxMenu]);
+
+      // 右键菜单：Escape / 窗口尺寸变化 / 任意滚动都关闭（菜单是 fixed 定位，
+      // 跟随的是打开时的坐标，滚动后必须收起避免菜单与好友行错位）。
+      React.useEffect(() => {
+        if (!ctxMenu) return;
+        const close = () => setCtxMenu(null);
+        const onKey = (e) => { if (e.key === 'Escape') close(); };
+        window.addEventListener('keydown', onKey);
+        window.addEventListener('resize', close);
+        window.addEventListener('scroll', close, true);
+        return () => {
+          window.removeEventListener('keydown', onKey);
+          window.removeEventListener('resize', close);
+          window.removeEventListener('scroll', close, true);
+        };
+      }, [ctxMenu]);
+
+      // 删除确认框：Escape 关闭（等价取消），不触发删除。
+      React.useEffect(() => {
+        if (!confirmDel) return;
+        const onKey = (e) => { if (e.key === 'Escape') setConfirmDel(null); };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [confirmDel]);
 
       // 自动滚动到底部
       React.useEffect(() => {
@@ -851,6 +907,29 @@ window.__ModuleLoader__.load({
       const selectFriend = (id) => {
         setActiveFriend(id);
         pmService.markRead(id);
+      };
+
+      // 右键只打开菜单（含视口夹取）；删除必须再点菜单项 + 确认框两道闸。
+      const openCtxMenu = (e, f) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const pos = clampMenuPosition(e.clientX, e.clientY, window.innerWidth, window.innerHeight, 200, 210);
+        setCtxMenu({ id: f.id, left: pos.left, top: pos.top });
+      };
+
+      const ctxFriend = ctxMenu ? state.friends.find(f => f.id === ctxMenu.id) : null;
+
+      const requestDeleteFriend = (f) => {
+        setCtxMenu(null);
+        setConfirmDel({ id: f.id, name: f.name || shortId(f.id) });
+      };
+
+      const doDeleteFriend = () => {
+        const target = confirmDel;
+        setConfirmDel(null);
+        if (!target) return;
+        pmService.removeFriend(target.id);
+        pmService.showToast('已删除好友「' + target.name + '」');
       };
 
       const copyMyId = () => {
@@ -899,7 +978,7 @@ window.__ModuleLoader__.load({
                   key: f.id,
                   className: 'pm-friend-item' + (f.id === activeFriend ? ' active' : ''),
                   onClick: () => selectFriend(f.id),
-                  onContextMenu: (e) => { e.preventDefault(); pmService.removeFriend(f.id); },
+                  onContextMenu: (e) => openCtxMenu(e, f),
                 },
                   h('div', { className: 'pm-avatar', style: { background: avatarColor(f.id) } }, (f.name || shortId(f.id) || '?').slice(0, 1).toUpperCase()),
                   h('div', { className: 'pm-friend-info' },
@@ -945,7 +1024,7 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'pm-empty-text' }, '选择一个好友开始聊天'),
                 h('div', { className: 'pm-empty-hint' },
                   '我的 ID 是 ' + (myId || '连接中…') + '。把 ID 告诉朋友，或让朋友输入你的 ID 添加你。',
-                  peerStatus === 'online' ? '（右键好友可删除）' : '',
+                  peerStatus === 'online' ? '（右键好友可打开操作菜单，删除需二次确认）' : '',
                 ),
               ),
             ),
@@ -960,6 +1039,58 @@ window.__ModuleLoader__.load({
             h('div', { className: 'pm-modal-btns' },
               h('button', { className: 'pm-btn', onClick: copyMyId }, '复制 ID'),
               h('button', { className: 'pm-btn primary', onClick: () => setShowQR(false) }, '关闭'),
+            ),
+          ),
+        ) : null,
+
+        // 好友右键菜单：右键只打开这里，数据改动只发生在用户点菜单项之后。
+        ctxMenu && ctxFriend ? h(React.Fragment, null,
+          h('div', {
+            className: 'pm-ctx-backdrop',
+            onMouseDown: () => setCtxMenu(null),
+            onContextMenu: (e) => { e.preventDefault(); setCtxMenu(null); },
+          }),
+          h('div', {
+            className: 'pm-ctx-menu',
+            role: 'menu',
+            'aria-label': '好友操作',
+            style: { left: ctxMenu.left, top: ctxMenu.top },
+            onContextMenu: (e) => e.preventDefault(),
+          },
+            h('div', { className: 'pm-ctx-title', title: ctxFriend.name || ctxFriend.id }, ctxFriend.name || shortId(ctxFriend.id)),
+            h('button', {
+              className: 'pm-ctx-item', role: 'menuitem', type: 'button',
+              onClick: () => { setCtxMenu(null); selectFriend(ctxFriend.id); },
+            }, h('span', { 'aria-hidden': 'true' }, '💬'), '打开聊天'),
+            h('button', {
+              className: 'pm-ctx-item', role: 'menuitem', type: 'button',
+              onClick: () => {
+                setCtxMenu(null);
+                copyText(ctxFriend.id).then(() => pmService.showToast('ID 已复制')).catch(() => pmService.showToast('复制失败'));
+              },
+            }, h('span', { 'aria-hidden': 'true' }, '⧉'), '复制 ID'),
+            h('button', {
+              className: 'pm-ctx-item', role: 'menuitem', type: 'button',
+              disabled: !ctxFriend.unread,
+              onClick: () => { setCtxMenu(null); pmService.markRead(ctxFriend.id); pmService.showToast('已标记为已读'); },
+            }, h('span', { 'aria-hidden': 'true' }, '✓'), '标记已读'),
+            h('div', { className: 'pm-ctx-sep' }),
+            h('button', {
+              className: 'pm-ctx-item danger', role: 'menuitem', type: 'button',
+              onClick: () => requestDeleteFriend(ctxFriend),
+            }, h('span', { 'aria-hidden': 'true' }, '🗑'), '删除好友…'),
+          ),
+        ) : null,
+
+        // 删除好友二次确认：取消 / Escape / 点遮罩都不删除。
+        confirmDel ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setConfirmDel(null) },
+          h('div', { className: 'pm-modal', style: { position: 'relative' }, onMouseDown: (e) => e.stopPropagation() },
+            h('div', { className: 'pm-modal-title' }, '删除好友'),
+            h('div', { className: 'pm-confirm-target' }, confirmDel.name),
+            h('div', { className: 'pm-confirm-text' }, '删除后好友与聊天记录都会清除，且无法恢复。'),
+            h('div', { className: 'pm-modal-btns' },
+              h('button', { className: 'pm-btn', type: 'button', onClick: () => setConfirmDel(null) }, '取消'),
+              h('button', { className: 'pm-btn danger', type: 'button', onClick: doDeleteFriend }, '删除好友'),
             ),
           ),
         ) : null,
