@@ -57,7 +57,8 @@ window.__ModuleLoader__.load({
     const MAX_DELIVERY_TRIES = 10;     // agent 队列投递重试上限（防无限回环）
 
     // ── 后台运行开关（随主 state 持久化，面板关闭也生效） ────────────────
-    const DEFAULT_SETTINGS = { allowBroadcast: false, allowIncoming: true };
+    // nickname 为空 = 使用 ID 前缀作为 hello 握手显示名（见 getNickname）。
+    const DEFAULT_SETTINGS = { allowBroadcast: false, allowIncoming: true, nickname: '' };
 
     // ── 自动回复配置（随 settings 持久化；Host 侧 reply-core.js 会再校验一次） ──
     const DEFAULT_REPLY = {
@@ -118,6 +119,7 @@ window.__ModuleLoader__.load({
       return {
         allowBroadcast: raw && typeof raw.allowBroadcast === 'boolean' ? raw.allowBroadcast : d.allowBroadcast,
         allowIncoming: raw && typeof raw.allowIncoming === 'boolean' ? raw.allowIncoming : d.allowIncoming,
+        nickname: typeof raw?.nickname === 'string' ? raw.nickname.replace(/\s+/g, ' ').trim().slice(0, MAX_NAME_LEN) : d.nickname,
         reply: coerceReplyConfig(raw && raw.reply),
       };
     }
@@ -151,13 +153,17 @@ window.__ModuleLoader__.load({
       } catch (e) { /* ignore */ }
     }
 
-    // 固定 Peer ID：首次生成后存入 localStorage，跨页面刷新/重启不变
+    // 固定 Peer ID：首次生成后存入 localStorage，跨页面刷新/重启不变。
+    // 唯一 ID 被别的标签页/旧会话占用时，可显式重置（见 pmService.resetPeerId）。
     const PEER_ID_KEY = 'dsh-peer-message-peer-id-v1';
+    function generatePeerId() {
+      return 'dsh-pm-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36);
+    }
     function getStablePeerId() {
       let id = null;
       try { id = localStorage.getItem(PEER_ID_KEY); } catch (e) { /* ignore */ }
       if (!id) {
-        id = 'dsh-pm-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36);
+        id = generatePeerId();
         try { localStorage.setItem(PEER_ID_KEY, id); } catch (e) { /* ignore */ }
       }
       return id;
@@ -272,7 +278,21 @@ window.__ModuleLoader__.load({
 
       // 加载态
       '.pm-loading{flex:1;display:flex;align-items:center;justify-content:center;color:var(--dsw-alias-label-secondary,inherit);font-size:14px;}',
-      '.pm-peer-error{color:var(--dsw-alias-state-error-primary,#ef4444);font-size:11px;margin-top:4px;}',
+      '.pm-peer-error{color:var(--dsw-alias-state-error-primary,#ef4444);font-size:11px;margin-top:4px;line-height:1.5;}',
+      '.pm-peer-error-box{margin-top:8px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-state-error-primary,#ef4444);background:var(--dsw-alias-interactive-bg-hover-danger,rgba(239,68,68,.08));}',
+      '.pm-peer-error-box .pm-peer-error{margin-top:0;font-size:10px;}',
+      '.pm-peer-error-actions{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;}',
+      // 显示名称行：昵称 + 重置 ID 入口
+      '.pm-nick-row{display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--dsw-alias-label-secondary,inherit);min-width:0;}',
+      '.pm-nick-label{white-space:nowrap;flex:none;}',
+      '.pm-nick-value{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary,inherit);}',
+      '.pm-link-btn{border:none;background:transparent;color:var(--dsw-alias-brand-primary,inherit);font-size:10px;cursor:pointer;padding:3px 5px;border-radius:4px;font-family:inherit;white-space:nowrap;flex:none;transition:background .15s;}',
+      '.pm-link-btn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));}',
+      // 小尺寸输入弹窗（昵称/备注/重置 ID）
+      '.pm-modal-narrow{width:380px;max-width:92vw;align-items:stretch;}',
+      '.pm-modal-narrow .pm-modal-title{text-align:left;}',
+      '.pm-modal-narrow .pm-hint,.pm-modal-narrow .pm-warn{text-align:left;}',
+      '.pm-field-static{font-family:monospace;font-size:11px;color:var(--dsw-alias-label-secondary,inherit);word-break:break-all;margin-bottom:8px;}',
       // 后台开关行：紧凑、主题色跟随。
       '.pm-toggle-row{margin-top:8px;}',
       '.pm-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;}',
@@ -345,6 +365,13 @@ window.__ModuleLoader__.load({
       return id.length > 8 ? id.slice(0, 8) : id;
     }
 
+    // 好友显示名优先级：本地备注(alias) > 对方 hello 昵称(name) > ID 前缀。
+    // hello 只更新 name，绝不覆盖本地 alias。
+    function displayName(friend) {
+      if (!friend) return '';
+      return friend.alias || friend.name || shortId(friend.id);
+    }
+
     // 右键菜单定位：把客户端坐标夹到视口内（留 8px 边距），
     // 避免在窗口右/下边缘右键时菜单被裁掉、点不到“删除好友”。
     function clampMenuPosition(x, y, vw, vh, mw, mh) {
@@ -414,6 +441,7 @@ window.__ModuleLoader__.load({
       myId: '',                    // 本端 PeerJS id（peer open 后回填）
       peerStatus: 'connecting',    // connecting | online | offline | error | closed
       peerError: '',
+      peerErrorType: '',           // PeerJS error.type，如 unavailable-id / network
       conns: {},                   // id -> DataConnection
       peer: null,
       pollTimer: null,
@@ -453,6 +481,7 @@ window.__ModuleLoader__.load({
             myId: this.myId,
             peerStatus: this.peerStatus,
             peerError: this.peerError,
+            peerErrorType: this.peerErrorType,
             toast: this.toast,
             settings: this.settings,
             reply: this.settings.reply,
@@ -545,6 +574,7 @@ window.__ModuleLoader__.load({
         this.myId = '';
         this.peerStatus = 'connecting';
         this.peerError = '';
+        this.peerErrorType = '';
         this.toast = '';
         this.started = false;
         this._snap = null;
@@ -558,6 +588,7 @@ window.__ModuleLoader__.load({
           peer = new window.Peer(getStablePeerId(), DEFAULT_PEER_CONFIG);
         } catch (err) {
           this.peerStatus = 'error';
+          this.peerErrorType = 'init';
           this.peerError = String(err && err.message || err);
           this.emit();
           return;
@@ -568,6 +599,7 @@ window.__ModuleLoader__.load({
           this.myId = id;
           this.peerStatus = 'online';
           this.peerError = '';
+          this.peerErrorType = '';
           this.reconnectAttempts = 0; // 重连成功，清零退避计数
           this.conns = {};
           this.emit();
@@ -584,10 +616,12 @@ window.__ModuleLoader__.load({
           const type = err && err.type;
           if (type === 'unavailable-id') {
             this.peerStatus = 'error';
-            this.peerError = 'ID 被占用，请刷新页面重试';
+            this.peerErrorType = 'unavailable-id';
+            this.peerError = 'ID 被占用：同一浏览器的其他 DSH 标签页或上一次会话仍占着这个固定 ID。请关闭其他标签页后点「重试连接」；或点「重置 ID」换一个新 ID（好友需要重新加你）。';
             this.emit();
           } else if (type === 'network' || type === 'server-error') {
             this.peerStatus = 'error';
+            this.peerErrorType = type;
             this.peerError = '信令服务器连接失败：' + (err && err.message || type);
             this.emit();
             this.scheduleReconnect();
@@ -600,9 +634,11 @@ window.__ModuleLoader__.load({
           } else if (type === 'disconnected') {
             this.peerStatus = 'offline';
             this.peerError = '';
+            this.peerErrorType = '';
             this.emit();
             this.scheduleReconnect();
           } else {
+            this.peerErrorType = type || '';
             this.peerError = type || String(err && err.message || err);
             this.emit();
           }
@@ -635,6 +671,8 @@ window.__ModuleLoader__.load({
           try { if (this.peer && !this.peer.destroyed) this.peer.destroy(); } catch (e) { /* ignore */ }
           this.peer = null;
           this.peerStatus = 'connecting';
+          this.peerError = '';
+          this.peerErrorType = '';
           this.emit();
           this.initPeer();
         }, delay);
@@ -666,9 +704,11 @@ window.__ModuleLoader__.load({
             const friends = prev.friends.slice();
             const idx = friends.findIndex(f => f.id === remoteId);
             if (idx >= 0) friends[idx] = Object.assign({}, friends[idx], { online: true });
-            else friends.push({ id: remoteId, name: shortId(remoteId), online: true, unread: 0, lastMsg: '', lastTs: Date.now() });
+            else friends.push({ id: remoteId, name: shortId(remoteId), alias: '', online: true, unread: 0, lastMsg: '', lastTs: Date.now() });
             return Object.assign({}, prev, { friends });
           });
+          // 回发 hello：让主动连接方也能看到本端昵称（原来只单向发）。
+          this.sendHello(conn);
           this.showToast('「' + shortId(remoteId) + '」已连接');
         });
         conn.on('data', (data) => this.handleData(remoteId, data));
@@ -690,6 +730,78 @@ window.__ModuleLoader__.load({
           settings: Object.assign({}, prev.settings || coerceSettings(null), { allowIncoming: next }),
         }));
         this.showToast(next ? '已开启接收新连接' : '已关闭接收新连接：已建立连接不受影响');
+      },
+
+      // ── 显示名称（hello 握手）与好友备注 ─────────────────────────────
+      // 本端显示名：settings.nickname；留空则退化到 ID 前缀（不再是写死的“我”）。
+      getNickname() {
+        return sanitizeName(this.settings.nickname) || shortId(this.myId) || '我';
+      },
+
+      // 双向 hello：主动连接和收到的连接打开后都发一次，双方才能互相显示昵称。
+      sendHello(conn) {
+        if (!conn || !conn.open) return;
+        try { conn.send({ type: 'hello', name: this.getNickname() }); } catch (e) { /* ignore */ }
+      },
+
+      broadcastHello() {
+        for (const conn of Object.values(this.conns)) this.sendHello(conn);
+      },
+
+      setNickname(raw) {
+        const text = typeof raw === 'string' ? raw.trim() : '';
+        const clean = text ? sanitizeName(text) : '';
+        if (text && !clean) { this.showToast('显示名称不合法（最多 ' + MAX_NAME_LEN + ' 字）'); return false; }
+        this.update(prev => Object.assign({}, prev, {
+          settings: Object.assign({}, prev.settings || coerceSettings(null), { nickname: clean }),
+        }));
+        this.broadcastHello();
+        this.showToast(clean ? '显示名称已更新为「' + clean + '」' : '已恢复默认显示名（ID 前缀）');
+        return true;
+      },
+
+      // 好友备注名：hello 只改 name，本地 alias 永远优先，不会被对方覆盖。
+      setFriendAlias(id, raw) {
+        const text = raw == null ? '' : String(raw).trim();
+        const alias = text ? sanitizeName(text) : '';
+        if (text && !alias) { this.showToast('备注名不合法'); return false; }
+        this.update(prev => {
+          const idx = prev.friends.findIndex(f => f.id === id);
+          if (idx < 0) return prev;
+          const friends = prev.friends.slice();
+          friends[idx] = Object.assign({}, friends[idx], { alias });
+          return Object.assign({}, prev, { friends });
+        });
+        this.showToast(alias ? '备注名已设为「' + alias + '」' : '已清除备注名');
+        return true;
+      },
+
+      // ── Peer ID 占用恢复 ─────────────────────────────────────────────
+      // 用同一个固定 ID 重连（关闭其他标签页后使用）。
+      retryPeer() {
+        if (this.peer) { try { this.peer.destroy(); } catch (e) { /* ignore */ } }
+        this.peer = null;
+        for (const id of Object.keys(this.conns)) {
+          try { this.conns[id].close(); } catch (e) { /* ignore */ }
+        }
+        this.conns = {};
+        this.myId = '';
+        this.peerStatus = 'connecting';
+        this.peerError = '';
+        this.peerErrorType = '';
+        this.reconnectAttempts = 0;
+        this.emit();
+        this.initPeer();
+        this.showToast('正在用固定 ID 重新连接…');
+      },
+
+      // 换一个新 Peer ID（旧 ID 被别处占用时的兜底）。好友列表保留，但对方要重新加新 ID。
+      resetPeerId() {
+        const oldId = this.myId || (() => { try { return localStorage.getItem(PEER_ID_KEY); } catch (e) { return ''; } })();
+        const nextId = generatePeerId();
+        try { localStorage.setItem(PEER_ID_KEY, nextId); } catch (e) { /* ignore */ }
+        this.retryPeer();
+        this.showToast('已重置 Peer ID：' + nextId + (oldId ? '（旧 ID：' + shortId(oldId) + '）' : ''));
       },
 
       // 入站数据：文本消息清洗 + hello 握手昵称清洗。
@@ -759,7 +871,7 @@ window.__ModuleLoader__.load({
             const friends = prev.friends.map(f => f.id === id ? Object.assign({}, f, { online: true }) : f);
             return Object.assign({}, prev, { friends });
           });
-          try { conn.send({ type: 'hello', name: '我' }); } catch (e) { /* ignore */ }
+          this.sendHello(conn);
           if (!opts.silent) this.showToast('已连接「' + shortId(id) + '」');
         });
         conn.on('data', (data) => this.handleData(id, data));
@@ -772,7 +884,7 @@ window.__ModuleLoader__.load({
         if (this.state.friends.some(f => f.id === id)) return;
         this.update(prev => {
           if (prev.friends.some(f => f.id === id)) return prev;
-          const friends = prev.friends.concat([{ id, name: shortId(id), online: false, unread: 0, lastMsg: '', lastTs: Date.now() }]);
+          const friends = prev.friends.concat([{ id, name: shortId(id), alias: '', online: false, unread: 0, lastMsg: '', lastTs: Date.now() }]);
           return Object.assign({}, prev, { friends });
         });
       },
@@ -933,7 +1045,7 @@ window.__ModuleLoader__.load({
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
             peerId,
-            peerName: friend ? friend.name : '',
+            peerName: friend ? displayName(friend) : '',
             text: clean,
             config: reply,
           }),
@@ -1203,6 +1315,7 @@ window.__ModuleLoader__.load({
       const myId = snap.myId;
       const peerStatus = snap.peerStatus;
       const peerError = snap.peerError;
+      const peerErrorType = snap.peerErrorType;
       const toast = snap.toast;
       const settings = snap.settings || { allowBroadcast: false, allowIncoming: true };
       const reply = snap.reply || DEFAULT_REPLY;
@@ -1218,6 +1331,11 @@ window.__ModuleLoader__.load({
       const [showQR, setShowQR] = React.useState(false);
       const [showReplySettings, setShowReplySettings] = React.useState(false);
       const [showPending, setShowPending] = React.useState(false);
+      // 显示名称 / 好友备注 / 重置 Peer ID
+      const [showNickname, setShowNickname] = React.useState(false);
+      const [nicknameDraft, setNicknameDraft] = React.useState('');
+      const [renameFriend, setRenameFriend] = React.useState(null); // { id, alias }
+      const [showResetId, setShowResetId] = React.useState(false);
       // 右键菜单：{ id, left, top }。右键只负责开菜单，绝不直接改好友数据。
       const [ctxMenu, setCtxMenu] = React.useState(null);
       // 删除确认：{ id, name }。确认框打开前不会有任何 removeFriend 调用。
@@ -1263,15 +1381,20 @@ window.__ModuleLoader__.load({
         return () => window.removeEventListener('keydown', onKey);
       }, [confirmDel]);
 
-      // 自动回复设置 / 待批准弹窗：Escape 关闭。
+      // 自动回复设置 / 待批准 / 昵称 / 备注 / 重置 ID 弹窗：Escape 关闭。
       React.useEffect(() => {
-        if (!showReplySettings && !showPending) return;
+        if (!showReplySettings && !showPending && !showNickname && !renameFriend && !showResetId) return;
         const onKey = (e) => {
-          if (e.key === 'Escape') { setShowReplySettings(false); setShowPending(false); }
+          if (e.key !== 'Escape') return;
+          setShowReplySettings(false);
+          setShowPending(false);
+          setShowNickname(false);
+          setRenameFriend(null);
+          setShowResetId(false);
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-      }, [showReplySettings, showPending]);
+      }, [showReplySettings, showPending, showNickname, renameFriend, showResetId]);
 
       // 自动滚动到底部
       React.useEffect(() => {
@@ -1281,7 +1404,7 @@ window.__ModuleLoader__.load({
       const filteredFriends = React.useMemo(() => {
         const q = search.trim().toLowerCase();
         let list = state.friends;
-        if (q) list = list.filter(f => (f.name || '').toLowerCase().includes(q) || (f.id || '').toLowerCase().includes(q));
+        if (q) list = list.filter(f => (displayName(f)).toLowerCase().includes(q) || (f.alias || '').toLowerCase().includes(q) || (f.id || '').toLowerCase().includes(q));
         // 按最近消息时间排序
         return list.slice().sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
       }, [state.friends, search]);
@@ -1298,15 +1421,20 @@ window.__ModuleLoader__.load({
       const openCtxMenu = (e, f) => {
         e.preventDefault();
         e.stopPropagation();
-        const pos = clampMenuPosition(e.clientX, e.clientY, window.innerWidth, window.innerHeight, 200, 210);
+        const pos = clampMenuPosition(e.clientX, e.clientY, window.innerWidth, window.innerHeight, 210, 250);
         setCtxMenu({ id: f.id, left: pos.left, top: pos.top });
       };
 
       const ctxFriend = ctxMenu ? state.friends.find(f => f.id === ctxMenu.id) : null;
 
+      const openRenameFriend = (f) => {
+        setCtxMenu(null);
+        setRenameFriend({ id: f.id, alias: f.alias || '' });
+      };
+
       const requestDeleteFriend = (f) => {
         setCtxMenu(null);
-        setConfirmDel({ id: f.id, name: f.name || shortId(f.id) });
+        setConfirmDel({ id: f.id, name: displayName(f) });
       };
 
       const doDeleteFriend = () => {
@@ -1338,7 +1466,26 @@ window.__ModuleLoader__.load({
               h('button', { className: 'pm-icon-btn', title: '显示二维码', onClick: () => setShowQR(true), disabled: !myId }, '▦'),
               h('button', { className: 'pm-icon-btn', title: '自动回复设置', onClick: openReplySettings }, '⚙'),
             ),
-            peerError ? h('div', { className: 'pm-peer-error' }, peerError) : null,
+            // 显示名称（hello 握手）+ 重置 Peer ID 入口
+            h('div', { className: 'pm-nick-row' },
+              h('span', { className: 'pm-nick-label' }, '显示名称'),
+              h('span', { className: 'pm-nick-value', title: settings.nickname || '默认：ID 前缀' }, settings.nickname || '（默认：ID 前缀）'),
+              h('button', {
+                className: 'pm-icon-btn', title: '修改显示名称',
+                onClick: () => { setNicknameDraft(settings.nickname || ''); setShowNickname(true); },
+              }, '✎'),
+              h('button', {
+                className: 'pm-link-btn', title: '重置 Peer ID（生成新 ID）',
+                onClick: () => setShowResetId(true),
+              }, '重置 ID'),
+            ),
+            peerError ? h('div', { className: 'pm-peer-error-box' },
+              h('div', { className: 'pm-peer-error' }, peerError),
+              h('div', { className: 'pm-peer-error-actions' },
+                h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.retryPeer() }, '重试连接'),
+                peerErrorType === 'unavailable-id' ? h('button', { className: 'pm-btn small danger', type: 'button', onClick: () => setShowResetId(true) }, '重置 ID') : null,
+              ),
+            ) : null,
             // 后台运行开关（持久化；面板关闭时由 pmService 继续生效）
             h('div', { className: 'pm-toggle-row' },
               h('label', { className: 'pm-toggle' },
@@ -1384,9 +1531,9 @@ window.__ModuleLoader__.load({
                   onClick: () => selectFriend(f.id),
                   onContextMenu: (e) => openCtxMenu(e, f),
                 },
-                  h('div', { className: 'pm-avatar', style: { background: avatarColor(f.id) } }, (f.name || shortId(f.id) || '?').slice(0, 1).toUpperCase()),
+                  h('div', { className: 'pm-avatar', style: { background: avatarColor(f.id) } }, (displayName(f) || '?').slice(0, 1).toUpperCase()),
                   h('div', { className: 'pm-friend-info' },
-                    h('div', { className: 'pm-friend-name' }, f.name || shortId(f.id)),
+                    h('div', { className: 'pm-friend-name', title: f.alias ? displayName(f) + ' · ' + f.id : (f.name && f.name !== shortId(f.id) ? f.name + ' · ' + f.id : f.id) }, displayName(f)),
                     h('div', { className: 'pm-friend-last' }, f.lastMsg || (f.online ? '在线' : '离线')),
                   ),
                   f.unread > 0 ? h('span', { className: 'pm-unread' }, f.unread > 99 ? '99+' : f.unread) : null,
@@ -1403,9 +1550,9 @@ window.__ModuleLoader__.load({
         active
           ? h('div', { className: 'pm-chat' },
               h('div', { className: 'pm-chat-header' },
-                h('div', { className: 'pm-avatar', style: { background: avatarColor(active.id), width: 32, height: 32, fontSize: 13 } }, (active.name || shortId(active.id) || '?').slice(0, 1).toUpperCase()),
+                h('div', { className: 'pm-avatar', style: { background: avatarColor(active.id), width: 32, height: 32, fontSize: 13 } }, (displayName(active) || '?').slice(0, 1).toUpperCase()),
                 h('div', { className: 'pm-chat-header-info' },
-                  h('div', { className: 'pm-chat-header-name', title: active.name || active.id }, active.name || shortId(active.id)),
+                  h('div', { className: 'pm-chat-header-name', title: active.alias ? active.alias + ' · ' + active.name + ' · ' + active.id : (active.name ? active.name + ' · ' + active.id : active.id) }, displayName(active)),
                   h('div', { className: 'pm-chat-header-status' }, active.online ? '在线' : '离线'),
                 ),
               ),
@@ -1461,7 +1608,7 @@ window.__ModuleLoader__.load({
             style: { left: ctxMenu.left, top: ctxMenu.top },
             onContextMenu: (e) => e.preventDefault(),
           },
-            h('div', { className: 'pm-ctx-title', title: ctxFriend.name || ctxFriend.id }, ctxFriend.name || shortId(ctxFriend.id)),
+            h('div', { className: 'pm-ctx-title', title: ctxFriend.alias ? ctxFriend.alias + ' · ' + ctxFriend.id : (ctxFriend.name && ctxFriend.name !== shortId(ctxFriend.id) ? ctxFriend.name + ' · ' + ctxFriend.id : ctxFriend.id) }, displayName(ctxFriend)),
             h('button', {
               className: 'pm-ctx-item', role: 'menuitem', type: 'button',
               onClick: () => { setCtxMenu(null); selectFriend(ctxFriend.id); },
@@ -1478,6 +1625,10 @@ window.__ModuleLoader__.load({
               disabled: !ctxFriend.unread,
               onClick: () => { setCtxMenu(null); pmService.markRead(ctxFriend.id); pmService.showToast('已标记为已读'); },
             }, h('span', { 'aria-hidden': 'true' }, '✓'), '标记已读'),
+            h('button', {
+              className: 'pm-ctx-item', role: 'menuitem', type: 'button',
+              onClick: () => openRenameFriend(ctxFriend),
+            }, h('span', { 'aria-hidden': 'true' }, '✎'), '设置备注名…'),
             h('div', { className: 'pm-ctx-sep' }),
             h('button', {
               className: 'pm-ctx-item danger', role: 'menuitem', type: 'button',
@@ -1495,6 +1646,65 @@ window.__ModuleLoader__.load({
             h('div', { className: 'pm-modal-btns' },
               h('button', { className: 'pm-btn', type: 'button', onClick: () => setConfirmDel(null) }, '取消'),
               h('button', { className: 'pm-btn danger', type: 'button', onClick: doDeleteFriend }, '删除好友'),
+            ),
+          ),
+        ) : null,
+
+        // 显示名称 / 好友备注 / 重置 Peer ID 弹窗
+        showNickname ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setShowNickname(false) },
+          h('div', { className: 'pm-modal pm-modal-narrow', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
+            h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setShowNickname(false) }, '✕'),
+            h('div', { className: 'pm-modal-title' }, '显示名称'),
+            h('div', { className: 'pm-field' },
+              h('label', { className: 'pm-field-label' }, '好友看到的名称'),
+              h('input', {
+                className: 'pm-text-input', maxLength: MAX_NAME_LEN, value: nicknameDraft,
+                placeholder: '留空 = 使用 ID 前缀',
+                onChange: e => setNicknameDraft(e.target.value),
+                onKeyDown: e => { if (e.key === 'Enter') { if (pmService.setNickname(nicknameDraft)) setShowNickname(false); } },
+              }),
+              h('div', { className: 'pm-hint' }, '连接建立时通过 hello 握手发给对方；修改后会立即广播给已连接好友。最多 ' + MAX_NAME_LEN + ' 字。'),
+            ),
+            h('div', { className: 'pm-modal-btns' },
+              h('button', { className: 'pm-btn', type: 'button', onClick: () => setShowNickname(false) }, '取消'),
+              h('button', { className: 'pm-btn primary', type: 'button', onClick: () => { if (pmService.setNickname(nicknameDraft)) setShowNickname(false); } }, '保存'),
+            ),
+          ),
+        ) : null,
+        renameFriend ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setRenameFriend(null) },
+          h('div', { className: 'pm-modal pm-modal-narrow', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
+            h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setRenameFriend(null) }, '✕'),
+            h('div', { className: 'pm-modal-title' }, '设置备注名'),
+            h('div', { className: 'pm-field-static' }, renameFriend.id),
+            h('div', { className: 'pm-field' },
+              h('label', { className: 'pm-field-label' }, '备注名（只保存在本机）'),
+              h('input', {
+                className: 'pm-text-input', maxLength: MAX_NAME_LEN, value: renameFriend.alias,
+                placeholder: '留空 = 使用对方昵称',
+                onChange: e => setRenameFriend(prev => Object.assign({}, prev, { alias: e.target.value })),
+                onKeyDown: e => {
+                  if (e.key !== 'Enter') return;
+                  if (pmService.setFriendAlias(renameFriend.id, renameFriend.alias)) setRenameFriend(null);
+                },
+              }),
+              h('div', { className: 'pm-hint' }, '备注名优先于对方 hello 发来的昵称；对方改名不会覆盖你的备注。'),
+            ),
+            h('div', { className: 'pm-modal-btns' },
+              h('button', { className: 'pm-btn', type: 'button', onClick: () => setRenameFriend(null) }, '取消'),
+              h('button', { className: 'pm-btn primary', type: 'button', onClick: () => { if (pmService.setFriendAlias(renameFriend.id, renameFriend.alias)) setRenameFriend(null); } }, '保存'),
+            ),
+          ),
+        ) : null,
+        showResetId ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setShowResetId(false) },
+          h('div', { className: 'pm-modal pm-modal-narrow', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
+            h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setShowResetId(false) }, '✕'),
+            h('div', { className: 'pm-modal-title' }, '重置 Peer ID'),
+            h('div', { className: 'pm-field-static' }, '当前 ID：' + (myId || '未连接')),
+            h('div', { className: 'pm-confirm-text', style: { textAlign: 'left' } }, '将为这台浏览器生成一个新的 Peer ID 并立即重连。适用于固定 ID 被其他标签页或旧会话占用、重试也无效的情况。'),
+            h('div', { className: 'pm-warn' }, '旧好友仍保留在列表，但对方需要重新添加你的新 ID；如果对方关闭了「广播」，你的新连接可能被当成陌生人拒收。'),
+            h('div', { className: 'pm-modal-btns' },
+              h('button', { className: 'pm-btn', type: 'button', onClick: () => setShowResetId(false) }, '取消'),
+              h('button', { className: 'pm-btn danger', type: 'button', onClick: () => { pmService.resetPeerId(); setShowResetId(false); } }, '重置 ID'),
             ),
           ),
         ) : null,

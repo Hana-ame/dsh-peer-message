@@ -24,8 +24,12 @@ a session's agent send P2P messages through the `pm_send` tool, alongside
 - **Unread-count badges** — each friend row shows the number of unread messages.
 - **Night-mode compatible** — the UI styles use `--dsw-alias-*` design tokens,
   so it adapts to the active DSH theme (light/dark).
-- **Stable peer ID** — the peer ID is persisted in `localStorage` and reused
-  across page reloads, so a restart of the DSH Web process does not change it.
+- **Stable peer ID with recovery** — the peer ID is persisted in `localStorage`
+  and reused across page reloads. If another DSH tab or a stale session still
+  holds it, the panel offers **重试连接** and **重置 ID** instead of a dead end.
+- **Display names and remarks** — set your own nickname (sent over the `hello`
+  handshake in both directions) and give friends local-only remarks that always
+  win over the nickname their client sends.
 - **Agent `pm_send` tool** — a `Peer Chat` agent preset exposes `pm_send`
   (queue a P2P message to a peer), `web_search`, and `web_fetch`, with the
   global tools (`bash`, `fs`, `browser_*`, `plugin_manager`, …) hidden.
@@ -130,6 +134,40 @@ only enable it for peers you trust.
 | `/api/pm-reply/approve` | POST | run one parked manual request |
 | `/api/pm-reply/reject` | POST | drop one parked manual request |
 | `/api/pm-reply/catalog` | GET | endpoints/models, sessions, workspaces for the settings UI |
+
+## Display names, remarks, and Peer ID
+
+### Your display name
+
+The sidebar shows **显示名称** under your peer ID; the ✎ button edits it (max 32
+characters, empty = use the peer-ID prefix). The nickname is persisted in
+`settings.nickname` and sent as `{type:"hello", name:…}` when a connection
+opens — from both the dialing and the accepting side, so each peer knows the
+other's name. Editing it broadcasts a fresh `hello` to all live connections.
+Defaults are never a hard-coded "我" any more.
+
+### Friend remarks
+
+Right-click a friend → **设置备注名…**. Remarks are local-only (`friend.alias`)
+and always take precedence over the nickname the other side sends; an incoming
+`hello` only updates `friend.name`, never the remark. Search matches the
+display name, the remark and the peer ID.
+
+Display priority: `alias` → received `hello` name → peer-ID prefix.
+
+### Peer ID occupied / reset
+
+The peer ID is a stable localStorage identity, so it is normally reused after a
+reload. PeerJS allows only one live connection per ID, so the ID can be reported
+as `unavailable-id` when another DSH tab in the same browser — or a stale
+session — still holds it. The panel then shows a box with:
+
+- **重试连接** — reconnect with the same stable ID (use after closing the other
+  tab or waiting for the stale session to drop);
+- **重置 ID** — generate a new peer ID, persist it and reconnect immediately.
+  This is a confirmation dialog because the identity changes: friends stay in
+  the list, but they must add your new ID, and peers with broadcast disabled may
+  reject the new connection as a stranger. The new ID is also shown in a toast.
 
 ## Installation
 
