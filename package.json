@@ -23,7 +23,9 @@
     "./outbox": "./outbox.js",
     "./validate": "./validate.js",
     "./package.json": "./package.json",
-    "./locale/*.json": "./locale/*.json"
+    "./locale/*.json": "./locale/*.json",
+    "./reply-core": "./reply-core.js",
+    "./reply-runner": "./reply-runner.js"
   },
   "files": [
     "index.js",
@@ -31,6 +33,8 @@
     "tool.js",
     "outbox.js",
     "validate.js",
+    "reply-runner.js",
+    "reply-core.js",
     "locale",
     "cordis.patch.yml"
   ],

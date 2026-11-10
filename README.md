@@ -29,6 +29,11 @@ a session's agent send P2P messages through the `pm_send` tool, alongside
 - **Agent `pm_send` tool** — a `Peer Chat` agent preset exposes `pm_send`
   (queue a P2P message to a peer), `web_search`, and `web_fetch`, with the
   global tools (`bash`, `fs`, `browser_*`, `plugin_manager`, …) hidden.
+- **Agent auto-reply callback** — inbound friend messages can trigger one
+  agent turn that answers back over P2P: off / manual-approve / fully
+  automatic, with a five-level capability gate, endpoint + model selection,
+  per-peer dedicated or shared existing session, and a configurable working
+  path. See [Agent auto-reply](#agent-auto-reply).
 
 ## Friend management
 
@@ -44,6 +49,87 @@ Right-click a friend row to open its action menu:
 changing any data; `Escape` or **取消** dismisses the delete dialog. The menu is
 anchored at the pointer and clamped to the viewport, so right-clicking near the
 bottom-right corner still leaves every menu item clickable.
+
+## Agent auto-reply
+
+The sidebar ⚙ button opens **P2P 自动回复设置**. When enabled, every inbound
+text message from a friend is handed to the Host half of the bundle, which runs
+one agent turn and sends the final answer back to that peer over P2P. The
+browser half never executes tools or models itself: it only POSTs the untrusted
+message to the Host and displays the result.
+
+### Reply modes
+
+| Mode | Behavior |
+| --- | --- |
+| 关闭 (`off`) | No agent call at all (default). |
+| 手动批准 (`manual`) | Inbound messages land in the pending queue; nothing runs until you click **批准回复**. **忽略** drops the request. |
+| 全自动 (`auto`) | Each inbound message runs a reply turn immediately, bounded by the rate limits below. |
+
+### Capability modes (permission of the reply agent)
+
+| Mode | Sandbox / approval appended to the session | Tool gate (`tools/pre-execute`) |
+| --- | --- | --- |
+| 全不允许 (`deny-all`) | `read-only` + `ask` (defense in depth) | denies **every** tool |
+| 只读 (`read`) | `read-only` + `ask` | allows `read`, `read_image`, `glob`, `grep`, `web_search`, `web_fetch` only |
+| 只写 (`write`) | `workspace-write` + `ask` | allows `write`, `edit`, `present` only |
+| 读写 (`readwrite`) | `workspace-write` + `ask` | every tool; writes stay inside the session workspace |
+| 全自动 (`auto`) | `danger-full-access` + `never` | every tool, no approval prompts |
+
+The gate is enforced by the Host plugin on `tools/pre-execute`; the sandbox /
+approval pair is appended to the session log as a second layer. `deny-all`
+still lets the model answer from its own knowledge, it just cannot touch any
+tool.
+
+### Model, endpoint, session, working path
+
+- **Endpoint + model** — picked from the live `modelCatalog()` (all configured
+  providers and routable models, plus reasoning-effort choices when offered).
+  Leaving both empty uses the session / deployment default.
+- **Session** — `dedicated` (default) creates one session per friend and reuses
+  it for later replies, preserving context; `existing` injects the message into
+  a session you pick from the session list. In `existing` mode the capability
+  pair is applied for the reply turn and then restored; the session's current
+  model may be switched to the configured endpoint/model.
+- **Working path** — absolute `cwd` for dedicated sessions; pick one of the
+  registered workspaces or type any absolute existing directory.
+
+Pending approvals, running turns, and recent results are polled every 2.5 s and
+shown in the panel (a badge appears above the friend list). Settings persist in
+the same `localStorage` state as friends/messages (`settings.reply`).
+
+### Security model
+
+Inbound P2P text is untrusted:
+
+- the prompt fences the message in `<incoming_p2p_message>` and explicitly
+  forbids following instructions from the body; literal fence tags in the body
+  are defanged so they cannot break out of the envelope;
+- the browser sends plain text only; the Host re-validates peer ID, text length
+  (§4096), config enums and pending caps;
+- per-peer cooldown (5 s), per-peer window (6/min) and global window (20/min)
+  bound model spend; at most 20 requests can wait for approval;
+- replies are prefixed with `[自动回复] ` so the receiver can tell the message
+  is AI-generated, and a message already carrying that marker never triggers
+  another reply — two auto-replying peers cannot ping-pong forever;
+- only text from existing friends triggers a callback; `hello` handshakes,
+  objects, empty and control-only payloads are ignored.
+
+Limits worth knowing: P2P lives in the browser, so a reply can only run while a
+DSH Web tab is open; the pending queue is in Host memory (lost on restart); the
+per-peer dedicated-session mapping is per DSH process (after a restart the next
+message may create a new session); `auto` mode is a genuine remote-code path —
+only enable it for peers you trust.
+
+### Host routes
+
+| Route | Method | Purpose |
+| --- | --- | --- |
+| `/api/pm-reply/request` | POST | browser reports one inbound message (`peerId`, `text`, `config`) |
+| `/api/pm-reply/requests` | GET | pending / running / recent reply state |
+| `/api/pm-reply/approve` | POST | run one parked manual request |
+| `/api/pm-reply/reject` | POST | drop one parked manual request |
+| `/api/pm-reply/catalog` | GET | endpoints/models, sessions, workspaces for the settings UI |
 
 ## Installation
 
@@ -109,9 +195,11 @@ reloads.
 
 | File | Role |
 | --- | --- |
-| `index.js` | Host plugin — registers `/api/pm-outbox` fetch route |
+| `index.js` | Host plugin — `/api/pm-outbox` + `/api/pm-reply/*` routes and the reply runner wiring |
+| `reply-core.js` | Pure auto-reply config/policy/prompt/rate-limit helpers |
+| `reply-runner.js` | Host auto-reply runner — session/model/permission setup, turn capture, outbox delivery |
 | `tool.js` | Preset plugin — `pm_send` tool + tool-surface restriction |
-| `client.js` | Client plugin — chat panel UI, PeerJS, persistence |
+| `client.js` | Client plugin — chat panel UI, PeerJS, persistence, reply settings/approval UI |
 | `outbox.js` | Shared outbound queue module |
 | `validate.js` | Shared peer-ID / text validation and sanitization |
 | `locale/en.json`, `locale/zh.json` | UI strings |
@@ -122,6 +210,15 @@ reloads.
 ```bash
 npm test   # runs test/*.test.js
 ```
+
+Host-side files (`index.js`, `reply-core.js`, `reply-runner.js`) are ESM
+modules imported by the DSH Host loader. A running `dsh web` only re-reads
+bundle patch layers on restart, so host changes need either a DSH restart or a
+deliberate hot-mount during development (a `file:///…/index.js?rev=<new>`
+insert row in the Home patch layer, see `$DSH_HOME/cordis.patch.yml`). The
+relative `reply-runner.js?rev=` import in `index.js` exists to bust Node's ESM
+cache under that hot-mount workflow; bump it when editing `reply-runner.js`.
+Client plugin changes hot-reload automatically.
 
 ## License
 

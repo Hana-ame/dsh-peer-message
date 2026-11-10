@@ -59,6 +59,45 @@ window.__ModuleLoader__.load({
     // ── 后台运行开关（随主 state 持久化，面板关闭也生效） ────────────────
     const DEFAULT_SETTINGS = { allowBroadcast: false, allowIncoming: true };
 
+    // ── 自动回复配置（随 settings 持久化；Host 侧 reply-core.js 会再校验一次） ──
+    const DEFAULT_REPLY = {
+      mode: 'off',              // off | manual | auto
+      permission: 'read',       // deny-all | read | write | readwrite | auto
+      provider: '',             // 空 = 会话/部署默认 endpoint
+      model: '',
+      reasoningEffort: '',
+      sessionMode: 'dedicated', // dedicated = 每个好友独立会话；existing = 指定会话
+      sessionId: '',
+      cwd: '',                  // 空 = Host 进程 cwd
+    };
+    const REPLY_MODES = ['off', 'manual', 'auto'];
+    const PERMISSION_MODES = ['deny-all', 'read', 'write', 'readwrite', 'auto'];
+    const AUTO_REPLY_PREFIX = '[自动回复] ';
+    const REPLY_MODE_LABELS = { off: '关闭', manual: '手动批准', auto: '全自动' };
+    const REPLY_PERMISSION_LABELS = {
+      'deny-all': '全不允许（禁用所有工具）',
+      read: '只读',
+      write: '只写',
+      readwrite: '读写（限定工作路径）',
+      auto: '全自动（全盘读写 + 免审批）',
+    };
+
+    function coerceReplyConfig(raw) {
+      const d = DEFAULT_REPLY;
+      const r = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+      const str = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
+      return {
+        mode: REPLY_MODES.includes(r.mode) ? r.mode : d.mode,
+        permission: PERMISSION_MODES.includes(r.permission) ? r.permission : d.permission,
+        provider: str(r.provider, 120),
+        model: str(r.model, 160),
+        reasoningEffort: str(r.reasoningEffort, 60),
+        sessionMode: r.sessionMode === 'existing' ? 'existing' : 'dedicated',
+        sessionId: str(r.sessionId, 200),
+        cwd: str(r.cwd, 500),
+      };
+    }
+
     // 默认 PeerJS 云服务器；可通过 config 覆盖
     const DEFAULT_PEER_CONFIG = {
       debug: 1,
@@ -78,6 +117,7 @@ window.__ModuleLoader__.load({
       return {
         allowBroadcast: raw && typeof raw.allowBroadcast === 'boolean' ? raw.allowBroadcast : d.allowBroadcast,
         allowIncoming: raw && typeof raw.allowIncoming === 'boolean' ? raw.allowIncoming : d.allowIncoming,
+        reply: coerceReplyConfig(raw && raw.reply),
       };
     }
 
@@ -233,6 +273,30 @@ window.__ModuleLoader__.load({
       '.pm-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;}',
       '.pm-toggle input{accent-color:var(--dsw-alias-brand-primary,#3b82f6);cursor:pointer;}',
       '.pm-toggle-text{font-size:11px;color:var(--dsw-alias-label-secondary,inherit);}',
+
+      // ── 自动回复：状态条 / 待批准 / 设置弹窗 ──────────────────────────
+      '.pm-reply-row{margin-top:8px;display:flex;align-items:center;gap:6px;padding:6px 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.18));background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.06));font-size:11px;cursor:pointer;}',
+      '.pm-reply-row:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));}',
+      '.pm-reply-row .pm-reply-dot{width:7px;height:7px;border-radius:50%;flex:none;}',
+      '.pm-reply-row-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary,inherit);}',
+      '.pm-reply-count{min-width:16px;height:16px;border-radius:8px;background:var(--dsw-alias-state-error-primary,#ef4444);color:#fff;font-size:9px;line-height:16px;text-align:center;padding:0 4px;}',
+      '.pm-modal-wide{width:480px;max-width:94vw;max-height:86vh;overflow-y:auto;align-items:stretch;}',
+      '.pm-field{margin-bottom:12px;}',
+      '.pm-field-label{display:block;font-size:11px;color:var(--dsw-alias-label-secondary,inherit);margin-bottom:4px;}',
+      '.pm-select,.pm-text-input{width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.25));background:var(--dsw-alias-bg-base,transparent);color:var(--dsw-alias-label-primary,inherit);font-size:12px;font-family:inherit;outline:none;}',
+      '.pm-select:focus,.pm-text-input:focus{border-color:var(--dsw-alias-brand-primary,inherit);}',
+      '.pm-hint{font-size:10px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit);margin-top:4px;}',
+      '.pm-warn{font-size:10px;line-height:1.6;color:var(--dsw-alias-state-error-primary,#ef4444);margin-top:4px;}',
+      '.pm-modal-section-title{font-size:12px;font-weight:600;margin:4px 0 8px;padding-top:8px;border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.15));}',
+      '.pm-pending-item{border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.2));border-radius:8px;padding:8px 10px;margin-bottom:8px;background:var(--dsw-alias-bg-layer-1,transparent);}',
+      '.pm-pending-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:10px;color:var(--dsw-alias-label-secondary,inherit);}',
+      '.pm-pending-text{font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:110px;overflow-y:auto;margin:6px 0;color:var(--dsw-alias-label-primary,inherit);}',
+      '.pm-pending-btns{display:flex;gap:6px;justify-content:flex-end;}',
+      '.pm-btn.small{padding:4px 10px;font-size:11px;flex:none;}',
+      '.pm-reply-status-list{max-height:180px;overflow-y:auto;font-size:11px;line-height:1.6;}',
+      '.pm-reply-status-row{display:flex;gap:6px;padding:2px 0;color:var(--dsw-alias-label-secondary,inherit);}',
+      '.pm-reply-status-ok{color:var(--dsw-alias-state-success-primary,#22c55e);}',
+      '.pm-reply-status-bad{color:var(--dsw-alias-state-error-primary,#ef4444);}',
     ].join('');
 
     // ── 侧栏未读徽标共享 store ──────────────────────────────────────────
@@ -348,6 +412,15 @@ window.__ModuleLoader__.load({
       pollTimer: null,
       reconnectTimer: null,
       polling: false,
+      // 自动回复（后台）：pending/running/recent 是 Host 侧内存态，面板只是视图。
+      replyCatalog: null,
+      replyPending: [],
+      replyRunning: [],
+      replyRecent: [],
+      replyUnavailable: false,
+      replyPollTimer: null,
+      replyPolling: false,
+      replyLastRecentId: '',
       started: false,
       version: 0,
       _snap: null,
@@ -375,6 +448,12 @@ window.__ModuleLoader__.load({
             peerError: this.peerError,
             toast: this.toast,
             settings: this.settings,
+            reply: this.settings.reply,
+            replyCatalog: this.replyCatalog,
+            replyPending: this.replyPending,
+            replyRunning: this.replyRunning,
+            replyRecent: this.replyRecent,
+            replyUnavailable: this.replyUnavailable,
             version: this.version,
           };
         }
@@ -433,6 +512,9 @@ window.__ModuleLoader__.load({
         });
         // agent 队列轮询：面板不打开也照常排水投递（消息要跑在后台）。
         this.pollTimer = setInterval(() => this.drainOutbox(), 1000);
+        // 自动回复状态轮询：待批准请求 / 正在回复 / 最近结果（面板不打开也跑）。
+        this.replyPollTimer = setInterval(() => this.pollReplies(), 2500);
+        this.pollReplies();
         // 慢速后台重连：每 30s 重试不在线的好友。
         this.reconnectTimer = setInterval(() => {
           if (this.peer && this.peer.open) this.reconnectAll();
@@ -441,6 +523,10 @@ window.__ModuleLoader__.load({
 
       stop() {
         if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
+        if (this.replyPollTimer) { clearInterval(this.replyPollTimer); this.replyPollTimer = null; }
+        this.replyPending = [];
+        this.replyRunning = [];
+        this.replyRecent = [];
         if (this.reconnectTimer) { clearInterval(this.reconnectTimer); this.reconnectTimer = null; }
         if (this.reconnectTimer2) { clearTimeout(this.reconnectTimer2); this.reconnectTimer2 = null; }
         for (const id of Object.keys(this.conns)) {
@@ -618,6 +704,8 @@ window.__ModuleLoader__.load({
             messages[remoteId] = msgs;
             return Object.assign({}, prev, { friends, messages });
           });
+          // 好友文本入站 → 交给 Host 回调管线（关闭/全不允许等策略在 Host 再校验）。
+          if (this.state.friends.some(f => f.id === remoteId)) this.maybeRequestReply(remoteId, text);
         } else if (data && typeof data === 'object') {
           if (data.type === 'hello') {
             // 攻防加固：昵称非字符串/空 → 丢弃，绝不写进 state（防对象打崩渲染）。
@@ -732,6 +820,127 @@ window.__ModuleLoader__.load({
         this.showToast('已投递 agent 消息');
       },
 
+      // ── 自动回复（Host 回气管线） ─────────────────────────────────────
+      // 入站消息只是触发 Host 侧 agent；权限/模型/会话/工作路径全部由 Host
+      // 按下面持久化的 settings.reply 校验并执行，浏览器不直接跑任何工具。
+      setReplyConfig(patch) {
+        const next = coerceReplyConfig(Object.assign({}, this.settings.reply, patch || {}));
+        this.update(prev => Object.assign({}, prev, {
+          settings: Object.assign({}, prev.settings || coerceSettings(null), { reply: next }),
+        }));
+        return next;
+      },
+
+      // 打开设置弹窗时才拉 catalog（endpoint/模型、会话列表、workspace 列表）。
+      async loadReplyCatalog(force) {
+        if (this.replyCatalog && !force) return this.replyCatalog;
+        try {
+          const res = await fetch('/api/pm-reply/catalog', { headers: { 'cache-control': 'no-cache' } });
+          if (!res.ok) { this.replyUnavailable = true; this.emit(); return null; }
+          const data = await res.json();
+          if (!data || data.ok === false) { this.replyUnavailable = true; this.emit(); return null; }
+          this.replyCatalog = data;
+          this.replyUnavailable = false;
+          this.emit();
+          return data;
+        } catch (e) {
+          this.replyUnavailable = true;
+          this.emit();
+          return null;
+        }
+      },
+
+      async pollReplies() {
+        if (this.replyPolling) return;
+        this.replyPolling = true;
+        try {
+          const res = await fetch('/api/pm-reply/requests', { headers: { 'cache-control': 'no-cache' } });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.ok !== false) {
+              const pending = Array.isArray(data.pending) ? data.pending : [];
+              const running = Array.isArray(data.running) ? data.running : [];
+              const recent = Array.isArray(data.recent) ? data.recent : [];
+              this.replyPending = pending;
+              this.replyRunning = running;
+              this.replyRecent = recent;
+              this.replyUnavailable = false;
+              const latest = recent[0];
+              if (latest && latest.id !== this.replyLastRecentId) {
+                this.replyLastRecentId = latest.id;
+                if (latest.status === 'failed') this.showToast('自动回复失败：' + (latest.error || '未知错误'));
+                else if (latest.status === 'sent') this.showToast('自动回复已投递');
+              }
+              this.emit();
+            }
+          } else if (res.status === 503) {
+            this.replyUnavailable = true;
+            this.emit();
+          }
+        } catch (e) { /* 静默：下次轮询重试 */ }
+        this.replyPolling = false;
+      },
+
+      async approveReply(id) {
+        try {
+          const res = await fetch('/api/pm-reply/approve', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (res.ok && data.ok) this.showToast('已批准，开始生成回复');
+          else this.showToast('批准失败：' + (data.error || ('HTTP ' + res.status)));
+        } catch (e) {
+          this.showToast('批准失败：无法连接 Host');
+        }
+        this.pollReplies();
+      },
+
+      async rejectReply(id) {
+        try {
+          const res = await fetch('/api/pm-reply/reject', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (res.ok && data.ok) this.showToast('已忽略该条回复请求');
+          else this.showToast('忽略失败：' + (data.error || ('HTTP ' + res.status)));
+        } catch (e) {
+          this.showToast('忽略失败：无法连接 Host');
+        }
+        this.pollReplies();
+      },
+
+      // 入站文本 → Host 回调管线；关闭、空文本、自动回复标记（防死循环）直接跳过。
+      maybeRequestReply(peerId, text) {
+        const reply = this.settings.reply || DEFAULT_REPLY;
+        if (reply.mode === 'off') return;
+        const clean = typeof text === 'string' ? text.trim() : '';
+        if (!clean) return;
+        if (clean.startsWith(AUTO_REPLY_PREFIX)) return; // 对方也是自动回复：不再回调，避免互刷
+        const friend = this.state.friends.find(f => f.id === peerId);
+        fetch('/api/pm-reply/request', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            peerId,
+            peerName: friend ? friend.name : '',
+            text: clean,
+            config: reply,
+          }),
+        }).then(res => res.json().catch(() => ({}))).then(data => {
+          if (data && data.accepted === true) {
+            if (data.mode === 'manual') this.showToast('收到一条待批准的自动回复请求');
+            this.pollReplies();
+          } else if (data && data.reason === 'reply-service-unavailable') {
+            this.replyUnavailable = true;
+            this.emit();
+          }
+        }).catch(() => { /* 静默：不阻塞聊天 */ });
+      },
+
       // ── 面板调用的操作 ───────────────────────────────────────────────
       addFriend(targetId) {
         const id = (targetId || '').trim();
@@ -833,6 +1042,154 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'pm-qr-box', dangerouslySetInnerHTML: { __html: svg || '<div style="width:120px;height:120px;display:flex;align-items:center;justify-content:center;color:#999;font-size:12px">加载中…</div>' } });
     }
 
+    // ── 自动回复设置弹窗 ───────────────────────────────────────────────
+    function ReplySettingsModal({ initial, catalog, unavailable, onClose }) {
+      const [draft, setDraft] = React.useState(() => coerceReplyConfig(initial));
+      React.useEffect(() => {
+        pmService.loadReplyCatalog(false).catch(() => {});
+      }, []);
+      const groups = catalog && catalog.models && Array.isArray(catalog.models.groups) ? catalog.models.groups : [];
+      const selectedGroup = groups.find(g => g.id === draft.provider) || null;
+      const models = selectedGroup && Array.isArray(selectedGroup.models) ? selectedGroup.models : [];
+      const modelInfo = models.find(m => m.id === draft.model) || null;
+      const efforts = modelInfo && modelInfo.reasoning && Array.isArray(modelInfo.reasoning.efforts) ? modelInfo.reasoning.efforts : [];
+      const sessions = catalog && Array.isArray(catalog.sessions) ? catalog.sessions : [];
+      const workspaces = catalog && Array.isArray(catalog.workspaces) ? catalog.workspaces : [];
+      const patch = (p) => setDraft(prev => coerceReplyConfig(Object.assign({}, prev, p)));
+      const save = () => {
+        const next = pmService.setReplyConfig(draft);
+        pmService.showToast(next.mode === 'off' ? '自动回复已关闭' : '自动回复设置已保存');
+        onClose();
+      };
+      const modeHint = draft.mode === 'auto'
+        ? '每条好友文本都会自动调用所选模型回复，无人值守。请先确认权限模式足够收紧。'
+        : draft.mode === 'manual'
+          ? '收到好友文本后先进入「待批准」，你点批准才会调用模型。'
+          : '不触发任何 agent 调用，聊天行为与之前一致。';
+
+      return h('div', { className: 'pm-modal-overlay', onMouseDown: onClose },
+        h('div', { className: 'pm-modal pm-modal-wide', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
+          h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: onClose }, '✕'),
+          h('div', { className: 'pm-modal-title' }, 'P2P 自动回复设置'),
+          unavailable ? h('div', { className: 'pm-warn' }, 'Host 回调服务未就绪：请确认 dsh-peer-message 的 Host 半已加载。') : null,
+
+          h('div', { className: 'pm-field' },
+            h('label', { className: 'pm-field-label' }, '回复模式'),
+            h('select', { className: 'pm-select', 'data-field': 'mode', value: draft.mode, onChange: e => patch({ mode: e.target.value }) },
+              REPLY_MODES.map(m => h('option', { key: m, value: m }, REPLY_MODE_LABELS[m]))),
+            h('div', { className: 'pm-hint' }, modeHint),
+          ),
+
+          h('div', { className: 'pm-field' },
+            h('label', { className: 'pm-field-label' }, '回复 Agent 权限'),
+            h('select', { className: 'pm-select', 'data-field': 'permission', value: draft.permission, onChange: e => patch({ permission: e.target.value }) },
+              PERMISSION_MODES.map(m => h('option', { key: m, value: m }, REPLY_PERMISSION_LABELS[m]))),
+            h('div', { className: 'pm-hint' }, '只读=读/搜/网页；只写=写/编辑；读写=工作路径内读写；全自动=全盘读写且免审批；全不允许=禁用一切工具。'),
+            draft.permission === 'auto' ? h('div', { className: 'pm-warn' }, '「全自动」会让模型在无人审批的情况下读写本机文件、执行命令。只对可信对等端使用。') : null,
+          ),
+
+          h('div', { className: 'pm-modal-section-title' }, '回复使用的模型 / endpoint'),
+          h('div', { className: 'pm-field' },
+            h('label', { className: 'pm-field-label' }, 'Endpoint（模型提供方）'),
+            h('select', { className: 'pm-select', 'data-field': 'provider', value: draft.provider, onChange: e => patch({ provider: e.target.value, model: '' }) },
+              h('option', { value: '' }, '默认（跟随会话 / 部署配置）'),
+              groups.map(g => h('option', { key: g.id, value: g.id }, g.name || g.id))),
+          ),
+          h('div', { className: 'pm-field' },
+            h('label', { className: 'pm-field-label' }, '模型'),
+            h('select', { className: 'pm-select', 'data-field': 'model', value: draft.model, disabled: !draft.provider, onChange: e => patch({ model: e.target.value }) },
+              h('option', { value: '' }, draft.provider ? '该 endpoint 的默认模型' : '先选择 endpoint'),
+              models.map(m => h('option', { key: m.id, value: m.id }, m.name || m.id))),
+            efforts.length > 0 ? h('select', { className: 'pm-select', style: { marginTop: 6 }, value: draft.reasoningEffort, onChange: e => patch({ reasoningEffort: e.target.value }) },
+              h('option', { value: '' }, '推理强度：模型默认'),
+              efforts.map(effort => h('option', { key: effort.id, value: effort.id }, effort.name || effort.id))) : null,
+          ),
+
+          h('div', { className: 'pm-modal-section-title' }, '回复使用的会话 / 工作路径'),
+          h('div', { className: 'pm-field' },
+            h('select', { className: 'pm-select', 'data-field': 'sessionMode', value: draft.sessionMode, onChange: e => patch({ sessionMode: e.target.value }) },
+              h('option', { value: 'dedicated' }, '每个好友一个独立会话（推荐）'),
+              h('option', { value: 'existing' }, '复用指定现有会话')),
+            h('div', { className: 'pm-hint' }, draft.sessionMode === 'dedicated'
+              ? '首次回复时创建，之后同一好友复用该会话，保留上下文。'
+              : '会把好友消息作为用户消息注入该会话；权限在回复轮次内生效，结束后恢复原设置。'),
+          ),
+          draft.sessionMode === 'existing'
+            ? h('div', { className: 'pm-field' },
+                h('label', { className: 'pm-field-label' }, '现有会话'),
+                h('select', { className: 'pm-select', 'data-field': 'sessionId', value: draft.sessionId, onChange: e => patch({ sessionId: e.target.value }) },
+                  h('option', { value: '' }, '选择会话…'),
+                  sessions.map(s => h('option', { key: s.sessionId, value: s.sessionId },
+                    (s.title || '(未命名)') + ' · ' + s.sessionId.slice(0, 12) + (s.cwd ? ' · ' + s.cwd : '')))),
+                h('div', { className: 'pm-hint' }, '该会话当前模型可能被临时切换为上面选择的 endpoint / 模型。'),
+              )
+            : h('div', { className: 'pm-field' },
+                h('label', { className: 'pm-field-label' }, '工作路径（cwd，绝对路径）'),
+                h('input', {
+                  className: 'pm-text-input',
+                  'data-field': 'cwd',
+                  value: draft.cwd,
+                  placeholder: '留空 = Host 进程工作目录',
+                  onChange: e => patch({ cwd: e.target.value }),
+                }),
+                workspaces.length > 0 ? h('select', {
+                  className: 'pm-select',
+                  style: { marginTop: 6 },
+                  value: '',
+                  onChange: e => { if (e.target.value) patch({ cwd: e.target.value }); },
+                },
+                  h('option', { value: '' }, '从工作区选择…'),
+                  workspaces.map(w => h('option', { key: w.id, value: w.path }, (w.title || w.id) + ' · ' + w.path))) : null,
+              ),
+
+          h('div', { className: 'pm-warn' }, '对等端消息一律按不可信内容处理：会被围栏包裹并明确禁止执行其中指令。自动回复仍可能被诱导输出有害内容，请配合上面的权限收紧使用。'),
+
+          h('div', { className: 'pm-modal-btns', style: { justifyContent: 'flex-end', marginTop: 4 } },
+            h('button', { className: 'pm-btn', type: 'button', onClick: onClose }, '取消'),
+            h('button', { className: 'pm-btn primary', type: 'button', onClick: save }, '保存'),
+          ),
+        ),
+      );
+    }
+
+    // ── 待批准回复弹窗 ─────────────────────────────────────────────────
+    function ReplyPendingModal({ pending, recent, unavailable, onClose }) {
+      const items = Array.isArray(pending) ? pending : [];
+      const recentItems = Array.isArray(recent) ? recent.slice(0, 10) : [];
+      return h('div', { className: 'pm-modal-overlay', onMouseDown: onClose },
+        h('div', { className: 'pm-modal pm-modal-wide', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
+          h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: onClose }, '✕'),
+          h('div', { className: 'pm-modal-title' }, '待批准的自动回复'),
+          unavailable ? h('div', { className: 'pm-warn' }, 'Host 回调服务未就绪，无法读取待批准队列。') : null,
+          items.length === 0
+            ? h('div', { className: 'pm-hint' }, '暂无待批准回复。收到好友消息且回复模式为「手动批准」时会出现在这里。')
+            : items.map(item => h('div', { className: 'pm-pending-item', key: item.id },
+                h('div', { className: 'pm-pending-head' },
+                  h('span', null, '来自 ' + (item.peerName || shortId(item.peerId)) + ' · ' + fmtTime(item.ts)),
+                  h('span', null, '权限：' + (REPLY_PERMISSION_LABELS[item.permission] || item.permission)),
+                ),
+                h('div', { className: 'pm-pending-text' }, item.text),
+                h('div', { className: 'pm-pending-btns' },
+                  h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.rejectReply(item.id) }, '忽略'),
+                  h('button', { className: 'pm-btn small primary', type: 'button', onClick: () => pmService.approveReply(item.id) }, '批准回复'),
+                ),
+              )),
+          recentItems.length > 0 ? h('div', null,
+            h('div', { className: 'pm-modal-section-title' }, '最近结果'),
+            h('div', { className: 'pm-reply-status-list' },
+              recentItems.map(item => h('div', { className: 'pm-reply-status-row', key: item.id },
+                h('span', { className: item.status === 'sent' ? 'pm-reply-status-ok' : item.status === 'failed' ? 'pm-reply-status-bad' : '' },
+                  item.status === 'sent' ? '已投递' : item.status === 'failed' ? '失败' : item.status),
+                h('span', null, shortId(item.peerId) + (item.finishedAt ? ' · ' + fmtTime(item.finishedAt) : '')),
+                h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+                  item.reply || item.error || ''),
+              )),
+            ),
+          ) : null,
+        ),
+      );
+    }
+
     // ── 主面板（纯视图，网络全在 pmService） ─────────────────────────────
     function PeerMessagePanel() {
       const snap = usePmService();
@@ -842,17 +1199,29 @@ window.__ModuleLoader__.load({
       const peerError = snap.peerError;
       const toast = snap.toast;
       const settings = snap.settings || { allowBroadcast: false, allowIncoming: true };
+      const reply = snap.reply || DEFAULT_REPLY;
+      const replyPending = Array.isArray(snap.replyPending) ? snap.replyPending : [];
+      const replyRecent = Array.isArray(snap.replyRecent) ? snap.replyRecent : [];
+      const replyUnavailable = !!snap.replyUnavailable;
+      const replyCatalog = snap.replyCatalog;
 
       const [activeFriend, setActiveFriend] = React.useState(null);
       const [search, setSearch] = React.useState('');
       const [addId, setAddId] = React.useState('');
       const [draft, setDraft] = React.useState('');
       const [showQR, setShowQR] = React.useState(false);
+      const [showReplySettings, setShowReplySettings] = React.useState(false);
+      const [showPending, setShowPending] = React.useState(false);
       // 右键菜单：{ id, left, top }。右键只负责开菜单，绝不直接改好友数据。
       const [ctxMenu, setCtxMenu] = React.useState(null);
       // 删除确认：{ id, name }。确认框打开前不会有任何 removeFriend 调用。
       const [confirmDel, setConfirmDel] = React.useState(null);
       const chatRef = React.useRef(null);
+
+      const openReplySettings = () => {
+        setShowReplySettings(true);
+        pmService.loadReplyCatalog(false);
+      };
 
       // 活跃好友被删除时自动清空选择
       React.useEffect(() => {
@@ -887,6 +1256,16 @@ window.__ModuleLoader__.load({
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
       }, [confirmDel]);
+
+      // 自动回复设置 / 待批准弹窗：Escape 关闭。
+      React.useEffect(() => {
+        if (!showReplySettings && !showPending) return;
+        const onKey = (e) => {
+          if (e.key === 'Escape') { setShowReplySettings(false); setShowPending(false); }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [showReplySettings, showPending]);
 
       // 自动滚动到底部
       React.useEffect(() => {
@@ -951,6 +1330,7 @@ window.__ModuleLoader__.load({
               h('span', { className: 'pm-my-id-value', title: myId || '连接中…' }, myId || (peerStatus === 'connecting' ? '连接中…' : '未连接')),
               h('button', { className: 'pm-icon-btn', title: '复制 ID', onClick: copyMyId }, '⧉'),
               h('button', { className: 'pm-icon-btn', title: '显示二维码', onClick: () => setShowQR(true), disabled: !myId }, '▦'),
+              h('button', { className: 'pm-icon-btn', title: '自动回复设置', onClick: openReplySettings }, '⚙'),
             ),
             peerError ? h('div', { className: 'pm-peer-error' }, peerError) : null,
             // 后台运行开关（持久化；面板关闭时由 pmService 继续生效）
@@ -966,6 +1346,24 @@ window.__ModuleLoader__.load({
                 h('span', { className: 'pm-toggle-text' }, '接收新连接：', settings.allowIncoming ? '开' : '关（已建立连接不受影响）'),
               ),
             ),
+            // 自动回复状态：点开设置；有待批准时单独一条高亮入口。
+            h('div', { className: 'pm-reply-row', title: '自动回复设置', onClick: openReplySettings },
+              h('span', { className: 'pm-reply-dot', style: { background: reply.mode === 'auto' ? 'var(--dsw-alias-state-success-primary,#22c55e)' : reply.mode === 'manual' ? 'var(--dsw-alias-state-warning-primary,#f59e0b)' : 'var(--dsw-alias-state-idle-primary,rgba(127,127,127,.5))' } }),
+              h('span', { className: 'pm-reply-row-text' }, '自动回复：' + (REPLY_MODE_LABELS[reply.mode] || '关闭') + ' · ' + (REPLY_PERMISSION_LABELS[reply.permission] || reply.permission)),
+            ),
+            replyPending.length > 0 ? h('div', {
+              className: 'pm-reply-row',
+              style: { borderColor: 'var(--dsw-alias-state-warning-primary,#f59e0b)', marginTop: 4 },
+              title: '审核待批准回复',
+              onClick: () => setShowPending(true),
+            },
+              h('span', { className: 'pm-reply-count' }, replyPending.length > 99 ? '99+' : String(replyPending.length)),
+              h('span', { className: 'pm-reply-row-text' }, '条自动回复待批准，点击审核'),
+            ) : null,
+            snap.replyRunning && snap.replyRunning.length > 0 ? h('div', { className: 'pm-reply-row', style: { marginTop: 4 }, onClick: () => setShowPending(true) },
+              h('span', { className: 'pm-reply-dot', style: { background: 'var(--dsw-alias-brand-primary,#3b82f6)' } }),
+              h('span', { className: 'pm-reply-row-text' }, '正在生成 ' + snap.replyRunning.length + ' 条自动回复…'),
+            ) : null,
           ),
           h('div', { className: 'pm-search' },
             h('input', { className: 'pm-search-input', placeholder: '搜索好友', value: search, onChange: e => setSearch(e.target.value) }),
@@ -1094,6 +1492,20 @@ window.__ModuleLoader__.load({
             ),
           ),
         ) : null,
+
+        // 自动回复设置 / 待批准审核弹窗
+        showReplySettings ? h(ReplySettingsModal, {
+          initial: reply,
+          catalog: replyCatalog,
+          unavailable: replyUnavailable,
+          onClose: () => setShowReplySettings(false),
+        }) : null,
+        showPending ? h(ReplyPendingModal, {
+          pending: replyPending,
+          recent: replyRecent,
+          unavailable: replyUnavailable,
+          onClose: () => setShowPending(false),
+        }) : null,
 
         // Toast
         toast ? h('div', { className: 'pm-toast' }, toast) : null,
