@@ -242,6 +242,13 @@ window.__ModuleLoader__.load({
       '.pm-identity-row:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));}',
       '.pm-identity-lock{flex:none;font-size:10px;}',
       '.pm-role-row{margin-top:4px;font-size:10px;color:var(--dsw-alias-label-secondary,inherit);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      // 「更多设置」折叠开关：整行可点，右侧 carets 指示展开状态。
+      '.pm-more-toggle{display:flex;align-items:center;justify-content:space-between;gap:6px;width:100%;margin-top:8px;padding:4px 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.18));background:transparent;color:var(--dsw-alias-label-secondary,inherit);font-size:10px;font-family:inherit;cursor:pointer;text-align:left;transition:background .15s;}',
+      '.pm-more-toggle:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));}',
+      '.pm-more-toggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#3b82f6);outline-offset:1px;}',
+      '.pm-more-toggle-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.pm-more-toggle-caret{flex:none;font-size:9px;line-height:1;}',
+      '.pm-more-settings{margin-top:2px;padding-top:2px;border-top:1px dashed var(--dsw-alias-border-l1,rgba(127,127,127,.15));}',
       '.pm-identity-row-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.pm-modal-fp{width:100%;}',
       '.pm-identity-grid{display:grid;grid-template-columns:64px 1fr;gap:6px 10px;font-size:11px;line-height:1.6;}',
@@ -1079,6 +1086,9 @@ window.__ModuleLoader__.load({
       const [addId, setAddId] = React.useState('');
       const [draft, setDraft] = React.useState('');
       const [showQR, setShowQR] = React.useState(false);
+      // 「更多设置」默认隐藏：侧栏只留最常用信息（Peer ID / 身份 / 待办提醒），
+      // 其余配置折叠起来，需要时再展开（纯 UI 偏好，不写任何持久化状态）。
+      const [showMoreSettings, setShowMoreSettings] = React.useState(false);
       const [showReplySettings, setShowReplySettings] = React.useState(false);
       const [showPending, setShowPending] = React.useState(false);
       // 显示名称 / 好友备注 / 身份密钥
@@ -1230,6 +1240,26 @@ window.__ModuleLoader__.load({
                 : '身份未启用（非安全上下文）'),
               h('span', { className: 'pm-link-btn' }, '查看'),
             ),
+            // 错误提示放在折叠区之外：连接故障不属于「可选设置」，必须可见。
+            peerError ? h('div', { className: 'pm-peer-error-box' },
+              h('div', { className: 'pm-peer-error' }, peerError),
+              h('div', { className: 'pm-peer-error-actions' },
+                h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.retryPeer() }, '重试连接'),
+                peerErrorType === 'unavailable-id' ? h('button', { className: 'pm-btn small', type: 'button', onClick: () => setShowIdentity(true) }, '身份密钥') : null,
+              ),
+            ) : null,
+            // 展开/收起「更多设置」（默认收起）
+            h('button', {
+              className: 'pm-more-toggle',
+              type: 'button',
+              'aria-expanded': showMoreSettings,
+              title: showMoreSettings ? '隐藏更多设置' : '展开更多设置',
+              onClick: () => setShowMoreSettings((prev) => !prev),
+            },
+              h('span', { className: 'pm-more-toggle-label' }, showMoreSettings ? '隐藏更多设置' : '展开更多设置'),
+              h('span', { className: 'pm-more-toggle-caret', 'aria-hidden': 'true' }, showMoreSettings ? '▴' : '▾'),
+            ),
+            showMoreSettings ? h('div', { className: 'pm-more-settings' },
             // 多标签页连接持有角色（单连接协调；不改变身份/Peer ID）
             h('div', { className: 'pm-role-row', title: 'P2P 连接由 DSH Host 进程持有：关闭标签页也不会掉线，多标签页共用同一身份' },
               role === 'host'
@@ -1248,13 +1278,6 @@ window.__ModuleLoader__.load({
                 onClick: () => setShowIdentity(true),
               }, '身份密钥'),
             ),
-            peerError ? h('div', { className: 'pm-peer-error-box' },
-              h('div', { className: 'pm-peer-error' }, peerError),
-              h('div', { className: 'pm-peer-error-actions' },
-                h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.retryPeer() }, '重试连接'),
-                peerErrorType === 'unavailable-id' ? h('button', { className: 'pm-btn small', type: 'button', onClick: () => setShowIdentity(true) }, '身份密钥') : null,
-              ),
-            ) : null,
             // 后台运行开关（持久化；面板关闭时由 pmService 继续生效）
             h('div', { className: 'pm-toggle-row' },
               h('label', { className: 'pm-toggle' },
@@ -1273,6 +1296,8 @@ window.__ModuleLoader__.load({
               h('span', { className: 'pm-reply-dot', style: { background: reply.mode === 'auto' ? 'var(--dsw-alias-state-success-primary,#22c55e)' : reply.mode === 'manual' ? 'var(--dsw-alias-state-warning-primary,#f59e0b)' : 'var(--dsw-alias-state-idle-primary,rgba(127,127,127,.5))' } }),
               h('span', { className: 'pm-reply-row-text' }, '自动回复：' + (REPLY_MODE_LABELS[reply.mode] || '关闭') + ' · ' + (REPLY_PERMISSION_LABELS[reply.permission] || reply.permission)),
             ),
+            ) : null,
+            // 待批准/正在生成属于「需要你处理」的提醒：即使更多设置收起也保持可见。
             replyPending.length > 0 ? h('div', {
               className: 'pm-reply-row',
               style: { borderColor: 'var(--dsw-alias-state-warning-primary,#f59e0b)', marginTop: 4 },

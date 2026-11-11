@@ -285,6 +285,23 @@ The identity is continuously visible, not hidden in a dialog:
   offline and across restarts, re-verified on every signed hello.
 - **Role row** — `🔗 连接由 DSH Host 持有 · 关标签页不掉线`.
 
+### Sidebar: more settings collapsed by default
+
+The sidebar keeps only what you need at a glance — Peer ID, identity
+fingerprint, connection errors, and pending-approval alerts. Everything else
+sits behind one row, **defaulting to collapsed**:
+
+- **`展开更多设置`** (collapsed) / **`隐藏更多设置`** (expanded) — one row toggles
+  the optional block, with `aria-expanded` for assistive tech.
+- Collapsed by default on every open and after a refresh (it is view state, not
+  persisted preference).
+- Inside the expandable block: connection owner row, display name + edit,
+  身份密钥 entry, 广播 toggle, 接收新连接 toggle, auto-reply status row.
+- Never hidden by the collapse: identity row (🔐 fingerprint), Peer ID row,
+  connection error box with 重试连接 / 身份密钥, and the pending-approval /
+  generating alerts — connection failures and work waiting for you are not
+  "optional settings".
+
 ## Installation
 
 This is a DSH bundle. From a DSH Web profile:

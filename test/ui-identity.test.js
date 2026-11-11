@@ -180,3 +180,23 @@ test('identity: 连接状态由 Host 持有并广播给所有标签页', () => {
   assert.ok(CLIENT.includes('🔗 连接由 DSH Host 持有 · 关标签页不掉线'));
   assert.ok(CLIENT.includes('async pollHost()'));
 });
+
+
+test('identity: 侧栏「更多设置」默认隐藏，可展开/隐藏，故障与待办不折叠', () => {
+  assert.ok(CLIENT.includes("const [showMoreSettings, setShowMoreSettings] = React.useState(false)"), '默认必须隐藏');
+  assert.ok(CLIENT.includes("showMoreSettings ? '隐藏更多设置' : '展开更多设置'"), '按钮文案');
+  assert.ok(CLIENT.includes("'aria-expanded': showMoreSettings"));
+  assert.ok(CLIENT.includes("className: 'pm-more-toggle'"));
+  assert.ok(CLIENT.includes("showMoreSettings ? h('div', { className: 'pm-more-settings' }"));
+  // 折叠态只决定渲染，不做持久化（刷新回到默认隐藏）
+  assert.ok(!CLIENT.includes("localStorage.setItem('dsh-peer-message-more-settings"), '不应持久化折叠状态');
+  // 关键信息/告警/待办必须在折叠区之外
+  const before = CLIENT.slice(CLIENT.indexOf("className: 'pm-identity-row'"), CLIENT.indexOf("className: 'pm-more-toggle'"));
+  assert.ok(before.includes('pm-peer-error-box'), '错误提示不能被折叠');
+  assert.ok(CLIENT.includes("// 待批准/正在生成属于「需要你处理」的提醒"), '待办提醒不能被折叠');
+  // 折叠区内是可选项
+  const after = CLIENT.slice(CLIENT.indexOf("className: 'pm-more-settings'"), CLIENT.indexOf("// 待批准/正在生成"));
+  for (const field of ['连接由 DSH Host 持有', '显示名称', '广播：', '接收新连接：', '自动回复：']) {
+    assert.ok(after.includes(field), '折叠区缺少 ' + field);
+  }
+});
