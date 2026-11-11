@@ -19,7 +19,7 @@
  * guard and per-session sandbox/approval events.
  */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -210,6 +210,32 @@ export function apply(ctx) {
     const now = Date.now();
     if (now - lastSpawnAt < SPAWN_MIN_INTERVAL_MS) return true; // 视为已在拉起中
     lastSpawnAt = now;
+    // 跨进程 spawn 互斥：DSH 可能有多个进程（旧实例、多 profile），而页面轮询
+    // 会各自触发 spawn。用 O_EXCL 的启动锁保证全机器同一时刻只有一个 spawner，
+    // 否则多个 daemon 同时向 PeerJS 注册同一 Peer ID，互相踢下线。
+    const dir = dataDir();
+    const spawnLock = join(dir, 'spawn.lock');
+    try {
+      mkdirSync(dir, { recursive: true });
+      try {
+        writeFileSync(spawnLock, String(process.pid), { flag: 'wx', mode: 0o600 });
+      } catch (error) {
+        if (error.code === 'EEXIST') {
+          // 别人刚在拉起：等它把自己的锁变成 daemon 的 net.lock 即可。
+          try {
+            const other = Number.parseInt(readFileSync(spawnLock, 'utf8').trim(), 10);
+            if (Number.isInteger(other) && other > 0) { process.kill(other, 0); }
+            ctx.logger.info?.('[peer-message] another process is spawning the daemon; waiting');
+          } catch (e) { /* 持有者已退出：清理后继续 */ try { rmSync(spawnLock); } catch (e2) { /* ignore */ } }
+          return true;
+        }
+        throw error;
+      }
+      // 锁会在 daemon 建立 net.lock 后由这里释放（或超时自动清理）。
+      setTimeout(() => { try { rmSync(spawnLock); } catch (e) { /* ignore */ } }, 60000).unref?.();
+    } catch (error) {
+      ctx.logger.warn(`[peer-message] spawn lock failed: ${String(error && error.message || error)}`);
+    }
     try {
       const child = spawn(process.execPath, [daemonEntry], {
         detached: true,

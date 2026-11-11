@@ -182,7 +182,9 @@ test('host network: 重连永不放弃（PeerJS 云端旧 ID 释放后必须能�
   assert.ok(!/retryAttempts\s*>\s*\d+\s*\)\s*return/.test(src), '仍存在放弃重试的短路');
   assert.ok(src.includes('永不放弃'), '缺少永不放弃的说明与实现');
   // 延迟封顶 30s
-  assert.ok(src.includes('Math.min(2000 * Math.pow(2, Math.min(net.retryAttempts - 1, 4)), 30000)'));
+  // 退避封顶 45s；unavailable-id 用更长基线（云端释放需要时间）
+  assert.ok(src.includes("net.peerErrorType === 'unavailable-id' ? 6000 : 2000"), '未区分 unavailable-id 的退避基线');
+  assert.ok(src.includes('Math.min(base * Math.pow(2, Math.min(net.retryAttempts - 1, 3)), 45000)'));
   // 重试沿用同一身份
   assert.ok(src.includes('net.peer = null;') && src.includes('initPeer()'));
 });

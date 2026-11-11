@@ -357,19 +357,29 @@ export function createNetwork(options) {
     net.retryAttempts = (net.retryAttempts || 0) + 1;
     // 永不放弃：PeerJS 云端的旧 Peer ID 会在服务端超时后释放（强杀进程时尤其如此），
     // 延迟封顶 30s 持续重试同一身份/同一 Peer ID。绝不因此生成新 ID。
-    const delay = Math.min(2000 * Math.pow(2, Math.min(net.retryAttempts - 1, 4)), 30000);
+    // unavailable-id 的增长更慢：云端释放同一 ID 需要时间，密集重试只会反复撞车。
+    const base = net.peerErrorType === 'unavailable-id' ? 6000 : 2000;
+    const delay = Math.min(base * Math.pow(2, Math.min(net.retryAttempts - 1, 3)), 45000);
     if (net.retryTimer) clearTimeout(net.retryTimer);
     net.retryTimer = setTimeout(() => {
       net.retryTimer = null;
       if (!net.started) return;
       if (net.peer && net.peer.open) { net.retryAttempts = 0; return; }
-      if (net.peer) { try { net.peer.destroy(); } catch (e) { /* ignore */ } }
+      // 关键：重试前必须先 destroy 旧 Peer，并留出足够时间让云端释放 ID。
+      // 立刻新建会让新连接与自己的旧登记互撞 → 永远 unavailable-id。
+      if (net.peer) {
+        try { net.peer.destroy(); } catch (e) { /* ignore */ }
+      }
       net.peer = null;
       net.peerStatus = 'connecting';
       net.peerError = '';
       net.peerErrorType = '';
       touch();
-      initPeer().catch(() => {});
+      // 销毁后至少再等 1.5s 才重建，避免和刚关闭的信令会话抢同一 ID。
+      setTimeout(() => {
+        if (!net.started) return;
+        initPeer().catch(() => {});
+      }, 1500).unref?.();
     }, delay);
     net.retryTimer.unref?.();
   }
