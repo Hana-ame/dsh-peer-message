@@ -228,24 +228,35 @@ Identity is not a random string any more:
    不匹配）” and marks the friend unverified. Peers on older versions that send a
    `hello` without `pub` are still compatible but shown as **未验签**.
 
-Because two tabs share the same local key, only one can hold the derived ID at a
-time. On `unavailable-id` the panel explains that the **identity ID** is occupied
-and offers:
+Because the Peer ID is deterministic from the shared local key, two tabs would
+race for one PeerJS ID. The plugin does **not** randomize the Peer ID to escape
+that; it coordinates a single connection owner instead:
 
-- **重试连接** — reconnect with the *same key-derived ID* (close the other tab or
-  wait for the stale session to drop);
-- **重置 Peer ID** — direct button in the error box: one confirmation dialog,
-  then a new keypair is generated immediately, so the Peer ID changes and the
-  client reconnects. The dialog warns that friends stay in the list but must
-  re-add the new Peer ID, and broadcast-off peers may reject the new connection;
-- **身份密钥** — open the identity dialog (Peer ID, algorithm, public-key
-  fingerprint), which also offers the same **重置 Peer ID（生成新身份密钥）**
-  action plus fingerprint copy.
+- Every tab requests an exclusive **Web Lock**
+  (`dsh-peer-message-network-owner`). The lock holder becomes the only **leader**
+  that creates the PeerJS connection with the key-derived Peer ID. Other tabs are
+  **followers**: they mirror the leader's persisted state through `storage`
+  events and forward user actions (send, add/remove friend, notes, settings)
+  through a `BroadcastChannel`.
+- Identity creation is serialized by its own Web Lock
+  (`dsh-peer-message-identity`), so two tabs opened at the same moment cannot
+  each generate a different keypair.
+- The sidebar shows the role: `🔗 连接由本标签页持有` or `🔗 连接由其他标签页持有 ·
+  操作自动转发`. Closing the leader releases the lock; a follower takes over
+  with the **same key and the same Peer ID**.
+- On `unavailable-id` the same Peer ID is retried automatically with backoff.
+  The banner offers **重试连接** (force-recreate the same identity/Peer ID) and
+  **身份密钥** (fingerprint view). It does **not** generate a new random Peer ID.
+  If another DSH process/window outside this browser uses the same identity,
+  close it. The identity dialog keeps a deliberate
+  **轮换身份密钥（会更换身份与 Peer ID）** action for a genuine identity change —
+  it is not the fix for an occupied ID.
+- Without Web Locks (non-secure context) each tab runs standalone and collisions
+  are possible again. A WebCrypto-less page falls back to the legacy random Peer
+  ID with `secured=false` and peers see it as unverified.
 
 Private keys are **not** exported by the UI; anyone with a backup of the browser
-profile can impersonate this identity, so do not share it. A WebCrypto-less
-(non-secure-context) page falls back to the legacy random Peer ID with
-`secured=false` and peers will see it as unverified.
+profile can impersonate this identity, so do not share it.
 
 ### Persistent identity display
 

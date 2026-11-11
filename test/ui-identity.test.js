@@ -113,10 +113,11 @@ test('identity: 校验失败会断开连接，ID/公钥不匹配或签名无效�
 test('identity: unavailable-id 提示说明「ID 由公钥派生」，提供重试/身份密钥入口', () => {
   const branch = slice("if (type === 'unavailable-id') {", "} else if (type === 'network'");
   assert.ok(branch.includes('Peer ID 被占用'));
-  assert.ok(branch.includes('身份密钥（公钥）派生'));
-  assert.ok(branch.includes('其他 DSH 标签页'));
-  assert.ok(branch.includes('重试连接') && branch.includes('重置 Peer ID') && branch.includes('身份密钥'));
-  assert.ok(branch.includes('点「重置 Peer ID」'), '提示未指向直接重置按钮');
+  assert.ok(branch.includes('公钥指纹唯一派生') && branch.includes('不会随机更换'));
+  assert.ok(branch.includes('多个标签页已自动选一个持有连接'));
+  assert.ok(branch.includes('重试连接'));
+  assert.ok(SRC.includes("onClick: () => setShowIdentity(true) }, '身份密钥'"));
+  assert.ok(branch.includes('强制重建连接'));
   assert.ok(!branch.includes('请刷新页面重试'));
   assert.ok(SRC.includes("peerErrorType === 'unavailable-id'"));
 });
@@ -136,7 +137,8 @@ test('identity: 新身份=重新生成密钥对并持久化，UI 有身份密钥
   assert.ok(SRC.includes('身份密钥'));
   assert.ok(SRC.includes("title: '身份密钥：查看公钥指纹 / 更换密钥身份'"));
   assert.ok(SRC.includes('公钥指纹（用于核对身份）'));
-  assert.ok(SRC.includes('生成新身份密钥'));
+  assert.ok(SRC.includes('轮换身份密钥（会更换身份与 Peer ID）'));
+  assert.ok(SRC.includes('已轮换身份密钥'));
 });
 
 test('identity: 生成新身份有二次确认与私钥/身份变化风险说明', () => {
@@ -187,11 +189,22 @@ test('identity: 身份在侧栏/图标/聊天头/二维码里持续表达（不�
 });
 
 
-test('identity: 占用错误框直接提供「重置 Peer ID」按钮与二次确认', () => {
-  assert.ok(SRC.includes("onClick: () => setShowResetPeerId(true) }, '重置 Peer ID'"), '错误框缺少直接重置按钮');
-  const modal = slice("showResetPeerId ? h('div'", 'showNickname ?');
-  assert.ok(modal.includes("'重置 Peer ID'"));
-  assert.ok(modal.includes('会立即生成新的身份密钥对并重连'));
-  assert.ok(modal.includes('旧好友仍在列表，但对方需要重新添加你的新 Peer ID'));
-  assert.ok(modal.includes('pmService.regenerateIdentity()'));
+test('identity: 多标签页单连接持有——Web Locks 选主 + BroadcastChannel 转发，不随机换 Peer ID', () => {
+  assert.ok(SRC.includes("const NETWORK_LOCK_NAME = 'dsh-peer-message-network-owner'"));
+  assert.ok(SRC.includes('navigator.locks.request(NETWORK_LOCK_NAME'));
+  assert.ok(SRC.includes("const NET_CHANNEL_NAME = 'dsh-peer-message-net-v1'"));
+  assert.ok(SRC.includes('new BroadcastChannel(NET_CHANNEL_NAME)'));
+  assert.ok(SRC.includes("this.role = 'leader'") && SRC.includes("this.role = 'follower'"));
+  // follower 镜像 leader 写入的 localStorage 状态
+  assert.ok(SRC.includes("event.key !== STORAGE_KEY"));
+  assert.ok(SRC.includes('this.state = loadState();'));
+  // follower 把用户操作转发给 leader，不自己写 state
+  assert.ok(SRC.includes("forwardAction('send'") || SRC.includes("forwardAction('addFriend'"));
+  assert.ok(SRC.includes('executeForwardedAction(msg)'));
+  // 只有 leader 创建 Peer / 排水 agent outbox / 触发自动回复
+  assert.ok(SRC.includes("if (this.role !== 'leader') return;"));
+  // 占用错误框不再提供随机重置按钮
+  assert.ok(!SRC.includes("setShowResetPeerId"));
+  assert.ok(!SRC.includes("'重置 Peer ID'"));
+  assert.ok(SRC.includes('连接由本标签页持有') && SRC.includes('连接由其他标签页持有'));
 });

@@ -202,6 +202,14 @@ window.__ModuleLoader__.load({
     const PUB_KEY_MAX_LEN = 200;
     const HELLO_SIG_MAX_LEN = 200;
 
+    // ── 单连接持有（多标签页协调）──────────────────────────────────────
+    // PeerJS 同一 ID 只允许一个在线连接。Peer ID 完全由公钥派生（确定性），
+    // 因此不再随机换 ID；同一浏览器多标签页通过 Web Locks 选主：只有一个标签
+    // 页持有 PeerJS 连接，其余标签页通过 BroadcastChannel 转发操作、镜像状态。
+    const NETWORK_LOCK_NAME = 'dsh-peer-message-network-owner';
+    const NET_CHANNEL_NAME = 'dsh-peer-message-net-v1';
+    const IDENTITY_LOCK_NAME = 'dsh-peer-message-identity';
+
     function bytesToBase64(bytes) {
       let binary = '';
       const view = new Uint8Array(bytes);
@@ -289,7 +297,20 @@ window.__ModuleLoader__.load({
       } catch (e) { /* ignore */ }
     }
 
+    // 多标签页同时首次加载会并发生成不同密钥：用 Web Lock 串行化
+    // 「读 localStorage → 生成 → 持久化」，保证所有标签页得到同一身份。
     async function loadIdentity() {
+      if (typeof navigator === 'undefined' || !navigator.locks || typeof navigator.locks.request !== 'function') {
+        return loadIdentityUnlocked();
+      }
+      return new Promise((resolve, reject) => {
+        navigator.locks.request(IDENTITY_LOCK_NAME, { mode: 'exclusive' }, async () => {
+          try { resolve(await loadIdentityUnlocked()); } catch (error) { reject(error); }
+        }).catch(reject);
+      });
+    }
+
+    async function loadIdentityUnlocked() {
       // 非安全上下文（无 crypto.subtle）无法生成/验签密钥：退回旧的随机 Peer ID，
       // 标记 secured=false，hello 不携带公钥，对端会显示「未验签」。
       if (!cryptoIdentityAvailable()) {
@@ -404,6 +425,7 @@ window.__ModuleLoader__.load({
       '.pm-identity-row{display:flex;align-items:center;gap:6px;margin-top:8px;padding:4px 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.18));background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.06));font-size:10px;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;min-width:0;}',
       '.pm-identity-row:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));}',
       '.pm-identity-lock{flex:none;font-size:10px;}',
+      '.pm-role-row{margin-top:4px;font-size:10px;color:var(--dsw-alias-label-secondary,inherit);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.pm-identity-row-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.pm-modal-fp{width:100%;}',
       '.pm-identity-grid{display:grid;grid-template-columns:64px 1fr;gap:6px 10px;font-size:11px;line-height:1.6;}',
@@ -695,6 +717,11 @@ window.__ModuleLoader__.load({
       replyPollTimer: null,
       replyPolling: false,
       replyLastRecentId: '',
+      // 连接持有角色：candidate（等待选主）/ leader（持有 PeerJS）/ follower（转发）
+      role: 'candidate',
+      networkChannel: null,
+      lockRelease: null,
+      hadLeader: false,
       started: false,
       version: 0,
       _snap: null,
@@ -721,6 +748,7 @@ window.__ModuleLoader__.load({
             secured: !!(this.identity && this.identity.secured),
             fingerprint: this.identity ? this.identity.fingerprint : '',
             identityError: this.identityError,
+            role: this.role,
             peerStatus: this.peerStatus,
             peerError: this.peerError,
             peerErrorType: this.peerErrorType,
@@ -741,6 +769,15 @@ window.__ModuleLoader__.load({
         this.version++;
         this._snap = null;
         for (const fn of this.listeners) { try { fn(); } catch (e) { /* ignore */ } }
+        // leader 把连接状态广播给同源其他标签页（它们不创建 PeerJS 连接）。
+        if (this.role === 'leader' && this.networkChannel) {
+          try {
+            this.networkChannel.postMessage({
+              type: 'status', role: 'leader', myId: this.myId,
+              peerStatus: this.peerStatus, peerError: this.peerError, peerErrorType: this.peerErrorType,
+            });
+          } catch (e) { /* ignore */ }
+        }
       },
 
       showToast(msg) {
@@ -783,7 +820,7 @@ window.__ModuleLoader__.load({
         // 侧栏徽标初值（后台服务启动即发布，不等面板挂载）。
         pmUnreadStore.publish(computeUnreadTotal(this.state.friends));
         this.emit();
-        // 身份先于 Peer 就绪：Peer ID 由公钥指纹派生。
+        // 身份先于 Peer 就绪：Peer ID 由公钥指纹派生（确定性，不随机）。
         this.ensureIdentity()
           .then(() => {
             this.myId = this.identity.peerId;
@@ -793,7 +830,7 @@ window.__ModuleLoader__.load({
             }
             return loadPeerJS();
           })
-          .then(() => this.initPeer())
+          .then(() => this.startNetwork())
           .catch(err => {
             this.peerStatus = 'error';
             this.peerError = '身份/PeerJS 初始化失败: ' + String(err && err.message || err);
@@ -810,6 +847,123 @@ window.__ModuleLoader__.load({
         }, 30000);
       },
 
+      // ── 单连接持有：Web Locks 选主 + BroadcastChannel 转发/镜像 ─────────
+      // 同一身份只允许一个 PeerJS 连接；多标签页只有一个 leader 创建 Peer，
+      // follower 通过 storage 事件镜像状态、通过 channel 转发操作。
+      startNetwork() {
+        this.setupNetworkChannel();
+        if (typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function') {
+          this.role = 'follower';
+          this.emit();
+          this.lockAbort = new AbortController();
+          navigator.locks.request(NETWORK_LOCK_NAME, { mode: 'exclusive', signal: this.lockAbort.signal }, () => new Promise((resolve) => {
+            this.lockRelease = resolve;
+            this.becomeLeader();
+          })).catch(() => {
+            // Web Locks 不可用/被中断：退回独立连接模式（仍用同一确定性 Peer ID）。
+            if (!this.started) return;
+            this.role = 'leader';
+            this.emit();
+            this.initPeer();
+          });
+        } else {
+          this.role = 'leader';
+          this.emit();
+          this.initPeer();
+        }
+      },
+
+      setupNetworkChannel() {
+        if (typeof BroadcastChannel !== 'function' || this.networkChannel) return;
+        try {
+          this.networkChannel = new BroadcastChannel(NET_CHANNEL_NAME);
+          this.networkChannel.onmessage = (event) => this.onNetworkMessage(event.data);
+        } catch (e) { this.networkChannel = null; }
+        this.onStorageSync = (event) => {
+          if (!event) return;
+          // leader 轮换身份密钥后，其它标签页同步同一身份。
+          if (event.key === IDENTITY_KEY) {
+            this.reloadIdentity().catch(() => { /* ignore */ });
+            return;
+          }
+          if (event.key !== STORAGE_KEY) return;
+          if (this.role !== 'follower') return;
+          this.state = loadState();
+          pmUnreadStore.publish(computeUnreadTotal(this.state.friends));
+          this.emit();
+        };
+        window.addEventListener('storage', this.onStorageSync);
+      },
+
+      // 从 localStorage 重新读取身份（leader 轮换后 follower 同步）。
+      async reloadIdentity() {
+        if (this.role === 'leader') return;
+        this.identity = null;
+        this.identityPromise = null;
+        await this.ensureIdentity();
+        if (this.role !== 'leader') this.myId = this.identity.peerId;
+        this.emit();
+      },
+
+      becomeLeader() {
+        if (!this.started) {
+          try { if (this.lockRelease) this.lockRelease(); } catch (e) { /* ignore */ }
+          this.lockRelease = null;
+          return;
+        }
+        const wasFollower = this.everLeader === true;
+        this.role = 'leader';
+        this.everLeader = true;
+        this.emit();
+        if (wasFollower) this.showToast('本标签页已接管 P2P 连接（身份与 Peer ID 不变）');
+        this.initPeer();
+      },
+
+      onNetworkMessage(msg) {
+        if (!msg || typeof msg !== 'object') return;
+        if (msg.type === 'status') {
+          if (this.role !== 'follower') return;
+          if (typeof msg.myId === 'string' && msg.myId) this.myId = msg.myId;
+          if (typeof msg.peerStatus === 'string') this.peerStatus = msg.peerStatus;
+          if (typeof msg.peerError === 'string') this.peerError = msg.peerError;
+          if (typeof msg.peerErrorType === 'string') this.peerErrorType = msg.peerErrorType;
+          this.emit();
+          return;
+        }
+        if (msg.type === 'action' && this.role === 'leader') {
+          this.executeForwardedAction(msg);
+        }
+      },
+
+      executeForwardedAction(msg) {
+        const args = Array.isArray(msg.args) ? msg.args : [];
+        switch (msg.action) {
+          case 'send': this.sendMessage(args[0], args[1]); break;
+          case 'addFriend': this.addFriend(args[0]); break;
+          case 'removeFriend': this.removeFriend(args[0]); break;
+          case 'markRead': this.markRead(args[0]); break;
+          case 'setNickname': this.setNickname(args[0]); break;
+          case 'setFriendProfile': this.setFriendProfile(args[0], args[1], args[2]); break;
+          case 'setFriendAlias': this.setFriendAlias(args[0], args[1]); break;
+          case 'setFriendNote': this.setFriendNote(args[0], args[1]); break;
+          case 'setAllowBroadcast': this.setAllowBroadcast(!!args[0]); break;
+          case 'setAllowIncoming': this.setAllowIncoming(!!args[0]); break;
+          case 'setReplyConfig': this.setReplyConfig(args[0]); break;
+          case 'retryPeer': this.retryPeer(); break;
+          default: break;
+        }
+      },
+
+      forwardAction(action, args) {
+        if (this.networkChannel) {
+          try { this.networkChannel.postMessage({ type: 'action', action, args }); return true; } catch (e) { /* ignore */ }
+        }
+        this.showToast('操作无法转发到持有连接的标签页');
+        return false;
+      },
+
+      isFollower() { return this.role === 'follower'; },
+
       stop() {
         if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
         if (this.replyPollTimer) { clearInterval(this.replyPollTimer); this.replyPollTimer = null; }
@@ -824,6 +978,15 @@ window.__ModuleLoader__.load({
         this.conns = {};
         if (this.peer) { try { this.peer.destroy(); } catch (e) { /* ignore */ } }
         this.peer = null;
+        try { if (this.lockAbort) this.lockAbort.abort(); } catch (e) { /* ignore */ }
+        try { if (this.lockRelease) this.lockRelease(); } catch (e) { /* ignore */ }
+        this.lockRelease = null;
+        this.lockAbort = null;
+        try { if (this.onStorageSync) window.removeEventListener('storage', this.onStorageSync); } catch (e) { /* ignore */ }
+        this.onStorageSync = null;
+        try { if (this.networkChannel) this.networkChannel.close(); } catch (e) { /* ignore */ }
+        this.networkChannel = null;
+        this.role = 'candidate';
         this.myId = '';
         this.peerStatus = 'connecting';
         this.peerError = '';
@@ -858,6 +1021,8 @@ window.__ModuleLoader__.load({
 
       initPeer() {
         if (!this.started) return;
+        // 只有持有网络角色的标签页才能创建 PeerJS 连接。
+        if (this.role !== 'leader') return;
         if (!this.identity) {
           this.ensureIdentity().then(() => this.initPeer()).catch(err => {
             this.peerStatus = 'error';
@@ -900,8 +1065,9 @@ window.__ModuleLoader__.load({
           if (type === 'unavailable-id') {
             this.peerStatus = 'error';
             this.peerErrorType = 'unavailable-id';
-            this.peerError = 'Peer ID 被占用：这个 Peer ID 由你本机的身份密钥（公钥）派生，同一个身份密钥同时只能有一个在线连接。常见原因：①同一浏览器开了多个 DSH 标签页，另一个标签页已经用了同一个 Peer ID；②上一次会话的 PeerJS 连接还没释放。处理：先关闭其他 DSH 标签页（或等旧连接释放），再点「重试连接」。如果「重试连接」仍失败、或你确实要换一个 Peer ID：点「重置 Peer ID」；这会生成新的身份密钥对，Peer ID 随之改变，好友需要重新添加你，对方若关闭「广播」还可能把新连接当陌生人拒收。';
+            this.peerError = 'Peer ID 被占用：Peer ID 由你的公钥指纹唯一派生，不会随机更换。同一浏览器的多个标签页已自动选一个持有连接，其他标签页转发操作；出现占用通常是上一次会话/另一个进程仍占着同一个 Peer ID。点「重试连接」会在同一身份、同一 Peer ID 上强制重建连接（不换身份、不换 Peer ID）；若确认是另一个 DSH 进程在用同一身份，关闭它即可。';
             this.emit();
+            this.scheduleReconnect();
           } else if (type === 'network' || type === 'server-error') {
             this.peerStatus = 'error';
             this.peerErrorType = type;
@@ -1001,6 +1167,7 @@ window.__ModuleLoader__.load({
 
       // 开关写入入口：走 update()（saveState 持久化 + 推未读徽标 + 广播快照）。
       setAllowBroadcast(on) {
+        if (this.isFollower()) { this.forwardAction('setAllowBroadcast', [!!on]); return; }
         const next = !!on;
         this.update(prev => Object.assign({}, prev, {
           settings: Object.assign({}, prev.settings || coerceSettings(null), { allowBroadcast: next }),
@@ -1008,6 +1175,7 @@ window.__ModuleLoader__.load({
         this.showToast(next ? '已开启广播：陌生 peer 可发现并加你为好友' : '已关闭广播');
       },
       setAllowIncoming(on) {
+        if (this.isFollower()) { this.forwardAction('setAllowIncoming', [!!on]); return; }
         const next = !!on;
         this.update(prev => Object.assign({}, prev, {
           settings: Object.assign({}, prev.settings || coerceSettings(null), { allowIncoming: next }),
@@ -1037,6 +1205,7 @@ window.__ModuleLoader__.load({
       },
 
       setNickname(raw) {
+        if (this.isFollower()) { this.forwardAction('setNickname', [raw]); return true; }
         const text = typeof raw === 'string' ? raw.trim() : '';
         const clean = text ? sanitizeName(text) : '';
         if (text && !clean) { this.showToast('显示名称不合法（最多 ' + MAX_NAME_LEN + ' 字）'); return false; }
@@ -1050,6 +1219,7 @@ window.__ModuleLoader__.load({
 
       // 好友备注名：hello 只改 name，本地 alias 永远优先，不会被对方覆盖。
       setFriendAlias(id, raw) {
+        if (this.isFollower()) { this.forwardAction('setFriendAlias', [id, raw]); return true; }
         const text = raw == null ? '' : String(raw).trim();
         const alias = text ? sanitizeName(text) : '';
         if (text && !alias) { this.showToast('备注名不合法'); return false; }
@@ -1066,6 +1236,7 @@ window.__ModuleLoader__.load({
 
       // 好友备注（注入自动回复上下文，见 maybeRequestReply → Host buildReplyPrompt）。
       setFriendNote(id, raw) {
+        if (this.isFollower()) { this.forwardAction('setFriendNote', [id, raw]); return true; }
         const text = raw == null ? '' : String(raw).trim();
         if (text && text.length > MAX_NOTE_LEN) { this.showToast('备注最多 ' + MAX_NOTE_LEN + ' 字'); return false; }
         const note = text;
@@ -1082,6 +1253,7 @@ window.__ModuleLoader__.load({
 
       // 备注弹窗一次保存显示名 + 上下文备注，只触发一次持久化/广播。
       setFriendProfile(id, aliasRaw, noteRaw) {
+        if (this.isFollower()) { this.forwardAction('setFriendProfile', [id, aliasRaw, noteRaw]); return true; }
         const aliasText = aliasRaw == null ? '' : String(aliasRaw).trim();
         const alias = aliasText ? sanitizeName(aliasText) : '';
         if (aliasText && !alias) { this.showToast('显示备注名不合法（最多 ' + MAX_NAME_LEN + ' 字）'); return false; }
@@ -1101,6 +1273,7 @@ window.__ModuleLoader__.load({
       // ── Peer ID 占用恢复 ─────────────────────────────────────────────
       // 用同一身份密钥重连：Peer ID 不变（关闭其他标签页后使用）。
       retryPeer() {
+        if (this.isFollower()) { this.forwardAction('retryPeer', []); this.showToast('已请求持有连接的标签页重试'); return; }
         if (this.peer) { try { this.peer.destroy(); } catch (e) { /* ignore */ } }
         this.peer = null;
         for (const id of Object.keys(this.conns)) {
@@ -1120,6 +1293,10 @@ window.__ModuleLoader__.load({
       // 生成新的身份密钥对（等同新账号）：Peer ID 随公钥指纹变化，
       // 旧好友仍留在列表但需要重新添加你的新 Peer ID。私钥只存本机，旧钥删除不可恢复。
       async regenerateIdentity() {
+        if (this.isFollower()) {
+          this.showToast('请在持有连接的标签页中轮换身份密钥（或关闭其他标签页）');
+          return false;
+        }
         if (!cryptoIdentityAvailable()) { this.showToast('当前页面不是安全上下文，无法生成密钥身份'); return false; }
         try {
           const next = await generateIdentity();
@@ -1129,7 +1306,7 @@ window.__ModuleLoader__.load({
           this.identityError = '';
           pmIdentityStore.publish(true, next.fingerprint);
           this.retryPeer();
-          this.showToast('已生成新身份密钥，并重置 Peer ID：' + next.peerId + '（好友需重新添加）');
+          this.showToast('已轮换身份密钥，新 Peer ID：' + next.peerId + '（好友需重新添加）');
           return true;
         } catch (err) {
           this.showToast('生成新身份失败：' + String(err && err.message || err));
@@ -1264,6 +1441,7 @@ window.__ModuleLoader__.load({
       // 面板不打开也照常运行（这就是“消息要跑在后台”的核心）。
       async drainOutbox() {
         if (this.polling) return;
+        if (this.role !== 'leader') return; // follower 不拥有 PeerJS 连接，由 leader 投递
         if (!this.peer || !this.peer.open) return; // peer 未就绪：留在 host 队列，不丢
         this.polling = true;
         try {
@@ -1331,6 +1509,10 @@ window.__ModuleLoader__.load({
       // 入站消息只是触发 Host 侧 agent；权限/模型/会话/工作路径全部由 Host
       // 按下面持久化的 settings.reply 校验并执行，浏览器不直接跑任何工具。
       setReplyConfig(patch) {
+        if (this.isFollower()) {
+          this.forwardAction('setReplyConfig', [patch || {}]);
+          return coerceReplyConfig(Object.assign({}, this.settings.reply, patch || {}));
+        }
         const next = coerceReplyConfig(Object.assign({}, this.settings.reply, patch || {}));
         this.update(prev => Object.assign({}, prev, {
           settings: Object.assign({}, prev.settings || coerceSettings(null), { reply: next }),
@@ -1422,6 +1604,7 @@ window.__ModuleLoader__.load({
 
       // 入站文本 → Host 回调管线；关闭、空文本、自动回复标记（防死循环）直接跳过。
       maybeRequestReply(peerId, text) {
+        if (this.role !== 'leader') return; // 入站只在 leader 处理，避免多标签重复回调
         const reply = this.settings.reply || DEFAULT_REPLY;
         if (reply.mode === 'off') return;
         const clean = typeof text === 'string' ? text.trim() : '';
@@ -1452,6 +1635,7 @@ window.__ModuleLoader__.load({
 
       // ── 面板调用的操作 ───────────────────────────────────────────────
       addFriend(targetId) {
+        if (this.isFollower()) { this.forwardAction('addFriend', [targetId]); this.showToast('已转发到持有连接的标签页'); return; }
         const id = (targetId || '').trim();
         if (!id) return;
         if (!isValidPeerId(id)) {
@@ -1467,6 +1651,7 @@ window.__ModuleLoader__.load({
       },
 
       removeFriend(id) {
+        if (this.isFollower()) { this.forwardAction('removeFriend', [id]); this.showToast('已转发到持有连接的标签页'); return; }
         const conn = this.conns[id];
         if (conn) { try { conn.close(); } catch (e) { /* ignore */ } }
         delete this.conns[id];
@@ -1479,6 +1664,13 @@ window.__ModuleLoader__.load({
       },
 
       sendMessage(id, draft) {
+        if (this.isFollower()) {
+          const clean = sanitizeText(draft);
+          if (!clean || !id) return false;
+          this.forwardAction('send', [id, clean]);
+          this.showToast('已通过持有连接的标签页发送');
+          return true;
+        }
         const text = sanitizeText(draft);
         if (!text || !id) return false;
         const conn = this.conns[id];
@@ -1500,6 +1692,7 @@ window.__ModuleLoader__.load({
       },
 
       markRead(id) {
+        if (this.isFollower()) { this.forwardAction('markRead', [id]); return; }
         this.update(prev => {
           if (!prev.friends.some(f => f.id === id && (f.unread || 0) > 0)) return prev;
           const friends = prev.friends.map(f => f.id === id ? Object.assign({}, f, { unread: 0 }) : f);
@@ -1708,6 +1901,7 @@ window.__ModuleLoader__.load({
       const peerStatus = snap.peerStatus;
       const peerError = snap.peerError;
       const peerErrorType = snap.peerErrorType;
+      const role = snap.role || 'candidate';
       const secured = !!snap.secured;
       const identityFingerprint = snap.fingerprint || '';
       const identityError = snap.identityError || '';
@@ -1731,7 +1925,7 @@ window.__ModuleLoader__.load({
       const [nicknameDraft, setNicknameDraft] = React.useState('');
       const [editFriend, setEditFriend] = React.useState(null); // { id, alias, note }
       const [showIdentity, setShowIdentity] = React.useState(false);
-      const [showResetPeerId, setShowResetPeerId] = React.useState(false);
+
       // 右键菜单：{ id, left, top }。右键只负责开菜单，绝不直接改好友数据。
       const [ctxMenu, setCtxMenu] = React.useState(null);
       // 删除确认：{ id, name }。确认框打开前不会有任何 removeFriend 调用。
@@ -1779,7 +1973,7 @@ window.__ModuleLoader__.load({
 
       // 自动回复设置 / 待批准 / 昵称 / 备注 / 身份密钥弹窗：Escape 关闭。
       React.useEffect(() => {
-        if (!showQR && !showReplySettings && !showPending && !showNickname && !editFriend && !showIdentity && !showResetPeerId) return;
+        if (!showQR && !showReplySettings && !showPending && !showNickname && !editFriend && !showIdentity) return;
         const onKey = (e) => {
           if (e.key !== 'Escape') return;
           setShowQR(false);
@@ -1788,11 +1982,10 @@ window.__ModuleLoader__.load({
           setShowNickname(false);
           setEditFriend(null);
           setShowIdentity(false);
-          setShowResetPeerId(false);
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-      }, [showQR, showReplySettings, showPending, showNickname, editFriend, showIdentity, showResetPeerId]);
+      }, [showQR, showReplySettings, showPending, showNickname, editFriend, showIdentity]);
 
       // 自动滚动到底部
       React.useEffect(() => {
@@ -1876,6 +2069,11 @@ window.__ModuleLoader__.load({
                 : '身份未启用（非安全上下文）'),
               h('span', { className: 'pm-link-btn' }, '查看'),
             ),
+            // 多标签页连接持有角色（单连接协调；不改变身份/Peer ID）
+            h('div', { className: 'pm-role-row', title: '同一浏览器多标签页共享一个 P2P 连接：一个标签页持有，其余转发操作' },
+              role === 'leader' ? '🔗 连接由本标签页持有'
+                : role === 'follower' ? '🔗 连接由其他标签页持有 · 操作自动转发'
+                : '🔗 正在接管连接…'),
             // 显示名称（hello 握手）+ 身份密钥入口
             h('div', { className: 'pm-nick-row' },
               h('span', { className: 'pm-nick-label' }, '显示名称'),
@@ -1893,7 +2091,6 @@ window.__ModuleLoader__.load({
               h('div', { className: 'pm-peer-error' }, peerError),
               h('div', { className: 'pm-peer-error-actions' },
                 h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.retryPeer() }, '重试连接'),
-                peerErrorType === 'unavailable-id' ? h('button', { className: 'pm-btn small danger', type: 'button', onClick: () => setShowResetPeerId(true) }, '重置 Peer ID') : null,
                 peerErrorType === 'unavailable-id' ? h('button', { className: 'pm-btn small', type: 'button', onClick: () => setShowIdentity(true) }, '身份密钥') : null,
               ),
             ) : null,
@@ -2075,22 +2272,7 @@ window.__ModuleLoader__.load({
           ),
         ) : null,
 
-        // 显示名称 / 好友备注 / 重置 Peer ID / 身份密钥弹窗
-        showResetPeerId ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setShowResetPeerId(false) },
-          h('div', { className: 'pm-modal pm-modal-narrow', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
-            h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setShowResetPeerId(false) }, '✕'),
-            h('div', { className: 'pm-modal-title' }, '重置 Peer ID'),
-            h('div', { className: 'pm-field-static' }, '当前 Peer ID：' + (myId || '生成中…')),
-            h('div', { className: 'pm-confirm-text', style: { textAlign: 'left' } }, '会立即生成新的身份密钥对并重连，Peer ID 随公钥指纹改变。用于这个 Peer ID 被其他标签页/旧会话占用且「重试连接」无效的情况。'),
-            h('div', { className: 'pm-warn' }, '旧好友仍在列表，但对方需要重新添加你的新 Peer ID；对方若关闭「广播」，新连接可能被当陌生人拒收。私钥只存本机，旧密钥删除后不可恢复。'),
-            h('div', { className: 'pm-modal-btns' },
-              h('button', { className: 'pm-btn', type: 'button', onClick: () => setShowResetPeerId(false) }, '取消'),
-              h('button', { className: 'pm-btn danger', type: 'button', onClick: () => {
-                pmService.regenerateIdentity().then(ok => { if (ok) setShowResetPeerId(false); });
-              } }, '重置 Peer ID'),
-            ),
-          ),
-        ) : null,
+        // 显示名称 / 好友备注 / 身份密钥弹窗
         showNickname ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setShowNickname(false) },
           h('div', { className: 'pm-modal pm-modal-narrow', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
             h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setShowNickname(false) }, '✕'),
@@ -2171,7 +2353,7 @@ window.__ModuleLoader__.load({
               h('button', {
                 className: 'pm-btn danger', type: 'button', disabled: !secured,
                 onClick: () => { if (window.confirm('确定生成新的身份密钥？Peer ID 会变化，好友需要重新添加你。')) { pmService.regenerateIdentity().then(ok => { if (ok) setShowIdentity(false); }); } },
-              }, '重置 Peer ID（生成新身份密钥）'),
+              }, '轮换身份密钥（会更换身份与 Peer ID）'),
             ),
           ),
         ) : null,
