@@ -506,10 +506,26 @@ export function createNetwork(options) {
       // 信令类故障自愈：指数退避重建同一 Peer ID（不换身份）。
       // unavailable-id 也要退避重连：最常见原因是同一进程里上一次挂载（HMR/插件重载）
       // 的 Peer 还没完全释放，稍等片刻即可拿回同一 Peer ID（不换身份）。
+      // 信令类故障优先复用同一个 Peer 实例：PeerJS 的 reconnect() 会沿用原来的
+      // 会话与 ID。destroy()+新建 会立刻去抢云端尚未释放的旧登记 →
+      // unavailable-id（日志里连续三次创建都撞回 taken 就是这个模式）。
+      if ((type === 'network' || type === 'server-error' || type === 'socket-error' || type === 'socket-closed')
+          && net.peer && !net.peer.destroyed) {
+        try { net.peer.reconnect(); } catch (e) { /* 落到退避重建 */ }
+      }
       if (type !== 'invalid-id' && type !== 'invalid-key') scheduleRetry();
     });
     peer.on('close', () => { net.peerStatus = 'offline'; touch(); });
-    peer.on('disconnected', () => { net.peerStatus = 'offline'; touch(); try { peer.reconnect(); } catch (e) { /* ignore */ } });
+    peer.on('disconnected', () => {
+      if (!net.started) return;
+      net.peerStatus = 'connecting';
+      touch();
+      try {
+        peer.reconnect(); // 复用同一 Peer 实例（保留 ID/会话）
+      } catch (e) {
+        scheduleRetry();
+      }
+    });
   }
 
   const api = {
