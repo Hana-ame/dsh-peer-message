@@ -268,9 +268,12 @@ node server/daemon.mjs                    # data dir ~/.dsh/peer-message
 DSH_PEER_MESSAGE_DIR=/tmp/pm node server/daemon.mjs
 ```
 
-Private keys are **not** exported by the UI. Anyone with a copy of
-`identity.json` or a backup of the machine can impersonate this identity, so do
-not share it. Files are 0600 and the socket is 0600.
+Private keys are **not** exported by the UI and are **never stored in the
+browser** — the identity dialog says so explicitly and shows the local key-file
+path instead. Anyone with a copy of `identity.json` or a backup of the machine
+can impersonate this identity, so do not share it. Files are 0600 and the socket
+is 0600. The only remaining `localStorage` use is the one-shot legacy migration
+(reading old browser state/keys once, then deleting those keys).
 
 ### Persistent identity display
 

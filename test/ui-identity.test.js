@@ -200,3 +200,19 @@ test('identity: 侧栏「更多设置」默认隐藏，可展开/隐藏，故障
     assert.ok(after.includes(field), '折叠区缺少 ' + field);
   }
 });
+
+
+test('identity: 用户可见文案不再声称私钥存在 localStorage（密钥在后台进程 0600 文件）', () => {
+  // 只允许「一次性迁移旧数据」的代码引用 localStorage，界面文字一律不得出现。
+  const uiStrings = [...CLIENT.matchAll(/'([^'\\\n]*)'/g)].map((m) => m[1]);
+  const offenders = uiStrings.filter((text) => /localStorage|浏览器配置/.test(text));
+  assert.deepEqual(offenders, [], '界面文案仍在提 localStorage：' + JSON.stringify(offenders));
+  // 身份弹窗必须说明真实存储位置与权限
+  assert.ok(CLIENT.includes('私钥只保存在本机后台进程的密钥文件（权限 0600）'), '缺少真实存储说明');
+  assert.ok(CLIENT.includes('不在浏览器里'), '未澄清密钥不在浏览器');
+  assert.ok(CLIENT.includes("'密钥文件：' + identityFile"), '未展示密钥文件路径');
+  assert.ok(CLIENT.includes('请勿外发'), '缺少私钥外发警告');
+  // 不再有「页面不是安全上下文 / 页面无法使用 WebCrypto」这类浏览器侧说法
+  assert.ok(!CLIENT.includes('当前页面不是安全上下文'), '仍残留浏览器安全上下文文案');
+  assert.ok(!CLIENT.includes('当前页面无法使用 WebCrypto'), '仍残留页面 WebCrypto 文案');
+});

@@ -42,7 +42,7 @@ window.__ModuleLoader__.load({
     // 因此下限取 16（大于前缀 dsh-pm- 的 7 字符），防止 7 字符纯前缀误通过。
     const PEER_ID_MIN_LEN = 16;
     const PEER_ID_MAX_LEN = 64;
-    // 攻防加固：资源上限，防恶意洪泛撑爆 localStorage/内存。
+    // 攻防加固：资源上限，防恶意洪泛撑爆对话框/内存（状态由后台进程持久化）。
     const MAX_MSGS_PER_FRIEND = 500;   // 每好友消息历史上限
     const MAX_FRIENDS = 100;           // 好友数上限
     const MAX_NAME_LEN = 32;           // hello 握手昵称长度上限
@@ -1072,6 +1072,7 @@ window.__ModuleLoader__.load({
       const role = snap.role || 'candidate';
       const secured = !!snap.secured;
       const identityFingerprint = snap.fingerprint || '';
+      const identityFile = snap.identityFile || '';
       const identityError = snap.identityError || '';
       const toast = snap.toast;
       const settings = snap.settings || { allowBroadcast: false, allowIncoming: true };
@@ -1231,13 +1232,13 @@ window.__ModuleLoader__.load({
             // 密钥身份的持续表达：始终显示身份是否启用 + 公钥指纹短形式。
             h('div', {
               className: 'pm-identity-row',
-              title: secured ? '公钥指纹：' + identityFingerprint : (identityError || '当前页面不是安全上下文，身份未启用密钥'),
+              title: secured ? '公钥指纹：' + identityFingerprint : (identityError || '后台进程未启用密钥身份（密钥文件缺失或损坏）'),
               onClick: () => setShowIdentity(true),
             },
               h('span', { className: 'pm-identity-lock' }, secured ? '🔐' : '⚠️'),
               h('span', { className: 'pm-identity-row-text' }, secured
                 ? '身份已启用 · 指纹 ' + shortFingerprint(identityFingerprint)
-                : '身份未启用（非安全上下文）'),
+                : '身份未启用（后台密钥缺失）'),
               h('span', { className: 'pm-link-btn' }, '查看'),
             ),
             // 错误提示放在折叠区之外：连接故障不属于「可选设置」，必须可见。
@@ -1520,7 +1521,7 @@ window.__ModuleLoader__.load({
               h('dt', null, '算法'),
               h('dd', null, secured ? IDENTITY_ALGORITHM : 'Host 未启用密钥身份（身份文件缺失/损坏）'),
               h('dt', null, '状态'),
-              h('dd', null, secured ? '已启用密钥身份；连接时通过 hello 公钥+签名验证' : '未启用：当前页面无法使用 WebCrypto'),
+              h('dd', null, secured ? '已启用密钥身份（密钥在后台进程，0600 文件）；连接时通过 hello 公钥+签名验证' : '未启用：后台进程未能加载/生成密钥'),
             ),
             identityFingerprint ? h('div', null,
               h('div', { className: 'pm-hint', style: { marginBottom: 6 } }, '概念说明：身份密钥 = 本机生成的一对 ECDSA 私钥/公钥；Peer ID = 由公钥指纹算出的网络标识。私钥不变，Peer ID 就不变。'),
@@ -1529,7 +1530,8 @@ window.__ModuleLoader__.load({
               h('div', { className: 'pm-hint' }, 'Peer ID 由该指纹派生；对方连接时会验证公钥与 Peer ID 绑定、hello 签名有效后标记「已验签」。'),
             ) : null,
             identityError ? h('div', { className: 'pm-warn' }, '身份错误：' + identityError) : null,
-            h('div', { className: 'pm-warn' }, '私钥只保存在本机 localStorage，请勿把浏览器配置/私钥备份发给他人。更换身份 = 生成新密钥对：Peer ID 会变化，旧好友仍在列表但需要重新添加你；对方若关闭「广播」，新连接可能被当陌生人拒收。'),
+            h('div', { className: 'pm-warn' }, '私钥只保存在本机后台进程的密钥文件（权限 0600），不在浏览器里，也不随页面刷新/换浏览器而改变；本页面只拿得到公钥指纹。不要把该密钥文件或整机备份发给他人。更换身份 = 生成新密钥对：Peer ID 会变化，旧好友仍在列表但需要重新添加你；对方若关闭「广播」，新连接可能被当陌生人拒收。'),
+            identityFile ? h('div', { className: 'pm-hint' }, '密钥文件：' + identityFile + '（本机路径，含私钥，请勿外发）') : null,
             h('div', { className: 'pm-modal-btns' },
               h('button', { className: 'pm-btn', type: 'button', onClick: () => setShowIdentity(false) }, '关闭'),
               identityFingerprint ? h('button', {
@@ -1591,8 +1593,8 @@ window.__ModuleLoader__.load({
 
     // ── 侧边栏图标组件 ─────────────────────────────────────────────────
     function PeerMessageIcon({ size, active }) {
-      // 初始未读总数：直接从 localStorage 读取（panel 未挂载时也能显示正确徽标），
-      // 再订阅 store 接收 panel persist 的后续更新。
+      // 初始未读总数：直接取当前 Host 快照（面板未挂载时也能显示正确徽标），
+      // 再订阅 store 接收后续快照更新。
       const [unread, setUnread] = React.useState(() => {
         try {
           return computeUnreadTotal(pmService.state ? pmService.state.friends : null);
