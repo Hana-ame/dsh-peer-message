@@ -166,16 +166,20 @@ test('identity: 旧 localStorage 数据一次性迁移进 Host 文件，不覆�
   assert.ok(HOST.includes("path: '/api/pm-net/migrate'"));
 });
 
-test('identity: 身份在侧栏/图标/聊天头/二维码里持续表达（不只是弹窗）', () => {
-  assert.ok(CLIENT.includes('const pmIdentityStore = {'));
+test('identity: 身份在侧栏/聊天头/二维码里持续表达（不只是弹窗），且无意义图标角标已移除', () => {
+  // 侧栏常驻身份行 + 指纹短形式
   assert.ok(CLIENT.includes("className: 'pm-identity-row'"));
   assert.ok(CLIENT.includes("'身份已启用 · 指纹 ' + shortFingerprint(identityFingerprint)"));
-  assert.ok(CLIENT.includes('pmIdentityStore.subscribe(setIdentity)'));
-  assert.ok(CLIENT.includes("title: '密钥身份已启用 · 指纹 ' + identity.fingerprint"));
   assert.ok(CLIENT.includes("className: 'pm-modal-fp'"));
   assert.ok(CLIENT.includes('function shortFingerprint(fingerprint)'));
-  // 指纹来自 Host 快照，浏览器自己算不出来
+  // 指纹来自 Host 快照
   assert.ok(CLIENT.includes("this.identity = { secured: !!snap.secured, fingerprint: snap.fingerprint || '', peerId: snap.myId || '' }"));
+  // 侧栏图标上的 🔐 角标已按要求移除（信息由身份行表达，角标无意义）
+  assert.ok(!CLIENT.includes("title: '密钥身份已启用 · 指纹 ' + identity.fingerprint"), '侧栏图标仍挂着锁角标');
+  assert.ok(!CLIENT.includes('pmIdentityStore'), '已无订阅者的身份 store 应删除');
+  // 身份行前缀和好友已验签标记保留
+  assert.ok(CLIENT.includes("className: 'pm-identity-lock'"), '身份行锁图标被误删');
+  assert.ok(CLIENT.includes("className: 'pm-verified-badge'"), '好友已验签标记被误删');
 });
 
 test('identity: 连接状态由 Host 持有并广播给所有标签页', () => {

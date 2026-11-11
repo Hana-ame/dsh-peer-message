@@ -422,27 +422,6 @@ window.__ModuleLoader__.load({
       },
     };
 
-    // 密钥身份的持续表达 store：侧栏图标/面板都要常驻显示「身份已启用 + 指纹」，
-    // 不能只在打开身份弹窗时才看得到。
-    const pmIdentityStore = {
-      secured: false,
-      fingerprint: '',
-      listeners: new Set(),
-      publish(secured, fingerprint) {
-        const nextFp = typeof fingerprint === 'string' ? fingerprint : '';
-        const nextSecured = !!secured;
-        if (this.secured === nextSecured && this.fingerprint === nextFp) return;
-        this.secured = nextSecured;
-        this.fingerprint = nextFp;
-        for (const fn of this.listeners) { try { fn({ secured: nextSecured, fingerprint: nextFp }); } catch (e) { /* ignore */ } }
-      },
-      subscribe(fn) {
-        this.listeners.add(fn);
-        try { fn({ secured: this.secured, fingerprint: this.fingerprint }); } catch (e) { /* ignore */ }
-        return () => { this.listeners.delete(fn); };
-      },
-    };
-
     // 计算好友未读总数（面板内使用）
     function computeUnreadTotal(friends) {
       return (friends || []).reduce((sum, f) => sum + (f.unread || 0), 0);
@@ -647,7 +626,7 @@ window.__ModuleLoader__.load({
         if (typeof snap.stateFile === 'string') this.stateFile = snap.stateFile;
         this.identity = { secured: !!snap.secured, fingerprint: snap.fingerprint || '', peerId: snap.myId || '' };
         this.identityError = snap.secured ? '' : (snap.identityError || '');
-        pmIdentityStore.publish(!!snap.secured, snap.fingerprint || '');
+
         if (snap.state && typeof snap.state === 'object') {
           this.state = snap.state;
           pmUnreadStore.publish(computeUnreadTotal(snap.state.friends));
@@ -1668,9 +1647,6 @@ window.__ModuleLoader__.load({
         } catch (e) { return 0; }
       });
       React.useEffect(() => pmUnreadStore.subscribe(setUnread), []);
-      // 身份也要在侧栏图标上持续可见（面板未打开时同样显示是否启用密钥身份）。
-      const [identity, setIdentity] = React.useState({ secured: false, fingerprint: '' });
-      React.useEffect(() => pmIdentityStore.subscribe(setIdentity), []);
       return h('span', { style: { position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' } },
         h('svg', {
           viewBox: '0 0 24 24', width: size || 18, height: size || 18,
@@ -1690,15 +1666,6 @@ window.__ModuleLoader__.load({
             textAlign: 'center', boxSizing: 'border-box',
           },
         }, unread > 99 ? '99+' : String(unread)) : null,
-        identity.secured ? h('span', {
-          title: '密钥身份已启用 · 指纹 ' + identity.fingerprint,
-          style: {
-            position: 'absolute', bottom: -4, left: -5,
-            fontSize: 8, lineHeight: 1, padding: '1px',
-            borderRadius: 4, background: 'var(--dsw-alias-bg-layer-1,transparent)',
-            boxShadow: '0 0 0 1px var(--dsw-alias-border-l2,rgba(127,127,127,.3))',
-          },
-        }, '🔐') : null,
       );
     }
 
