@@ -28,7 +28,11 @@ a session's agent send P2P messages through the `pm_send` tool, alongside
   locally** and stored only in this browser. The PeerJS ID is derived from the
   public-key fingerprint (`dsh-pm-<40 hex>`), and the `hello` handshake carries
   the public key, fingerprint and a signature; the peer verifies the ID↔key
-  binding before marking the friend 🔐 **身份已验签**. No random ID to reset.
+  binding before marking the friend 🔐 **身份已验签**. The identity is also
+  **persistently visible**: a sidebar identity row and the sidebar icon show the
+  short fingerprint even when the panel is closed, the QR dialog shows the full
+  fingerprint, and verified friends keep 🔐 + the fingerprint in their chat
+  header across reconnects and restarts. No random ID to reset.
 - **Display names and remarks** — set your own nickname (sent over the `hello`
   handshake in both directions) and give friends local-only remarks that always
   win over the nickname their client sends.
@@ -237,8 +241,27 @@ and offers:
 
 Private keys are **not** exported by the UI; anyone with a backup of the browser
 profile can impersonate this identity, so do not share it. A WebCrypto-less
-(non-secure-context) page falls back to the legacy random ID with `secured=false`
-and peers will see it as unverified.
+(non-secure-context) page falls back to the legacy random Peer ID with
+`secured=false` and peers will see it as unverified.
+
+### Persistent identity display
+
+The identity is not hidden inside a dialog:
+
+- **Sidebar row** — `🔐 身份已启用 · 指纹 07b9…bb3b`, always visible next to the
+  display name; hover/click opens the full fingerprint and rotation dialog. On a
+  non-secure page it shows `⚠️ 身份未启用（非安全上下文）`.
+- **Sidebar icon** — a small 🔐 badge is rendered even when the message panel is
+  closed, so the toolbar always reflects that a key identity is active.
+- **QR dialog** — shows the full grouped public-key fingerprint under the Peer
+  ID, so sharing a QR also shares the identity you can read out loud.
+- **Friend chat header** — after verification: `在线 · 身份已验签 · 指纹
+  07b9…bb3b`; the full fingerprint is in the title attribute. The `🔐` badge and
+  stored fingerprint persist in the friend record while offline and across
+  restarts; each reconnect re-verifies the signed `hello`.
+- **Identity dialog** — Peer ID, `ECDSA P-256 / SHA-256`, full fingerprint,
+  copy-fingerprint and key rotation.
+
 
 ## Installation
 

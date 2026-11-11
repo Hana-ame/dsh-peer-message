@@ -148,7 +148,9 @@ test('identity: 生成新身份有二次确认与私钥/身份变化风险说明
 
 test('identity: 好友已验签显示 🔐，聊天状态区分已验签/未验签', () => {
   assert.ok(SRC.includes("f.verified ? h('span', { className: 'pm-verified-badge'"));
-  assert.ok(SRC.includes("active.verified ? '在线 · 身份已验签' : '在线 · 未验签'"));
+  assert.ok(SRC.includes("active.verified ? '在线 · 身份已验签'"));
+  assert.ok(SRC.includes("在线 · 未验签"));
+  assert.ok(SRC.includes("· 指纹 ' + shortFingerprint(active.fingerprint)"));
 });
 
 test('identity: 昵称/备注/身份密钥弹窗支持 Escape 关闭', () => {
@@ -166,4 +168,19 @@ test('identity: 术语统一——只有 Peer ID 一个词，不再混用「身�
   // 关系说明必须出现在身份密钥弹窗，明确「Peer ID = 公钥指纹派生」
   assert.ok(SRC.includes('Peer ID = 由公钥指纹算出的网络标识'));
   assert.ok(SRC.includes('私钥不变，Peer ID 就不变'));
+});
+
+
+test('identity: 身份在侧栏/图标/聊天头/二维码里持续表达（不只是弹窗）', () => {
+  // 模块级身份 store + 侧栏常驻行
+  assert.ok(SRC.includes('const pmIdentityStore = {'));
+  assert.ok(SRC.includes("className: 'pm-identity-row'"));
+  assert.ok(SRC.includes("'身份已启用 · 指纹 ' + shortFingerprint(identityFingerprint)"));
+  // 面板未打开时侧栏图标也显示 🔐
+  assert.ok(SRC.includes("pmIdentityStore.subscribe(setIdentity)"));
+  assert.ok(SRC.includes("title: '密钥身份已启用 · 指纹 ' + identity.fingerprint"));
+  // 二维码弹窗也展示公钥指纹
+  assert.ok(SRC.includes("className: 'pm-modal-fp'"));
+  // 指纹短形式可复现
+  assert.ok(SRC.includes('function shortFingerprint(fingerprint)'));
 });

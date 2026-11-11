@@ -401,6 +401,11 @@ window.__ModuleLoader__.load({
       '.pm-friend-last{font-size:11px;color:var(--dsw-alias-label-secondary,inherit);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.pm-friend-note{font-size:10px;opacity:.75;flex:none;}',
       '.pm-verified-badge{font-size:10px;flex:none;opacity:.9;}',
+      '.pm-identity-row{display:flex;align-items:center;gap:6px;margin-top:8px;padding:4px 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.18));background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.06));font-size:10px;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;min-width:0;}',
+      '.pm-identity-row:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));}',
+      '.pm-identity-lock{flex:none;font-size:10px;}',
+      '.pm-identity-row-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.pm-modal-fp{width:100%;}',
       '.pm-identity-grid{display:grid;grid-template-columns:64px 1fr;gap:6px 10px;font-size:11px;line-height:1.6;}',
       '.pm-identity-grid dt{color:var(--dsw-alias-label-secondary,inherit);}',
       '.pm-identity-grid dd{margin:0;color:var(--dsw-alias-label-primary,inherit);word-break:break-all;}',
@@ -549,6 +554,27 @@ window.__ModuleLoader__.load({
       },
     };
 
+    // 密钥身份的持续表达 store：侧栏图标/面板都要常驻显示「身份已启用 + 指纹」，
+    // 不能只在打开身份弹窗时才看得到。
+    const pmIdentityStore = {
+      secured: false,
+      fingerprint: '',
+      listeners: new Set(),
+      publish(secured, fingerprint) {
+        const nextFp = typeof fingerprint === 'string' ? fingerprint : '';
+        const nextSecured = !!secured;
+        if (this.secured === nextSecured && this.fingerprint === nextFp) return;
+        this.secured = nextSecured;
+        this.fingerprint = nextFp;
+        for (const fn of this.listeners) { try { fn({ secured: nextSecured, fingerprint: nextFp }); } catch (e) { /* ignore */ } }
+      },
+      subscribe(fn) {
+        this.listeners.add(fn);
+        try { fn({ secured: this.secured, fingerprint: this.fingerprint }); } catch (e) { /* ignore */ }
+        return () => { this.listeners.delete(fn); };
+      },
+    };
+
     // 计算好友未读总数（面板内使用）
     function computeUnreadTotal(friends) {
       return (friends || []).reduce((sum, f) => sum + (f.unread || 0), 0);
@@ -567,6 +593,12 @@ window.__ModuleLoader__.load({
     function shortId(id) {
       if (!id) return '';
       return id.length > 8 ? id.slice(0, 8) : id;
+    }
+
+    // 指纹的短形式，用于侧栏/聊天头持续展示；完整值在身份弹窗/title 里。
+    function shortFingerprint(fingerprint) {
+      if (!fingerprint) return '';
+      return fingerprint.slice(0, 4) + '…' + fingerprint.slice(-4);
     }
 
     // 好友显示名优先级：本地备注(alias) > 对方 hello 昵称(name) > Peer ID 前缀。
@@ -811,6 +843,7 @@ window.__ModuleLoader__.load({
             this.identity = identity;
             this.identityError = '';
             this.myId = identity.peerId;
+            pmIdentityStore.publish(!!identity.secured, identity.fingerprint || '');
             this.emit();
             return identity;
           })
@@ -1094,6 +1127,7 @@ window.__ModuleLoader__.load({
           this.identity = next;
           this.myId = next.peerId;
           this.identityError = '';
+          pmIdentityStore.publish(true, next.fingerprint);
           this.retryPeer();
           this.showToast('已生成新身份密钥，新 Peer ID：' + next.peerId + '（好友需重新添加）');
           return true;
@@ -1744,9 +1778,10 @@ window.__ModuleLoader__.load({
 
       // 自动回复设置 / 待批准 / 昵称 / 备注 / 身份密钥弹窗：Escape 关闭。
       React.useEffect(() => {
-        if (!showReplySettings && !showPending && !showNickname && !editFriend && !showIdentity) return;
+        if (!showQR && !showReplySettings && !showPending && !showNickname && !editFriend && !showIdentity) return;
         const onKey = (e) => {
           if (e.key !== 'Escape') return;
+          setShowQR(false);
           setShowReplySettings(false);
           setShowPending(false);
           setShowNickname(false);
@@ -1755,7 +1790,7 @@ window.__ModuleLoader__.load({
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-      }, [showReplySettings, showPending, showNickname, editFriend, showIdentity]);
+      }, [showQR, showReplySettings, showPending, showNickname, editFriend, showIdentity]);
 
       // 自动滚动到底部
       React.useEffect(() => {
@@ -1826,6 +1861,18 @@ window.__ModuleLoader__.load({
               h('button', { className: 'pm-icon-btn', title: '复制 Peer ID', onClick: copyMyId }, '⧉'),
               h('button', { className: 'pm-icon-btn', title: '显示二维码', onClick: () => setShowQR(true), disabled: !myId }, '▦'),
               h('button', { className: 'pm-icon-btn', title: '自动回复设置', onClick: openReplySettings }, '⚙'),
+            ),
+            // 密钥身份的持续表达：始终显示身份是否启用 + 公钥指纹短形式。
+            h('div', {
+              className: 'pm-identity-row',
+              title: secured ? '公钥指纹：' + identityFingerprint : (identityError || '当前页面不是安全上下文，身份未启用密钥'),
+              onClick: () => setShowIdentity(true),
+            },
+              h('span', { className: 'pm-identity-lock' }, secured ? '🔐' : '⚠️'),
+              h('span', { className: 'pm-identity-row-text' }, secured
+                ? '身份已启用 · 指纹 ' + shortFingerprint(identityFingerprint)
+                : '身份未启用（非安全上下文）'),
+              h('span', { className: 'pm-link-btn' }, '查看'),
             ),
             // 显示名称（hello 握手）+ 身份密钥入口
             h('div', { className: 'pm-nick-row' },
@@ -1918,7 +1965,9 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'pm-chat-header-info' },
                   h('div', { className: 'pm-chat-header-name', title: (active.alias ? active.alias + ' · ' + active.name + ' · ' + active.id : (active.name ? active.name + ' · ' + active.id : active.id)) + (active.note ? '\n备注：' + active.note : '') }, displayName(active)),
                   h('div', { className: 'pm-chat-header-status', title: active.fingerprint ? '公钥指纹：' + active.fingerprint : '' },
-                    active.online ? (active.verified ? '在线 · 身份已验签' : '在线 · 未验签') : '离线'),
+                    active.online
+                      ? (active.verified ? '在线 · 身份已验签' + (active.fingerprint ? ' · 指纹 ' + shortFingerprint(active.fingerprint) : '') : '在线 · 未验签')
+                      : '离线'),
                 ),
               ),
               h('div', { className: 'pm-chat-messages', ref: chatRef },
@@ -1959,6 +2008,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'pm-modal-title' }, '我的连接二维码'),
             h(QRCodeView, { value: myId }),
             h('div', { className: 'pm-modal-id' }, myId),
+            identityFingerprint ? h('div', { className: 'pm-modal-fp' }, h('span', { className: 'pm-field-label' }, '公钥指纹'), h('div', { className: 'pm-identity-fp' }, identityFingerprint.replace(/(.{8})/g, '$1 ').trim())) : null,
             h('div', { className: 'pm-modal-btns' },
               h('button', { className: 'pm-btn', onClick: copyMyId }, '复制 Peer ID'),
               h('button', { className: 'pm-btn primary', onClick: () => setShowQR(false) }, '关闭'),
@@ -2164,6 +2214,9 @@ window.__ModuleLoader__.load({
         } catch (e) { return 0; }
       });
       React.useEffect(() => pmUnreadStore.subscribe(setUnread), []);
+      // 身份也要在侧栏图标上持续可见（面板未打开时同样显示是否启用密钥身份）。
+      const [identity, setIdentity] = React.useState({ secured: false, fingerprint: '' });
+      React.useEffect(() => pmIdentityStore.subscribe(setIdentity), []);
       return h('span', { style: { position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' } },
         h('svg', {
           viewBox: '0 0 24 24', width: size || 18, height: size || 18,
@@ -2183,6 +2236,15 @@ window.__ModuleLoader__.load({
             textAlign: 'center', boxSizing: 'border-box',
           },
         }, unread > 99 ? '99+' : String(unread)) : null,
+        identity.secured ? h('span', {
+          title: '密钥身份已启用 · 指纹 ' + identity.fingerprint,
+          style: {
+            position: 'absolute', bottom: -4, left: -5,
+            fontSize: 8, lineHeight: 1, padding: '1px',
+            borderRadius: 4, background: 'var(--dsw-alias-bg-layer-1,transparent)',
+            boxShadow: '0 0 0 1px var(--dsw-alias-border-l2,rgba(127,127,127,.3))',
+          },
+        }, '🔐') : null,
       );
     }
 
