@@ -186,3 +186,17 @@ test('host network: 重连永不放弃（PeerJS 云端旧 ID 释放后必须能�
   // 重试沿用同一身份
   assert.ok(src.includes('net.peer = null;') && src.includes('initPeer()'));
 });
+
+
+test('host network: 信令既不 open 也不 error 时有看门狗，不会永久卡在 connecting', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./network.js', import.meta.url), 'utf8');
+  assert.ok(src.includes('openWatchdog'), '缺少信令看门狗');
+  assert.ok(src.includes("net.peerErrorType = 'timeout'"), '看门狗未标记超时');
+  assert.ok(src.includes('}, 25000);'), '看门狗超时不是 25s');
+  // 看门狗触发后走同一套重试（不换身份）
+  const idx = src.indexOf('net.openWatchdog = setTimeout');
+  const block = src.slice(idx, idx + 700);
+  assert.ok(block.includes('scheduleRetry()'), '看门狗未触发重试');
+  assert.ok(!block.includes('generateIdentity'), '看门狗不应更换身份');
+});
