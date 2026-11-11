@@ -189,23 +189,35 @@ Right-click a friend → **编辑备注…**. The dialog has two local-only fiel
 
 ### Message provenance (human vs model)
 
-Every message keeps a structured origin, not just a text prefix:
+Every bubble carries an origin badge, so you can always tell who wrote it:
 
-| Wire text | Meaning | Local badge |
-| --- | --- | --- |
-| plain text | a person typed it | none |
-| `[自动回复] …` | model auto-reply (auto mode) | `AI · 自动回复` |
-| `[自动回复] [人工批准] …` | model reply a human approved | `AI · 你已批准` |
-| `[AI] …` | model-authored `pm_send` Agent message | `AI · Agent 发送` |
+| Badge | Meaning |
+| --- | --- |
+| 👤 人工 · 你 / 人工 · 对方 | a person typed it (normal chat message) |
+| 👤 人工 · 你回复 / 人工 · 对方回复 | a person wrote the reply themselves (human reply) |
+| AI · 自动回复 / AI · 对方自动回复 | the model answered on its own (mode `auto`) |
+| AI · 你已批准 / AI · 人工批准 | the model wrote it, a human approved it |
+| AI · Agent 发送 / AI · 对方 Agent | sent by the agent through `pm_send` |
 
-Incoming messages are classified the same way, with the marker stripped from the
-bubble body and replaced by `AI · 对方自动回复` / `AI · 人工批准` / `AI · 对方
-Agent`. The friend-list preview is prefixed with `AI｜` for the last message when
-it came from a model, and pending approvals show `AI · 模型生成 · 待批准`.
-Model-marked messages never trigger another auto-reply, so two AI peers cannot
-ping-pong. The outbox also carries `meta: {origin, trigger, model}`; queue items
-written by older versions without meta (or without a marker) are treated as
-model/Agent messages, since only agent-side code writes the outbox.
+Human badges use a neutral color, AI badges an accent color; the icon (`👤` vs
+`AI`) makes the distinction readable even without color. On the wire only model
+messages carry markers (`[自动回复] `, `[自动回复] [人工批准] `, `[AI] `) —
+human text is sent verbatim, so peers can never mistake a human reply for AI.
+
+### Humans can reply too
+
+You are never forced to accept a model draft. A pending manual reply offers three
+outcomes:
+
+- **批准回复** — send the model's draft (badge `AI · 你已批准`, wire keeps
+  `[自动回复] [人工批准] `);
+- **发送人工回复** — type your own text in the box: it is sent as a plain human
+  message (badge `人工 · 你回复`) and the model draft is dropped;
+- **忽略** — discard the draft.
+
+An empty human-reply box keeps the send button disabled; Ctrl/Cmd+Enter sends.
+Human replies are recorded with `origin: human, trigger: human-reply` in
+`state.json`, so the distinction survives restarts.
 
 ### Identity, storage and the P2P daemon
 

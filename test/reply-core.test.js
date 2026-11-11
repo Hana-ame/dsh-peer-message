@@ -242,3 +242,20 @@ test('rate: peek does not consume quota', () => {
   assert.equal(gate.check('p', 3000).ok, true);
   assert.equal(gate.peek('p', 4000).ok, false);
 });
+
+// ── 人工 vs AI 来源区分 ───────────────────────────────────────────────────
+
+test('provenance: 人工消息/人工回复与模型消息在解析层可区分', () => {
+  // 人的消息不带任何模型标记
+  assert.equal(modelTextInfo('手打的消息').isModel, false);
+  assert.equal(modelTextInfo('手打的消息').trigger, 'human');
+  // 模型自动回复
+  assert.equal(modelTextInfo(AUTO_REPLY_PREFIX + '自动').trigger, 'auto');
+  // 模型回复但经人工批准
+  assert.equal(modelTextInfo(AUTO_REPLY_PREFIX + MANUAL_APPROVAL_MARKER + '批准').trigger, 'manual');
+  assert.equal(modelTextInfo(AUTO_REPLY_PREFIX + MANUAL_APPROVAL_MARKER + '批准').isModel, true);
+  // Agent 发送
+  assert.equal(modelTextInfo(AI_AGENT_PREFIX + 'agent').trigger, 'agent');
+  // 人的回复（human-reply）在 wire 上也是纯文本 —— 对端不能被误判为 AI
+  assert.equal(modelTextInfo('我自己写的回复').isModel, false);
+});

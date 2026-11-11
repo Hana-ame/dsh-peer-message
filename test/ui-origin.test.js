@@ -56,7 +56,8 @@ test('origin: 客户端不再把 [自动回复] 前缀当正文重复显示', ()
   assert.ok(handler.includes("const origin = info.isModel ? 'model' : 'human'"), '未计算来源');
   assert.ok(handler.includes("origin, trigger: info.trigger"), '消息未落 origin/trigger 字段');
   assert.ok(handler.includes('lastOrigin: origin') && handler.includes('lastTrigger: info.trigger'));
-  assert.ok(CLIENT.includes("m.origin === 'model' ? h('div', { className: 'pm-msg-origin' }"), 'UI 未渲染来源徽标');
+  // 现在每条消息都带来源徽标（人/AI 都标），不再是只给 model 渲染。
+  assert.ok(CLIENT.includes("h('div', { className: 'pm-msg-origin' + (isHumanOrigin(m.trigger) ? ' pm-origin-human' : ' pm-origin-ai') }"), 'UI 未渲染来源徽标');
 });
 
 test('origin: 出站投递在 Host 侧按 trigger 写回标记与来源', () => {
@@ -70,11 +71,12 @@ test('origin: 出站投递在 Host 侧按 trigger 写回标记与来源', () => 
 });
 
 test('origin: 人类发送的消息被标记为 human', () => {
-  const send = slice(NET, 'send(id, text) {', 'addFriend(id) {');
-  assert.ok(send.includes("lastOrigin: 'human', lastTrigger: 'human'"), '人类消息缺少 human 来源');
-  assert.ok(send.includes("appendMessage(id, { from: 'me', text: clean, ts: Date.now(), origin: 'human', trigger: 'human' })"));
-  // 浏览器发消息只 POST 给 Host，不自己拼来源
-  assert.ok(CLIENT.includes("this.postAction('send', { id, text })"));
+  const send = slice(NET, 'send(id, text, trigger) {', 'addFriend(id) {');
+  assert.ok(send.includes("lastOrigin: 'human'"), '人类消息缺少 human 来源');
+  assert.ok(send.includes("const kind = trigger === 'human-reply' ? 'human-reply' : 'human'"), '未区分人工回复');
+  assert.ok(send.includes("origin: 'human', trigger: kind"), '未落 human 来源/触发方式');
+  // 浏览器发消息只 POST 给 Host，不自己拼来源（trigger 由 Host 归一）
+  assert.ok(CLIENT.includes("this.postAction('send', { id, text, trigger: trigger === 'human-reply' ? 'human-reply' : 'human' })"));
 });
 
 test('origin: 模型标记消息不会再次触发自动回复（防 AI 互刷）', () => {
@@ -89,7 +91,10 @@ test('origin: 模型标记消息不会再次触发自动回复（防 AI 互刷�
 test('origin: UI 渲染 AI 徽标，并按触发方式细分文案', () => {
   assert.ok(CLIENT.includes('function originLabel(trigger, from)'));
   assert.ok(CLIENT.includes("'AI · 你已批准'") && CLIENT.includes("'AI · 自动回复'") && CLIENT.includes("'AI · Agent 发送'"));
-  assert.ok(CLIENT.includes("m.origin === 'model' ? h('div', { className: 'pm-msg-origin' }"));
+  // 所有消息都渲来源徽标：👤 人工 / AI 模型
+  assert.ok(CLIENT.includes("h('div', { className: 'pm-msg-origin' + (isHumanOrigin(m.trigger) ? ' pm-origin-human' : ' pm-origin-ai') }"));
+  assert.ok(CLIENT.includes("'人工 · 你回复'") && CLIENT.includes("'人工 · 对方回复'"), '未区分人工回复文案');
+  assert.ok(CLIENT.includes('function originIcon(trigger)') && CLIENT.includes('function isHumanOrigin(trigger)'));
   assert.ok(CLIENT.includes('originLabel(m.trigger, m.from)'));
   assert.ok(CLIENT.includes("f.lastOrigin === 'model' ? 'AI｜' : ''"), '好友列表最近消息未标 AI');
   assert.ok(CLIENT.includes("'AI · 模型生成 · 待批准'"), '待批准项未标 AI');
@@ -104,4 +109,23 @@ test('origin: Host runner 给 outbox 写入 origin/trigger/meta', () => {
 
 test('origin: pm_send 工具消息标记为 model/agent', () => {
   assert.ok(TOOL.includes("meta: { origin: 'model', trigger: 'agent' }"));
+});
+
+test('origin: 人可以直接人工回复（待批准弹窗内写回复替代模型草稿）', () => {
+  // 服务层：人工回复走独立方法，trigger=human-reply
+  assert.ok(CLIENT.includes('async sendHumanMessage(id, draft, trigger)'), '缺少人工回复发送方法');
+  assert.ok(CLIENT.includes("trigger: trigger === 'human-reply' ? 'human-reply' : 'human'"));
+  // 待批准弹窗内可写人工回复
+  assert.ok(CLIENT.includes("className: 'pm-pending-human'"), '待批准弹窗缺少人工回复区');
+  assert.ok(CLIENT.includes("placeholder: '输入你要说的话…'"));
+  assert.ok(CLIENT.includes("'发送人工回复'"), '缺少发送人工回复按钮');
+  // 发送后丢弃模型草稿并提示
+  assert.ok(CLIENT.includes('pmService.rejectReply(item.id)'), '人工回复后未丢弃模型草稿');
+  assert.ok(CLIENT.includes("'已发送人工回复（模型草稿已丢弃）'"));
+  // Host 侧对人工回复不做任何模型标记（对端看到真人消息）
+  assert.ok(NET.includes("const kind = trigger === 'human-reply' ? 'human-reply' : 'human'"));
+  assert.ok(NET.includes('conn.send(clean);'), '人工回复不应加模型标记');
+  assert.ok(!NET.includes("kind === 'human-reply' ? wrap"), '人工回复被错误套用模型标记');
+  // 明确的来源文案：人 vs AI
+  assert.ok(CLIENT.includes("'人工 · 你'") && CLIENT.includes("'人工 · 对方'"));
 });

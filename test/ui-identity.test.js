@@ -87,7 +87,7 @@ test('identity: 私钥/Peer ID 在 Host 侧，落在 0600 本地文件（不是 
   assert.ok(NET.includes('const IDENTITY_FP_HEX_LEN = 40'));
   assert.ok(NET.includes("const publicKeyCanonical = (pub) => 'EC|P-256|' + pub.x + '|' + pub.y;"));
   assert.ok(NET.includes('JSON.stringify({ v: HELLO_VERSION, id: peerId, fp: fingerprint, name })'));
-  const snap = slice(NET, 'snapshot() {', 'send(id, text) {');
+  const snap = slice(NET, 'snapshot() {', 'send(id, text, trigger) {');
   assert.ok(!snap.includes('privateJwk'), '快照泄露私钥');
   // 浏览器端不再生成/使用密钥（唯一例外：一次性读取旧 localStorage 交给 Host 迁移）
   assert.ok(!CLIENT.includes('crypto.subtle'), '浏览器仍在做密钥运算');

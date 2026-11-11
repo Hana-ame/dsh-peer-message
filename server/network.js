@@ -352,8 +352,9 @@ export function createNetwork(options) {
   function scheduleRetry() {
     if (!net.started) return;
     net.retryAttempts = (net.retryAttempts || 0) + 1;
-    if (net.retryAttempts > 6) return;
-    const delay = Math.min(2000 * Math.pow(2, net.retryAttempts - 1), 30000);
+    // 永不放弃：PeerJS 云端的旧 Peer ID 会在服务端超时后释放（强杀进程时尤其如此），
+    // 延迟封顶 30s 持续重试同一身份/同一 Peer ID。绝不因此生成新 ID。
+    const delay = Math.min(2000 * Math.pow(2, Math.min(net.retryAttempts - 1, 4)), 30000);
     if (net.retryTimer) clearTimeout(net.retryTimer);
     net.retryTimer = setTimeout(() => {
       net.retryTimer = null;
@@ -469,16 +470,24 @@ export function createNetwork(options) {
       };
     },
 
-    send(id, text) {
+    /**
+     * Send a human-authored message. `trigger` is `human` for a normal chat
+     * message and `human-reply` when a person writes the reply themselves
+     * (e.g. in the pending-approval dialog instead of letting the model answer).
+     * Human replies are NOT wrapped in any model marker on the wire: they are
+     * genuinely written by a human, so peers must not treat them as AI.
+     */
+    send(id, text, trigger) {
       const clean = sanitizeText(text);
       if (!isValidPeerId(id) || !clean) return { ok: false, error: 'invalid-input' };
+      const kind = trigger === 'human-reply' ? 'human-reply' : 'human';
       const conn = net.conns.get(id);
       if (!conn || !conn.open) { connectTo(id); return { ok: false, error: 'offline' }; }
       try {
         conn.send(clean);
       } catch (e) { return { ok: false, error: 'send-failed' }; }
-      upsertFriend(id, { lastMsg: clean, lastTs: Date.now(), lastOrigin: 'human', lastTrigger: 'human' });
-      appendMessage(id, { from: 'me', text: clean, ts: Date.now(), origin: 'human', trigger: 'human' });
+      upsertFriend(id, { lastMsg: clean, lastTs: Date.now(), lastOrigin: 'human', lastTrigger: kind });
+      appendMessage(id, { from: 'me', text: clean, ts: Date.now(), origin: 'human', trigger: kind });
       touch();
       return { ok: true };
     },

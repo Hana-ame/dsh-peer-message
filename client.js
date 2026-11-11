@@ -95,13 +95,30 @@ window.__ModuleLoader__.load({
 
     function isModelText(text) { return modelTextInfo(text).isModel; }
 
-    // 人类消息没有徽标；模型消息按「谁决定发送」再细分。
+    // 来源只有两大类：人写的（human / human-reply）与模型写的（auto/manual/agent）。
+    // 以前人类消息不显示徽标，导致「AI 回复」和「人工回复」在气泡上难以区分；
+    // 现在两者都显示，且用不同图标与文案。
     function originLabel(trigger, from) {
       const mine = from === 'me';
+      // 人类
+      if (!trigger || trigger === 'human') return mine ? '人工 · 你' : '人工 · 对方';
+      if (trigger === 'human-reply') return mine ? '人工 · 你回复' : '人工 · 对方回复';
+      // 模型
       if (trigger === 'manual') return mine ? 'AI · 你已批准' : 'AI · 人工批准';
       if (trigger === 'agent') return mine ? 'AI · Agent 发送' : 'AI · 对方 Agent';
       if (trigger === 'auto') return mine ? 'AI · 自动回复' : 'AI · 对方自动回复';
       return 'AI';
+    }
+
+    // 徽标图标：人 ⇄ AI，让来源一眼可辨（不仅靠文案）。
+    function originIcon(trigger) {
+      if (!trigger || trigger === 'human' || trigger === 'human-reply') return '👤';
+      return 'AI';
+    }
+
+    // 是否是「人写的」消息（决定徽标配色：人类用中性色，模型用强调色）。
+    function isHumanOrigin(trigger) {
+      return !trigger || trigger === 'human' || trigger === 'human-reply';
     }
     const REPLY_MODE_LABELS = { off: '关闭', manual: '手动批准', auto: '全自动' };
     // 选项文案只保留能力描述（“=”右侧），不再重复“只读/只写/全自动”等模式名。
@@ -294,6 +311,8 @@ window.__ModuleLoader__.load({
       // 模型来源徽标：人类消息没有，模型消息按决策方式细分。
       '.pm-msg-model{padding-top:6px;}',
       '.pm-msg-origin{display:inline-flex;align-items:center;gap:4px;font-size:9px;line-height:1.5;padding:0 5px;border-radius:4px;border:1px solid currentColor;opacity:.72;margin-bottom:4px;white-space:nowrap;}',
+      '.pm-msg-origin.pm-origin-human{color:var(--dsw-alias-label-secondary,inherit);}',
+      '.pm-msg-origin.pm-origin-ai{color:color-mix(in srgb,var(--dsw-alias-brand-primary,#3b82f6) 78%,var(--dsw-alias-label-primary,#000));}',
       '.pm-msg-mine .pm-msg-origin{opacity:.85;}',
       '.pm-msg-origin .pm-origin-icon{font-weight:700;letter-spacing:.02em;}',
       '.pm-chat-input{padding:12px 20px;border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.15));display:flex;gap:8px;align-items:flex-end;}',
@@ -371,6 +390,10 @@ window.__ModuleLoader__.load({
       '.pm-note-input{min-height:88px;resize:vertical;line-height:1.5;font-family:inherit;}',
       '.pm-pending-text{font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:110px;overflow-y:auto;margin:6px 0;color:var(--dsw-alias-label-primary,inherit);}',
       '.pm-pending-btns{display:flex;gap:6px;justify-content:flex-end;}',
+      '.pm-pending-human{margin-top:8px;padding-top:8px;border-top:1px dashed var(--dsw-alias-border-l1,rgba(127,127,127,.18));}',
+      '.pm-pending-human-input{width:100%;box-sizing:border-box;min-height:52px;max-height:110px;resize:vertical;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.3));background:var(--dsw-specific-input-major,var(--dsw-alias-bg-layer-1,transparent));color:var(--dsw-alias-label-primary,inherit);font-size:12px;line-height:1.5;font-family:inherit;margin-top:4px;}',
+      '.pm-pending-human-input:focus{outline:2px solid var(--dsw-alias-brand-primary,#3b82f6);outline-offset:-1px;}',
+      '.pm-pending-human-btns{display:flex;justify-content:flex-end;margin-top:6px;}',
       '.pm-btn.small{padding:4px 10px;font-size:11px;flex:none;}',
       '.pm-reply-status-list{max-height:180px;overflow-y:auto;font-size:11px;line-height:1.6;}',
       '.pm-reply-status-row{display:flex;gap:6px;padding:2px 0;color:var(--dsw-alias-label-secondary,inherit);}',
@@ -705,9 +728,18 @@ window.__ModuleLoader__.load({
       async markRead(id) { await this.postAction('markRead', { id }); },
 
       async sendMessage(id, draft) {
+        return this.sendHumanMessage(id, draft, 'human');
+      },
+
+      /**
+       * 人自己写的消息。trigger='human-reply' 表示这是人替代模型写的回复
+       * （在待批准弹窗里直接回复），界面上会标成「人工 · 你回复」，
+       * 与「AI · 自动回复 / AI · 你已批准」明确区分。
+       */
+      async sendHumanMessage(id, draft, trigger) {
         const text = sanitizeText(draft);
         if (!text || !id) return false;
-        const r = await this.postAction('send', { id, text });
+        const r = await this.postAction('send', { id, text, trigger: trigger === 'human-reply' ? 'human-reply' : 'human' });
         if (r && r.ok === false) {
           this.showToast(r.error === 'offline' ? '对方不在线，消息无法送达' : '发送失败');
           return false;
@@ -1025,6 +1057,20 @@ window.__ModuleLoader__.load({
     function ReplyPendingModal({ pending, recent, unavailable, onClose }) {
       const items = Array.isArray(pending) ? pending : [];
       const recentItems = Array.isArray(recent) ? recent.slice(0, 10) : [];
+      // 每条待批准项都可以由人直接写回复（人工回复），与「批准模型回复」并列：
+      // 批准 = 发模型生成的内容（标 AI · 人工批准）；人工回复 = 发你自己写的内容（标 人工）。
+      const [humanDraft, setHumanDraft] = React.useState({});
+      const sendHuman = (item) => {
+        const text = (humanDraft[item.id] || '').trim();
+        if (!text) return;
+        pmService.sendHumanMessage(item.peerId, text, 'human-reply').then((ok) => {
+          if (!ok) return;
+          setHumanDraft((prev) => Object.assign({}, prev, { [item.id]: '' }));
+          // 人工已经回复，这条模型草稿不再需要批准。
+          pmService.rejectReply(item.id);
+          pmService.showToast('已发送人工回复（模型草稿已丢弃）');
+        });
+      };
       return h('div', { className: 'pm-modal-overlay', onMouseDown: onClose },
         h('div', { className: 'pm-modal pm-modal-wide', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
           h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: onClose }, '✕'),
@@ -1043,6 +1089,25 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'pm-pending-btns' },
                   h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.rejectReply(item.id) }, '忽略'),
                   h('button', { className: 'pm-btn small primary', type: 'button', onClick: () => pmService.approveReply(item.id) }, '批准回复'),
+                ),
+                // 人工回复：不采用模型草稿，改由人自己写一条（对端看到的是真人消息）。
+                h('div', { className: 'pm-pending-human' },
+                  h('div', { className: 'pm-pending-subhead' }, '或由你直接人工回复（发送后丢弃上面的模型草稿，对端看到的是人工消息）：'),
+                  h('textarea', {
+                    className: 'pm-pending-human-input',
+                    placeholder: '输入你要说的话…',
+                    maxLength: MAX_TEXT_LEN,
+                    value: humanDraft[item.id] || '',
+                    onChange: e => setHumanDraft((prev) => Object.assign({}, prev, { [item.id]: e.target.value })),
+                    onKeyDown: e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendHuman(item); } },
+                  }),
+                  h('div', { className: 'pm-pending-human-btns' },
+                    h('button', {
+                      className: 'pm-btn small', type: 'button',
+                      disabled: !(humanDraft[item.id] || '').trim(),
+                      onClick: () => sendHuman(item),
+                    }, '发送人工回复'),
+                  ),
                 ),
               )),
           recentItems.length > 0 ? h('div', null,
@@ -1362,12 +1427,14 @@ window.__ModuleLoader__.load({
                   ? h('div', { style: { textAlign: 'center', color: 'var(--dsw-alias-label-secondary,inherit)', padding: '40px', fontSize: 12 } }, '开始聊天吧')
                   : activeMsgs.map((m, i) => h('div', {
                       key: i,
-                      className: 'pm-msg ' + (m.from === 'me' ? 'pm-msg-mine' : 'pm-msg-theirs') + (m.origin === 'model' ? ' pm-msg-model' : ''),
+                      className: 'pm-msg ' + (m.from === 'me' ? 'pm-msg-mine' : 'pm-msg-theirs')
+                        + (m.origin === 'model' ? ' pm-msg-model' : ' pm-msg-human'),
                     },
-                      m.origin === 'model' ? h('div', { className: 'pm-msg-origin' },
-                        h('span', { className: 'pm-origin-icon' }, 'AI'),
+                      // 每条消息都标来源：👤 人工 / AI 模型（自动、已批准、Agent）。
+                      h('div', { className: 'pm-msg-origin' + (isHumanOrigin(m.trigger) ? ' pm-origin-human' : ' pm-origin-ai') },
+                        h('span', { className: 'pm-origin-icon', 'aria-hidden': 'true' }, originIcon(m.trigger)),
                         h('span', null, originLabel(m.trigger, m.from)),
-                      ) : null,
+                      ),
                       h('div', { className: 'pm-msg-body' }, m.text),
                       h('div', { className: 'pm-msg-time' }, fmtTime(m.ts)),
                     )),

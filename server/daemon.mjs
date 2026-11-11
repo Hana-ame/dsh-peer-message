@@ -193,7 +193,7 @@ const server = createServer(async (request, response) => {
       const action = typeof body.action === 'string' ? body.action : '';
       let result;
       switch (action) {
-        case 'send': result = net.send(body?.id, body?.text); break;
+        case 'send': result = net.send(body?.id, body?.text, body?.trigger); break;
         case 'addFriend': result = net.addFriend(body?.id); break;
         case 'removeFriend': result = net.removeFriend(body?.id); break;
         case 'markRead': result = net.markRead(body?.id); break;
