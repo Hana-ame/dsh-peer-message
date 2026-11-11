@@ -1,7 +1,7 @@
 // 真实集成：Host(createNetwork, 真 wrtc+peerjs) ↔ Node 真实对端，双向消息 + hello 验签 + 落盘。
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
-import { webcrypto } from 'node:crypto';
+import { webcrypto, randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
