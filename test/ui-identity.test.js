@@ -103,7 +103,11 @@ test('identity: 浏览器只轮询 Host 快照并 POST 操作（视图层）', (
   assert.ok(CLIENT.includes('this.pollTimer = setInterval(() => this.pollHost(), 1000)'));
   // 连接在独立 daemon 进程：关标签页、重启 DSH 都不掉线
   assert.ok(HOST.includes("new URL('./server/daemon.mjs', import.meta.url)"), 'Host 未指向 daemon 入口');
-  assert.ok(HOST.includes("socketPath: sockPath()"), 'Host 未通过 unix socket 访问 daemon');
+  // daemon 访问已抽成共享客户端（server/client.mjs），socketPath 在那里构造
+  const CLIENT_MOD = readFileSync(new URL('../server/client.mjs', import.meta.url), 'utf8');
+  assert.ok(CLIENT_MOD.includes('socketPath: sockPath'), '客户端未用 unix socket');
+  assert.ok(CLIENT_MOD.includes('join(dataDir, \'net.sock\')'), 'socket 路径不是 <dataDir>/net.sock');
+  assert.ok(HOST.includes('createDaemonClient'), 'Host 未使用共享客户端');
   assert.ok(HOST.includes('spawnDaemon'), '缺少 daemon 按需启动');
   const DAEMON = readFileSync(new URL('../server/daemon.mjs', import.meta.url), 'utf8');
   assert.ok(DAEMON.includes('createNetwork({'), 'daemon 未创建传输');
@@ -276,7 +280,9 @@ test('reply: 自动回复/agent 出站必须真正投给 daemon 并落库（不�
   assert.ok(DAEMON.includes("path === '/deliver'"), 'daemon 缺少 /deliver 端点');
   assert.ok(DAEMON.includes('net.deliverReply(body?.to, body?.text'), '/deliver 未调用 deliverReply');
   // Host 侧：pushOutbox 直接投 daemon
-  assert.ok(HOST.includes('deliver: (to, text, meta) => daemonRequest'), 'Host 未接 /deliver');
+  assert.ok(HOST.includes('deliver: (to, text, meta) => client.deliver(to, text, meta)'), 'Host 未接 deliver');
+  const clientMod = readFileSync(new URL('../server/client.mjs', import.meta.url), 'utf8');
+  assert.ok(clientMod.includes("deliver: (to, text, meta) => callRaw('POST', '/deliver'"), 'client 未实现 /deliver');
   assert.ok(HOST.includes('return instance.deliver(item.to, item.text, item.meta || {});'), 'pushOutbox 未投 daemon');
   // 常驻排水：pm_send 的 outbox 也要被投递
   assert.ok(HOST.includes("'peer-message: outbox drain'"), '缺少常驻 outbox 排水');

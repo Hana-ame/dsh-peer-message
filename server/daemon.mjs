@@ -188,6 +188,48 @@ const send = (response, status, value) => {
   response.end(body);
 };
 
+/**
+ * 全部可调用的 action。既是实现，也是 GET /api 的自描述来源——
+ * 调用方（Host 代理、脚本、将来的其它前端）不需要再猜有哪些操作。
+ */
+const ACTIONS = {
+  send: (net, body) => net.send(body?.id, body?.text, body?.trigger),
+  addFriend: (net, body) => net.addFriend(body?.id),
+  removeFriend: (net, body) => net.removeFriend(body?.id),
+  markRead: (net, body) => net.markRead(body?.id),
+  patchFriend: (net, body) => net.patchFriend(body?.id, body?.patch || {}),
+  patchSettings: (net, body) => net.patchSettings(body?.patch || {}),
+  retryPeer: (net) => net.retryPeer(),
+  rotateIdentity: (net) => net.rotateIdentity(),
+};
+
+const API_DOC = {
+    ok: true,
+    transport: 'unix socket, JSON over HTTP (mode 0600)',
+    endpoints: {
+      'GET  /health': 'daemon liveness + pid + peer id',
+      'GET  /state': 'full snapshot (identity metadata, friends, messages, settings, inbound peek)',
+      'POST /action': 'run one action from `actions`, returns { ok, result, snapshot }',
+      'POST /deliver': 'deliver a model/agent message: { to, text, meta:{origin,trigger,model} }',
+      'POST /inbound': 'consume the inbound human-message queue',
+      'POST /migrate': 'one-shot import of legacy browser state/identity',
+      'GET  /api': 'this document',
+    },
+    actions: Object.keys(ACTIONS),
+    fields: {
+      friend: ['id', 'name', 'alias', 'note', 'online', 'verified', 'fingerprint', 'unread', 'lastMsg', 'lastTs', 'lastOrigin', 'lastTrigger'],
+      message: ['from', 'text', 'ts', 'origin', 'trigger'],
+      settings: ['allowBroadcast', 'allowIncoming', 'nickname', 'reply'],
+      reply: ['mode', 'permission', 'provider', 'model', 'reasoningEffort', 'sessionMode', 'sessionId', 'cwd'],
+    },
+    notes: [
+      'Peer ID is derived from the identity public key and never randomized.',
+      'verified/fingerprint are only ever written by a successful hello signature check (patchFriend cannot set them).',
+      'send trigger: "human" (normal) or "human-reply" (a person answering instead of the model).',
+      'deliver meta.trigger: "auto" | "manual" | "agent".',
+    ],
+};
+
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url || '/', 'http://daemon');
@@ -212,6 +254,9 @@ const server = createServer(async (request, response) => {
       // 唯一消费入口：由 Host 的自动回复泵调用。
       return send(response, 200, { ok: true, items: net.drainInbound() });
     }
+    if (request.method === 'GET' && path === '/api') {
+      return send(response, 200, API_DOC);
+    }
     if (request.method === 'GET' && path === '/health') {
       return send(response, 200, { ok: true, pid: process.pid, version: net.version, myId: net.snapshot().myId });
     }
@@ -224,18 +269,16 @@ const server = createServer(async (request, response) => {
         return send(response, 200, Object.assign({ ok: true }, result, { snapshot: net.snapshot() }));
       }
       const action = typeof body.action === 'string' ? body.action : '';
-      let result;
-      switch (action) {
-        case 'send': result = net.send(body?.id, body?.text, body?.trigger); break;
-        case 'addFriend': result = net.addFriend(body?.id); break;
-        case 'removeFriend': result = net.removeFriend(body?.id); break;
-        case 'markRead': result = net.markRead(body?.id); break;
-        case 'patchFriend': result = net.patchFriend(body?.id, body?.patch || {}); break;
-        case 'patchSettings': result = net.patchSettings(body?.patch || {}); break;
-        case 'retryPeer': result = net.retryPeer(); break;
-        case 'rotateIdentity': result = await net.rotateIdentity(); break;
-        default: return send(response, 400, { ok: false, error: 'unknown-action' });
+      const handler = ACTIONS[action];
+      if (!handler) {
+        return send(response, 400, {
+          ok: false,
+          error: 'unknown-action',
+          action,
+          available: Object.keys(ACTIONS),
+        });
       }
+      const result = await handler(net, body);
       return send(response, 200, Object.assign({ ok: true }, result, { snapshot: net.snapshot() }));
     }
     return send(response, 404, { ok: false, error: 'not-found' });

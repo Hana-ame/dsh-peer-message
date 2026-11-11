@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { isValidPeerId } from './validate.js';
+import { createDaemonClient } from './server/client.mjs';
 
 export const inject = ['connection'];
 
@@ -34,6 +35,7 @@ const daemonEntry = fileURLToPath(new URL('./server/daemon.mjs', import.meta.url
 const ROUTES = [
   '/api/pm-net/state',
   '/api/pm-net/action',
+  '/api/pm-net/api',
   '/api/pm-net/migrate',
   '/api/pm-outbox',
   '/api/pm-reply/request',
@@ -166,30 +168,15 @@ export function apply(ctx) {
   const sockPath = () => join(dataDir(), 'net.sock');
 
   // unix socket 上的极简 JSON HTTP 客户端（Node 18+ undici 支持 socketPath）。
-  const daemonRequest = (method, path, payload, signal) => new Promise((resolve, reject) => {
-    const body = payload === undefined ? null : JSON.stringify(payload);
-    const request = httpRequest({
-      socketPath: sockPath(),
-      path,
-      method,
-      headers: body ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {},
-      // 信令重连期间 snapshot 可能较慢；超时过短会误判为「daemon 掉线」并重开
-      // 一个 daemon，新 daemon 又去抢同一 Peer ID → 永久 unavailable-id。
-      timeout: 20000,
-    }, (response) => {
-      const chunks = [];
-      response.on('data', (chunk) => chunks.push(chunk));
-      response.on('end', () => {
-        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); }
-        catch (error) { reject(error); }
-      });
-    });
-    request.on('error', reject);
-    request.on('timeout', () => { request.destroy(new Error('daemon timeout')); });
-    if (signal) signal.addEventListener('abort', () => request.destroy(new Error('aborted')), { once: true });
-    if (body) request.write(body);
-    request.end();
-  });
+  // 统一走 server/client.mjs：同一份客户端给脚本/其它进程复用，
+  // 避免各脚本各自实现一套（曾因此绕过 API 直接改 state.json）。
+  // 超时 20s：信令重连期间 snapshot 可能较慢，过短会误判掉线并重开 daemon。
+  let daemonClient = null;
+  const getClient = () => {
+    if (!daemonClient) daemonClient = createDaemonClient(dataDir(), { timeout: 20000 });
+    return daemonClient;
+  };
+  const daemonRequest = (method, path, payload, signal) => getClient().callRaw(method, path, payload, signal);
 
   // 只有「socket 不存在/拒绝连接」才算真的没有 daemon；超时不算。
   const isConnRefused = (error) => {
@@ -299,13 +286,14 @@ export function apply(ctx) {
         ctx.logger.warn('[peer-message] p2p daemon did not become ready');
         return null;
       }
+      const client = getClient();
       net = {
-        get(field) { return field; },
-        snapshot: () => daemonRequest('GET', '/state'),
-        action: (payload) => daemonRequest('POST', '/action', payload),
-        drainInbound: () => daemonRequest('POST', '/inbound'),
-        deliver: (to, text, meta) => daemonRequest('POST', '/deliver', { to, text, meta }),
-        migrate: (payload) => daemonRequest('POST', '/migrate', payload),
+        snapshot: (signal) => client.state(signal),
+        action: (payload, signal) => client.callRaw('POST', '/action', payload, signal),
+        drainInbound: () => client.drainInbound(),
+        deliver: (to, text, meta) => client.deliver(to, text, meta),
+        migrate: (payload, signal) => client.callRaw('POST', '/migrate', payload, signal),
+        api: () => client.api(),
       };
       ctx.logger.info?.(`[peer-message] p2p daemon ready (socket ${sockPath()})`);
       return net;
@@ -356,6 +344,21 @@ export function apply(ctx) {
       }
     },
   }), 'peer-message: /api/pm-net/action');
+
+  // 自描述：调用方/脚本不必猜 daemon 支持哪些 action。
+  ctx.effect(() => ctx.connection.fetch.register({
+    path: '/api/pm-net/api',
+    methods: ['GET'],
+    requestBody: 'buffered',
+    fetch: async () => {
+      const instance = await ensureNet();
+      if (!instance) return json({ ok: false, error: 'host-network-unavailable' }, 503);
+      try { return json(await instance.api()); } catch (error) {
+        if (isConnRefused(error)) netReady = null;
+        return json({ ok: false, error: 'daemon-busy', retry: true }, 503);
+      }
+    },
+  }), 'peer-message: /api/pm-net/api');
 
   ctx.effect(() => ctx.connection.fetch.register({
     path: '/api/pm-net/migrate',
