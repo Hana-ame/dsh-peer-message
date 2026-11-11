@@ -94,56 +94,79 @@ await net.start();
 log('network started; Peer ID =', net.snapshot().myId);
 
 // ── 单实例保护：同一个 dataDir 只允许一个 daemon ─────────────────────────
-// 关键：不能盲目 rm 掉已有 socket（那会让两个 daemon 同时持有同一 Peer ID →
-// 互相 unavailable-id）。先探活：活着的 daemon 直接让位；只有确认是残留
-// socket（连不上）才清理。
-{
-  const healthProbe = async (attempts = 3) => {
-    for (let i = 0; i < attempts; i += 1) {
-      const alive = await new Promise((resolve) => {
-        const probe = httpRequest({ socketPath: sockPath, path: '/health', method: 'GET', timeout: 2000 }, (response) => {
-          let body = '';
-          response.on('data', (chunk) => { body += chunk; });
-          response.on('end', () => {
-            try { resolve(JSON.parse(body).ok === true); } catch (e) { resolve(false); }
-          });
-        });
-        probe.on('error', () => resolve(false));
-        probe.on('timeout', () => { probe.destroy(); resolve(false); });
-        probe.end();
-      });
-      if (alive) return true;
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-    return false;
-  };
+// 关键教训：绝不能盲删已有 socket/pid。页面（1s 轮询）会并发触发自动拉起，
+// 多个 daemon 若都通过检查再各自 listen，就会向 PeerJS 注册同一个 Peer ID，
+// 后启动的挤掉先启动的，而被挤掉的那个仍在云端保留登记 → 永久 unavailable-id。
+// 因此这里用 **O_EXCL 原子创建** 锁文件抢占所有权，天然没有竞态窗口：
+// 只有一个进程能建成，其余直接退出；锁里记录 pid 用于识别残留锁。
+const lockPath = join(dataDir, 'net.lock');
 
-  // 1) 进程级：pid 文件里的那个进程还活着吗？（比 socket 探活更可靠）
-  if (existsSync(pidPath)) {
-    const raw = readFileSync(pidPath, 'utf8').trim();
-    const pid = Number.parseInt(raw, 10);
-    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
-      let running = false;
-      try { process.kill(pid, 0); running = true; } catch (e) { running = e.code === 'EPERM'; }
-      if (running) {
-        log(`another daemon (pid ${pid}) owns this data dir; exiting to keep a single holder`);
-        try { net.stop(); } catch (e) { /* ignore */ }
-        process.exit(0);
-      }
-    }
-  }
-  // 2) socket 级：pid 文件丢失但 daemon 还在跑的情况
-  if (existsSync(sockPath) && await healthProbe()) {
-    log('another daemon answers on this socket; exiting to keep a single holder');
-    try { net.stop(); } catch (e) { /* ignore */ }
-    process.exit(0);
-  }
-  if (existsSync(sockPath)) {
-    log('removing stale socket', sockPath);
-    try { rmSync(sockPath); } catch (e) { /* ignore */ }
-  }
-  writeFileSync(pidPath, String(process.pid), { mode: 0o600 });
+function readLockPid() {
+  try { return Number.parseInt(readFileSync(lockPath, 'utf8').trim(), 10) || 0; } catch (e) { return 0; }
 }
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+const healthProbe = async (attempts = 3) => {
+  for (let i = 0; i < attempts; i += 1) {
+    const alive = await new Promise((resolve) => {
+      const probe = httpRequest({ socketPath: sockPath, path: '/health', method: 'GET', timeout: 2000 }, (response) => {
+        let body = '';
+        response.on('data', (chunk) => { body += chunk; });
+        response.on('end', () => {
+          try { resolve(JSON.parse(body).ok === true); } catch (e) { resolve(false); }
+        });
+      });
+      probe.on('error', () => resolve(false));
+      probe.on('timeout', () => { probe.destroy(); resolve(false); });
+      probe.end();
+    });
+    if (alive) return true;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return false;
+};
+
+let ownsLock = false;
+for (let attempt = 0; attempt < 50 && !ownsLock; attempt += 1) {
+  try {
+    // wx = O_CREAT|O_EXCL：原子；失败说明别人先建了锁。
+    writeFileSync(lockPath, String(process.pid), { flag: 'wx', mode: 0o600 });
+    ownsLock = true;
+    break;
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    const otherPid = readLockPid();
+    if (pidAlive(otherPid)) {
+      log(`another daemon (pid ${otherPid}) holds the lock; exiting to keep a single holder`);
+      try { net.stop(); } catch (e) { /* ignore */ }
+      process.exit(0);
+    }
+    // 锁指向已死进程：确认没有活 daemon 应答后再清理（防 pid 复用误判）。
+    if (await healthProbe(1)) {
+      log('a live daemon answers on the socket; exiting to keep a single holder');
+      try { net.stop(); } catch (e) { /* ignore */ }
+      process.exit(0);
+    }
+    log(`removing stale lock (pid ${otherPid || 'unknown'} is not running)`);
+    try { rmSync(lockPath); } catch (e) { /* ignore */ }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+if (!ownsLock) {
+  log('could not acquire the single-holder lock; exiting');
+  try { net.stop(); } catch (e) { /* ignore */ }
+  process.exit(0);
+}
+
+// 拿到锁之后才清理残留 socket 并写 pid：此时已无竞争者。
+if (existsSync(sockPath)) {
+  try { rmSync(sockPath); } catch (e) { /* ignore */ }
+}
+writeFileSync(pidPath, String(process.pid), { mode: 0o600 });
 
 function readBody(request) {
   return new Promise((resolve, reject) => {
@@ -223,6 +246,8 @@ const shutdown = (signal) => {
   try { server.close(); } catch (e) { /* ignore */ }
   try { if (existsSync(sockPath)) rmSync(sockPath); } catch (e) { /* ignore */ }
   try { if (existsSync(pidPath)) rmSync(pidPath); } catch (e) { /* ignore */ }
+  // 释放单持有锁（只在确实写入本进程 pid 时删除，避免误删别人的锁）
+  try { if (readLockPid() === process.pid && existsSync(lockPath)) rmSync(lockPath); } catch (e) { /* ignore */ }
   process.exit(0);
 };
 process.on('SIGTERM', () => shutdown('SIGTERM'));

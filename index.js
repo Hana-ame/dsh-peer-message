@@ -160,7 +160,9 @@ export function apply(ctx) {
       path,
       method,
       headers: body ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {},
-      timeout: 8000,
+      // 信令重连期间 snapshot 可能较慢；超时过短会误判为「daemon 掉线」并重开
+      // 一个 daemon，新 daemon 又去抢同一 Peer ID → 永久 unavailable-id。
+      timeout: 20000,
     }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(chunk));
@@ -176,7 +178,21 @@ export function apply(ctx) {
     request.end();
   });
 
+  // 只有「socket 不存在/拒绝连接」才算真的没有 daemon；超时不算。
+  const isConnRefused = (error) => {
+    const code = error && (error.code || error.errno);
+    const message = String((error && error.message) || '');
+    return code === 'ENOENT' || code === 'ECONNREFUSED' || /ENOENT|ECONNREFUSED/.test(message);
+  };
+
+  // 拉起节流：同一进程内 30s 最多拉起一次，避免页面轮询把 spawn 放大成风暴。
+  let lastSpawnAt = 0;
+  const SPAWN_MIN_INTERVAL_MS = 30000;
+
   const spawnDaemon = () => {
+    const now = Date.now();
+    if (now - lastSpawnAt < SPAWN_MIN_INTERVAL_MS) return true; // 视为已在拉起中
+    lastSpawnAt = now;
     try {
       const child = spawn(process.execPath, [daemonEntry], {
         detached: true,
@@ -249,9 +265,10 @@ export function apply(ctx) {
         const snapshot = await instance.snapshot(request.signal);
         return json(snapshot);
       } catch (error) {
-        // daemon 掉线：重置缓存，下次请求重新拉起。
-        netReady = null;
-        return json({ ok: false, error: 'daemon-unreachable' }, 503);
+        // 只有确认「连不上」才允许下次重新拉起；超时/繁忙绝不重启 daemon，
+        // 否则会不断新起进程抢同一 Peer ID。这里只是把本次请求降级返回。
+        if (isConnRefused(error)) netReady = null;
+        return json({ ok: false, error: 'daemon-busy', retry: true }, 503);
       }
     },
   }), 'peer-message: /api/pm-net/state');
@@ -269,8 +286,8 @@ export function apply(ctx) {
         const result = await instance.action(body, request.signal);
         return json(result);
       } catch (error) {
-        netReady = null;
-        return json({ ok: false, error: 'daemon-unreachable' }, 503);
+        if (isConnRefused(error)) netReady = null;
+        return json({ ok: false, error: 'daemon-busy', retry: true }, 503);
       }
     },
   }), 'peer-message: /api/pm-net/action');
@@ -287,8 +304,8 @@ export function apply(ctx) {
       try {
         return json(await instance.migrate({ identity: body?.identity, state: body?.state }, request.signal));
       } catch (error) {
-        netReady = null;
-        return json({ ok: false, error: 'daemon-unreachable' }, 503);
+        if (isConnRefused(error)) netReady = null;
+        return json({ ok: false, error: 'daemon-busy', retry: true }, 503);
       }
     },
   }), 'peer-message: /api/pm-net/migrate');

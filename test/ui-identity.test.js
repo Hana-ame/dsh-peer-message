@@ -219,3 +219,17 @@ test('identity: 用户可见文案不再声称私钥存在 localStorage（密钥
   assert.ok(!CLIENT.includes('当前页面不是安全上下文'), '仍残留浏览器安全上下文文案');
   assert.ok(!CLIENT.includes('当前页面无法使用 WebCrypto'), '仍残留页面 WebCrypto 文案');
 });
+
+
+test('identity: 页面轮询不会因一次超时就重启 daemon（否则抢同一 Peer ID）', () => {
+  // 超时不得重置 netReady：只有 socket 不存在/拒绝连接才允许重新拉起
+  assert.ok(HOST.includes('const isConnRefused = (error) =>'), '缺少连接拒绝判定');
+  assert.ok(HOST.includes("code === 'ENOENT' || code === 'ECONNREFUSED'"), '未识别连接拒绝');
+  assert.ok(HOST.includes('if (isConnRefused(error)) netReady = null;'), '错误处理未区分超时与掉线');
+  assert.ok(!/catch \(error\) \{\s*netReady = null;\s*return json\(\{ ok: false, error: 'daemon-unreachable' \}/.test(HOST), '仍在任何错误上重启 daemon');
+  // 拉起节流
+  assert.ok(HOST.includes('SPAWN_MIN_INTERVAL_MS'), '缺少 spawn 节流');
+  assert.ok(HOST.includes("error: 'daemon-busy', retry: true"), '繁忙时应让页面重试而不是重启');
+  // 请求超时要大于信令重连耗时
+  assert.ok(/timeout: 20000/.test(HOST), 'daemon 请求超时过短');
+});
