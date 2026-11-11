@@ -233,3 +233,14 @@ test('identity: 页面轮询不会因一次超时就重启 daemon（否则抢同
   // 请求超时要大于信令重连耗时
   assert.ok(/timeout: 20000/.test(HOST), 'daemon 请求超时过短');
 });
+
+
+test('identity: 已有 daemon 在启动/运行时不另起第二个（避免抢同一 Peer ID）', () => {
+  assert.ok(HOST.includes('const daemonStarting = () =>'), '缺少「已有 daemon」判定');
+  assert.ok(HOST.includes("'net.lock'") && HOST.includes("'net.pid'"), '未检查锁/pid 文件');
+  assert.ok(HOST.includes('daemonStarting()'), 'ensureNet 未使用该判定');
+  // 冷启动等待时间必须足够长
+  assert.ok(HOST.includes('waitForDaemon(6000)'), '初始等待过短');
+  assert.ok(HOST.includes('waitForDaemon(30000)'), '已有 daemon 启动时等待过短');
+  assert.ok(HOST.includes('waitForDaemon(45000)'), '新 spawn 后等待过短');
+});

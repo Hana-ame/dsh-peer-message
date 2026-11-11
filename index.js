@@ -19,7 +19,7 @@
  * guard and per-session sandbox/approval events.
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -185,6 +185,23 @@ export function apply(ctx) {
     return code === 'ENOENT' || code === 'ECONNREFUSED' || /ENOENT|ECONNREFUSED/.test(message);
   };
 
+  // 锁文件或存活 pid 存在 = 已有 daemon 在启动/运行，绝不能另起一个。
+  const daemonStarting = () => {
+    const dir = dataDir();
+    const lockFile = join(dir, 'net.lock');
+    const pidFile = join(dir, 'net.pid');
+    for (const file of [lockFile, pidFile]) {
+      try {
+        if (!existsSync(file)) continue;
+        const pid = Number.parseInt(readFileSync(file, 'utf8').trim(), 10);
+        if (Number.isInteger(pid) && pid > 0) {
+          try { process.kill(pid, 0); return true; } catch (e) { if (e.code === 'EPERM') return true; }
+        }
+      } catch (e) { /* ignore */ }
+    }
+    return false;
+  };
+
   // 拉起节流：同一进程内 30s 最多拉起一次，避免页面轮询把 spawn 放大成风暴。
   let lastSpawnAt = 0;
   const SPAWN_MIN_INTERVAL_MS = 30000;
@@ -226,10 +243,18 @@ export function apply(ctx) {
   const ensureNet = () => {
     if (netReady) return netReady;
     netReady = (async () => {
-      let healthy = await waitForDaemon(1500);
+      // 先给可能正在启动/正在重连的 daemon 足够时间：冷启动要生成/读取密钥并
+      // 建立信令，1.5s 远远不够。过短会导致「以为没有 daemon → 再 spawn 一个」，
+      // 两个 daemon 抢同一 Peer ID，正是长期 unavailable-id 的根因。
+      let healthy = await waitForDaemon(6000);
+      if (!healthy && daemonStarting()) {
+        // 锁/pid 存在说明已有 daemon 在启动或运行中：等它，不要另起。
+        ctx.logger.info?.('[peer-message] p2p daemon already starting; waiting for it');
+        healthy = await waitForDaemon(30000);
+      }
       if (!healthy) {
         if (!spawnDaemon()) return null;
-        healthy = await waitForDaemon(15000);
+        healthy = await waitForDaemon(45000);
       }
       if (!healthy) {
         ctx.logger.warn('[peer-message] p2p daemon did not become ready');
