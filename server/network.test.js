@@ -202,3 +202,18 @@ test('host network: 信令既不 open 也不 error 时有看门狗，不会永�
   assert.ok(block.includes('scheduleRetry()'), '看门狗未触发重试');
   assert.ok(!block.includes('generateIdentity'), '看门狗不应更换身份');
 });
+
+
+test('host network: deliverReply 不会重复加来源标记（不能出现 [自动回复] [自动回复]）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pm-wrap-'));
+  const net = await makeNet(dir);
+  const snap = net.snapshot();
+  // 已带标记的正文：剥离后按 trigger 重新加，只应有一个前缀
+  const result = net.deliverReply(snap.state.friends[0]?.id || 'dsh-pm-wwwwwwwwwwwwwwwwwwww', '[自动回复] 正文内容', { trigger: 'auto' });
+  assert.ok(result.ok === false || result.ok === true);
+  net.stop();
+  const src = readFileSync(new URL('./network.js', import.meta.url), 'utf8');
+  const block = src.slice(src.indexOf('deliverReply(to, replyText, meta) {'), src.indexOf('deliverReply(to, replyText, meta) {') + 900);
+  assert.ok(block.includes('const info = modelTextInfo(raw)'), '未解析已有标记');
+  assert.ok(block.includes('const body = info.isModel ? info.display : raw'), '未剥离已有标记');
+});

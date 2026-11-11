@@ -198,6 +198,16 @@ const server = createServer(async (request, response) => {
       snapshot.inbound = net.peekInbound();
       return send(response, 200, snapshot);
     }
+    if (request.method === 'POST' && path === '/deliver') {
+      // 自动回复 / agent 出站消息的唯一投递入口。必须在 daemon 侧投递：
+      // 消息要进 state.json 并真的发出去，而不是停在 DSH 进程的 outbox 数组里
+      // （之前 /api/pm-outbox 只 push 不排水，回复 = 永远显示不出来）。
+      const raw = await readBody(request);
+      let body;
+      try { body = JSON.parse(raw || '{}'); } catch (e) { return send(response, 400, { ok: false, error: 'invalid-json' }); }
+      const result = net.deliverReply(body?.to, body?.text, body?.meta || {});
+      return send(response, result.ok ? 200 : 200, Object.assign({ ok: true }, result));
+    }
     if (request.method === 'POST' && path === '/inbound') {
       // 唯一消费入口：由 Host 的自动回复泵调用。
       return send(response, 200, { ok: true, items: net.drainInbound() });

@@ -676,9 +676,17 @@ export function createNetwork(options) {
 
     /** Model auto-reply / agent outbox delivery, unchanged wire markers. */
     deliverReply(to, replyText, meta) {
-      const clean = sanitizeText(replyText, MAX_REPLY_OUTPUT);
+      const raw = typeof replyText === 'string' ? replyText : '';
+      // reply-runner / pm_send 已经按来源加过一次标记（[自动回复]/[自动回复]
+      // [人工批准]/[AI]）。这里必须先把已有标记剥掉再按 trigger 重新加，
+      // 否则对端会看到 `[自动回复] [自动回复] …` 这种重复前缀。
+      const info = modelTextInfo(raw);
+      const body = info.isModel ? info.display : raw;
+      const clean = sanitizeText(body, MAX_REPLY_OUTPUT);
       if (!isValidPeerId(to) || !clean) return { ok: false, error: 'invalid' };
-      const trigger = meta && (meta.trigger === 'manual' || meta.trigger === 'auto' || meta.trigger === 'agent') ? meta.trigger : 'auto';
+      const trigger = meta && (meta.trigger === 'manual' || meta.trigger === 'auto' || meta.trigger === 'agent')
+        ? meta.trigger
+        : (info.isModel ? info.trigger : 'auto');
       const wire = trigger === 'manual'
         ? AUTO_REPLY_PREFIX + MANUAL_APPROVAL_MARKER + clean
         : trigger === 'agent' ? AI_AGENT_PREFIX + clean : AUTO_REPLY_PREFIX + clean;

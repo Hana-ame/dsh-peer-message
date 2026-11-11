@@ -261,3 +261,20 @@ test('identity: 重连好友严格限流，避免信令洪泛把自己踢下线'
   const block = NET.slice(NET.indexOf('function reconnectAll()'), NET.indexOf('function reconnectAll()') + 900);
   assert.ok(block.includes('.slice(0, RECONNECT_BATCH)'), '未限制批量');
 });
+
+
+test('reply: 自动回复/agent 出站必须真正投给 daemon 并落库（不能只 push 到没人排水的数组）', () => {
+  // daemon 暴露 /deliver，且走 net.deliverReply
+  assert.ok(NET.includes('deliverReply(to, replyText, meta)'), 'daemon 未提供 deliverReply');
+  const DAEMON = readFileSync(new URL('../server/daemon.mjs', import.meta.url), 'utf8');
+  assert.ok(DAEMON.includes("path === '/deliver'"), 'daemon 缺少 /deliver 端点');
+  assert.ok(DAEMON.includes('net.deliverReply(body?.to, body?.text'), '/deliver 未调用 deliverReply');
+  // Host 侧：pushOutbox 直接投 daemon
+  assert.ok(HOST.includes('deliver: (to, text, meta) => daemonRequest'), 'Host 未接 /deliver');
+  assert.ok(HOST.includes('return instance.deliver(item.to, item.text, item.meta || {});'), 'pushOutbox 未投 daemon');
+  // 常驻排水：pm_send 的 outbox 也要被投递
+  assert.ok(HOST.includes("'peer-message: outbox drain'"), '缺少常驻 outbox 排水');
+  assert.ok(HOST.includes('instance.deliver(item.to, item.text, item.meta || {})'), 'outbox 排水未投 daemon');
+  // 不能再出现「push 完就完事」的旧写法
+  assert.ok(!HOST.includes("import('./outbox.js').then(({ pushItem }) => pushItem(item)).catch(() => {});\n        },"), '仍存在只 push 不投递的旧 pushOutbox');
+});

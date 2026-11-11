@@ -74,8 +74,21 @@ export function apply(ctx) {
         on: (event, handler) => child.on(event, handler),
         controller,
         projections,
+        // 自动回复/agent 出站：直接投给 daemon 并由它落库 + 发送。
+        // 之前只是 push 进 outbox.js 的数组，而那个数组在「浏览器不再负责排水」
+        // 之后已经没人消费 → runner 报 sent，界面却什么都没有。
         pushOutbox: (item) => {
-          import('./outbox.js').then(({ pushItem }) => pushItem(item)).catch(() => {});
+          if (!item || typeof item.to !== 'string' || typeof item.text !== 'string') return;
+          ensureNet().then((instance) => {
+            if (!instance) return;
+            return instance.deliver(item.to, item.text, item.meta || {});
+          }).then((result) => {
+            if (result && result.ok === false && result.error === 'offline') {
+              ctx.logger.warn(`[peer-message] reply to ${item.to} skipped: peer offline`);
+            }
+          }).catch((error) => {
+            ctx.logger.warn(`[peer-message] reply delivery failed: ${String(error && error.message || error)}`);
+          });
         },
         logger: ctx.logger,
         defaultCwd: process.cwd(),
@@ -291,6 +304,7 @@ export function apply(ctx) {
         snapshot: () => daemonRequest('GET', '/state'),
         action: (payload) => daemonRequest('POST', '/action', payload),
         drainInbound: () => daemonRequest('POST', '/inbound'),
+        deliver: (to, text, meta) => daemonRequest('POST', '/deliver', { to, text, meta }),
         migrate: (payload) => daemonRequest('POST', '/migrate', payload),
       };
       ctx.logger.info?.(`[peer-message] p2p daemon ready (socket ${sockPath()})`);
@@ -362,6 +376,32 @@ export function apply(ctx) {
   }), 'peer-message: /api/pm-net/migrate');
 
   // ── outbox route (existing behavior) ─────────────────────────────────────
+  // 常驻排水：pm_send 工具只往 outbox.js 里 push，没人 GET 就不会发出去。
+  // 这里每秒主动投给 daemon（关掉所有标签页也照常投递）。
+  const outboxTimer = setInterval(async () => {
+    try {
+      const { outbox } = await import('./outbox.js');
+      if (!outbox.length) return;
+      const instance = await ensureNet();
+      if (!instance) return; // daemon 不可用：留在队列，不丢
+      const items = outbox.splice(0, outbox.length);
+      const failed = [];
+      for (const item of items) {
+        if (!item || typeof item.to !== 'string' || typeof item.text !== 'string') continue;
+        try {
+          const result = await instance.deliver(item.to, item.text, item.meta || {});
+          if (result && result.ok === false) failed.push(item);
+        } catch (e) { failed.push(item); }
+      }
+      if (failed.length) {
+        const { pushItem } = await import('./outbox.js');
+        for (const item of failed) pushItem(item);
+      }
+    } catch (e) { /* 下次再试 */ }
+  }, 1000);
+  outboxTimer.unref?.();
+  ctx.effect(() => () => clearInterval(outboxTimer), 'peer-message: outbox drain');
+
   ctx.effect(() => ctx.connection.fetch.register({
     path: '/api/pm-outbox',
     methods: ['GET', 'POST'],
@@ -378,9 +418,23 @@ export function apply(ctx) {
         } catch (e) { /* ignore malformed */ }
         return json({ ok: true });
       }
+      // GET 也要把队列真正投递出去：pm_send 写入的 agent 消息同样不能只躺在
+      // 数组里。先投给 daemon，投递失败的项才回传给调用方。
       const { outbox } = await import('./outbox.js');
       const items = outbox.splice(0, outbox.length);
-      return json({ items });
+      const instance = await ensureNet();
+      if (!instance) return json({ items }); // daemon 不可用：交回调用方，不丢
+      const failed = [];
+      for (const item of items) {
+        if (!item || typeof item.to !== 'string' || typeof item.text !== 'string') continue;
+        try {
+          const result = await instance.deliver(item.to, item.text, item.meta || {});
+          if (result && result.ok === false) failed.push(item);
+        } catch (e) {
+          failed.push(item);
+        }
+      }
+      return json({ items: failed });
     },
   }), 'peer-message: /api/pm-outbox');
 
