@@ -53,7 +53,7 @@ a session's agent send P2P messages through the `pm_send` tool, alongside
 Right-click a friend row to open its action menu:
 
 - **打开聊天** — select the friend and jump to the conversation.
-- **复制 ID** — copy the friend's peer ID to the clipboard.
+- **复制 Peer ID** — copy the friend's Peer ID to the clipboard.
 - **标记已读** — clear that friend's unread badge (disabled when already read).
 - **删除好友…** — opens a confirmation dialog; the friend and its message
   history are only removed after you confirm.

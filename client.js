@@ -58,7 +58,7 @@ window.__ModuleLoader__.load({
     const MAX_DELIVERY_TRIES = 10;     // agent 队列投递重试上限（防无限回环）
 
     // ── 后台运行开关（随主 state 持久化，面板关闭也生效） ────────────────
-    // nickname 为空 = 使用 ID 前缀作为 hello 握手显示名（见 getNickname）。
+    // nickname 为空 = 使用 Peer ID 前缀作为 hello 握手显示名（见 getNickname）。
     const DEFAULT_SETTINGS = { allowBroadcast: false, allowIncoming: true, nickname: '' };
 
     // ── 自动回复配置（随 settings 持久化；Host 侧 reply-core.js 会再校验一次） ──
@@ -284,13 +284,13 @@ window.__ModuleLoader__.load({
           peerId: identity.peerId,
           createdAt: identity.createdAt,
         }));
-        // 兼容旧代码/排障：把派生 ID 也写进旧 key（不再参与身份生成）。
+        // 兼容旧代码/排障：把派生 Peer ID 也写进旧 key（不再参与身份生成）。
         localStorage.setItem(LEGACY_PEER_ID_KEY, identity.peerId);
       } catch (e) { /* ignore */ }
     }
 
     async function loadIdentity() {
-      // 非安全上下文（无 crypto.subtle）无法生成/验签密钥：退回旧随机 ID，
+      // 非安全上下文（无 crypto.subtle）无法生成/验签密钥：退回旧的随机 Peer ID，
       // 标记 secured=false，hello 不携带公钥，对端会显示「未验签」。
       if (!cryptoIdentityAvailable()) {
         return { v: 0, secured: false, privateJwk: null, privateKey: null, pubJwk: null, fingerprint: '', peerId: legacyStablePeerId(), createdAt: 0 };
@@ -482,13 +482,13 @@ window.__ModuleLoader__.load({
       '.pm-peer-error-box{margin-top:8px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-state-error-primary,#ef4444);background:var(--dsw-alias-interactive-bg-hover-danger,rgba(239,68,68,.08));}',
       '.pm-peer-error-box .pm-peer-error{margin-top:0;font-size:10px;}',
       '.pm-peer-error-actions{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;}',
-      // 显示名称行：昵称 + 重置 ID 入口
+      // 显示名称行：昵称 + 身份密钥入口
       '.pm-nick-row{display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--dsw-alias-label-secondary,inherit);min-width:0;}',
       '.pm-nick-label{white-space:nowrap;flex:none;}',
       '.pm-nick-value{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary,inherit);}',
       '.pm-link-btn{border:none;background:transparent;color:var(--dsw-alias-brand-primary,inherit);font-size:10px;cursor:pointer;padding:3px 5px;border-radius:4px;font-family:inherit;white-space:nowrap;flex:none;transition:background .15s;}',
       '.pm-link-btn:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));}',
-      // 小尺寸输入弹窗（昵称/备注/重置 ID）
+      // 小尺寸输入弹窗（昵称/备注/身份密钥）
       '.pm-modal-narrow{width:380px;max-width:92vw;align-items:stretch;}',
       '.pm-modal-narrow .pm-modal-title{text-align:left;}',
       '.pm-modal-narrow .pm-hint,.pm-modal-narrow .pm-warn{text-align:left;}',
@@ -569,7 +569,7 @@ window.__ModuleLoader__.load({
       return id.length > 8 ? id.slice(0, 8) : id;
     }
 
-    // 好友显示名优先级：本地备注(alias) > 对方 hello 昵称(name) > ID 前缀。
+    // 好友显示名优先级：本地备注(alias) > 对方 hello 昵称(name) > Peer ID 前缀。
     // hello 只更新 name，绝不覆盖本地 alias。
     function displayName(friend) {
       if (!friend) return '';
@@ -757,7 +757,7 @@ window.__ModuleLoader__.load({
             this.myId = this.identity.peerId;
             this.emit();
             if (!this.identity.secured) {
-              this.showToast('当前页面不是安全上下文，无法生成密钥身份：已退回随机 ID（对端显示未验签）');
+              this.showToast('当前页面不是安全上下文，无法生成密钥身份：已退回旧的随机 Peer ID（对端显示未验签）');
             }
             return loadPeerJS();
           })
@@ -867,7 +867,7 @@ window.__ModuleLoader__.load({
           if (type === 'unavailable-id') {
             this.peerStatus = 'error';
             this.peerErrorType = 'unavailable-id';
-            this.peerError = '身份 ID 被占用：Peer ID 由你的本机公钥派生，同一密钥只能有一个在线连接；通常是同一浏览器的其他 DSH 标签页或上一次会话仍占着。关闭其他标签页后点「重试连接」；如确需换新身份，可在「身份密钥」里生成新密钥（等同新账号，好友需重新添加）。';
+            this.peerError = 'Peer ID 被占用：这个 Peer ID 由你本机的身份密钥（公钥）派生，同一个身份密钥同时只能有一个在线连接。常见原因：①同一浏览器开了多个 DSH 标签页，另一个标签页已经用了同一个 Peer ID；②上一次会话的 PeerJS 连接还没释放。处理：先关闭其他 DSH 标签页（或等旧连接释放），再点「重试连接」。如果确实要换一个 Peer ID：打开「身份密钥」→「生成新身份密钥」；这会生成新的密钥对，Peer ID 随之改变，好友需要重新添加你，对方若关闭「广播」还可能把新连接当陌生人拒收。';
             this.emit();
           } else if (type === 'network' || type === 'server-error') {
             this.peerStatus = 'error';
@@ -983,7 +983,7 @@ window.__ModuleLoader__.load({
       },
 
       // ── 显示名称（hello 握手）与好友备注 ─────────────────────────────
-      // 本端显示名：settings.nickname；留空则退化到 ID 前缀（不再是写死的“我”）。
+      // 本端显示名：settings.nickname；留空则退化到 Peer ID 前缀（不再是写死的“我”）。
       getNickname() {
         return sanitizeName(this.settings.nickname) || shortId(this.myId) || '我';
       },
@@ -1011,7 +1011,7 @@ window.__ModuleLoader__.load({
           settings: Object.assign({}, prev.settings || coerceSettings(null), { nickname: clean }),
         }));
         this.broadcastHello();
-        this.showToast(clean ? '显示名称已更新为「' + clean + '」' : '已恢复默认显示名（ID 前缀）');
+        this.showToast(clean ? '显示名称已更新为「' + clean + '」' : '已恢复默认显示名（Peer ID 前缀）');
         return true;
       },
 
@@ -1066,7 +1066,7 @@ window.__ModuleLoader__.load({
       },
 
       // ── Peer ID 占用恢复 ─────────────────────────────────────────────
-      // 用同一个固定 ID 重连（关闭其他标签页后使用）。
+      // 用同一身份密钥重连：Peer ID 不变（关闭其他标签页后使用）。
       retryPeer() {
         if (this.peer) { try { this.peer.destroy(); } catch (e) { /* ignore */ } }
         this.peer = null;
@@ -1081,11 +1081,11 @@ window.__ModuleLoader__.load({
         this.reconnectAttempts = 0;
         this.emit();
         this.initPeer();
-        this.showToast('正在用同一密钥身份重新连接…');
+        this.showToast('正在用同一身份密钥重连（Peer ID 不变）…');
       },
 
       // 生成新的身份密钥对（等同新账号）：Peer ID 随公钥指纹变化，
-      // 旧好友仍留在列表但需要重新添加新 ID。私钥只存本机，旧钥删除不可恢复。
+      // 旧好友仍留在列表但需要重新添加你的新 Peer ID。私钥只存本机，旧钥删除不可恢复。
       async regenerateIdentity() {
         if (!cryptoIdentityAvailable()) { this.showToast('当前页面不是安全上下文，无法生成密钥身份'); return false; }
         try {
@@ -1095,7 +1095,7 @@ window.__ModuleLoader__.load({
           this.myId = next.peerId;
           this.identityError = '';
           this.retryPeer();
-          this.showToast('已生成新身份密钥：' + next.peerId + '（好友需重新添加）');
+          this.showToast('已生成新身份密钥，新 Peer ID：' + next.peerId + '（好友需重新添加）');
           return true;
         } catch (err) {
           this.showToast('生成新身份失败：' + String(err && err.message || err));
@@ -1421,7 +1421,7 @@ window.__ModuleLoader__.load({
         const id = (targetId || '').trim();
         if (!id) return;
         if (!isValidPeerId(id)) {
-          this.showToast('ID 格式不合法（需以 ' + PEER_ID_PREFIX + ' 开头）');
+          this.showToast('Peer ID 格式不合法（需以 ' + PEER_ID_PREFIX + ' 开头）');
           return;
         }
         if (id === this.myId) {
@@ -1808,7 +1808,7 @@ window.__ModuleLoader__.load({
 
       const copyMyId = () => {
         if (!myId) return;
-        copyText(myId).then(() => pmService.showToast('ID 已复制')).catch(() => pmService.showToast('复制失败'));
+        copyText(myId).then(() => pmService.showToast('Peer ID 已复制')).catch(() => pmService.showToast('复制失败'));
       };
 
       const trySend = () => {
@@ -1821,16 +1821,16 @@ window.__ModuleLoader__.load({
           h('div', { className: 'pm-sidebar-header' },
             h('div', { className: 'pm-my-id' },
               h('span', { className: 'pm-status-dot', style: { background: peerStatus === 'online' ? 'var(--dsw-alias-state-success-primary,#22c55e)' : 'var(--dsw-alias-state-idle-primary,rgba(127,127,127,.5))' } }),
-              h('span', { className: 'pm-my-id-label' }, '我的 ID'),
+              h('span', { className: 'pm-my-id-label' }, 'Peer ID'),
               h('span', { className: 'pm-my-id-value', title: myId || '连接中…' }, myId || (peerStatus === 'connecting' ? '连接中…' : '未连接')),
-              h('button', { className: 'pm-icon-btn', title: '复制 ID', onClick: copyMyId }, '⧉'),
+              h('button', { className: 'pm-icon-btn', title: '复制 Peer ID', onClick: copyMyId }, '⧉'),
               h('button', { className: 'pm-icon-btn', title: '显示二维码', onClick: () => setShowQR(true), disabled: !myId }, '▦'),
               h('button', { className: 'pm-icon-btn', title: '自动回复设置', onClick: openReplySettings }, '⚙'),
             ),
             // 显示名称（hello 握手）+ 身份密钥入口
             h('div', { className: 'pm-nick-row' },
               h('span', { className: 'pm-nick-label' }, '显示名称'),
-              h('span', { className: 'pm-nick-value', title: settings.nickname || '默认：ID 前缀' }, settings.nickname || '（默认：ID 前缀）'),
+              h('span', { className: 'pm-nick-value', title: settings.nickname || '默认：Peer ID 前缀' }, settings.nickname || '（默认：Peer ID 前缀）'),
               h('button', {
                 className: 'pm-icon-btn', title: '修改显示名称',
                 onClick: () => { setNicknameDraft(settings.nickname || ''); setShowNickname(true); },
@@ -1905,7 +1905,7 @@ window.__ModuleLoader__.load({
                 )),
           ),
           h('div', { className: 'pm-add-friend' },
-            h('input', { className: 'pm-add-input', placeholder: '输入好友 ID 添加', value: addId, onChange: e => setAddId(e.target.value), onKeyDown: e => { if (e.key === 'Enter') pmService.addFriend(addId); } }),
+            h('input', { className: 'pm-add-input', placeholder: '输入好友 Peer ID 添加', value: addId, onChange: e => setAddId(e.target.value), onKeyDown: e => { if (e.key === 'Enter') pmService.addFriend(addId); } }),
             h('button', { className: 'pm-add-btn', onClick: () => pmService.addFriend(addId), disabled: !addId.trim() || peerStatus !== 'online' }, '添加'),
           ),
         ),
@@ -1946,7 +1946,7 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'pm-empty-icon' }, '💬'),
                 h('div', { className: 'pm-empty-text' }, '选择一个好友开始聊天'),
                 h('div', { className: 'pm-empty-hint' },
-                  '我的 ID 是 ' + (myId || '连接中…') + '。把 ID 告诉朋友，或让朋友输入你的 ID 添加你。',
+                  '我的 Peer ID 是 ' + (myId || '连接中…') + '。把 Peer ID 告诉朋友，或让朋友输入你的 Peer ID 添加你。',
                   peerStatus === 'online' ? '（右键好友可打开操作菜单，删除需二次确认）' : '',
                 ),
               ),
@@ -1960,7 +1960,7 @@ window.__ModuleLoader__.load({
             h(QRCodeView, { value: myId }),
             h('div', { className: 'pm-modal-id' }, myId),
             h('div', { className: 'pm-modal-btns' },
-              h('button', { className: 'pm-btn', onClick: copyMyId }, '复制 ID'),
+              h('button', { className: 'pm-btn', onClick: copyMyId }, '复制 Peer ID'),
               h('button', { className: 'pm-btn primary', onClick: () => setShowQR(false) }, '关闭'),
             ),
           ),
@@ -1989,9 +1989,9 @@ window.__ModuleLoader__.load({
               className: 'pm-ctx-item', role: 'menuitem', type: 'button',
               onClick: () => {
                 setCtxMenu(null);
-                copyText(ctxFriend.id).then(() => pmService.showToast('ID 已复制')).catch(() => pmService.showToast('复制失败'));
+                copyText(ctxFriend.id).then(() => pmService.showToast('Peer ID 已复制')).catch(() => pmService.showToast('复制失败'));
               },
-            }, h('span', { 'aria-hidden': 'true' }, '⧉'), '复制 ID'),
+            }, h('span', { 'aria-hidden': 'true' }, '⧉'), '复制 Peer ID'),
             h('button', {
               className: 'pm-ctx-item', role: 'menuitem', type: 'button',
               disabled: !ctxFriend.unread,
@@ -2031,7 +2031,7 @@ window.__ModuleLoader__.load({
               h('label', { className: 'pm-field-label' }, '好友看到的名称'),
               h('input', {
                 className: 'pm-text-input', maxLength: MAX_NAME_LEN, value: nicknameDraft,
-                placeholder: '留空 = 使用 ID 前缀',
+                placeholder: '留空 = 使用 Peer ID 前缀',
                 onChange: e => setNicknameDraft(e.target.value),
                 onKeyDown: e => { if (e.key === 'Enter') { if (pmService.setNickname(nicknameDraft)) setShowNickname(false); } },
               }),
@@ -2082,17 +2082,18 @@ window.__ModuleLoader__.load({
               h('dt', null, 'Peer ID'),
               h('dd', null, myId || '生成中…'),
               h('dt', null, '算法'),
-              h('dd', null, secured ? IDENTITY_ALGORITHM : '不可用（非安全上下文，已退回随机 ID）'),
+              h('dd', null, secured ? IDENTITY_ALGORITHM : '不可用（非安全上下文，已退回随机 Peer ID）'),
               h('dt', null, '状态'),
               h('dd', null, secured ? '已启用密钥身份；连接时通过 hello 公钥+签名验证' : '未启用：当前页面无法使用 WebCrypto'),
             ),
             identityFingerprint ? h('div', null,
+              h('div', { className: 'pm-hint', style: { marginBottom: 6 } }, '概念说明：身份密钥 = 本机生成的一对 ECDSA 私钥/公钥；Peer ID = 由公钥指纹算出的网络标识。私钥不变，Peer ID 就不变。'),
               h('div', { className: 'pm-field-label' }, '公钥指纹（用于核对身份）'),
               h('div', { className: 'pm-identity-fp' }, identityFingerprint.replace(/(.{8})/g, '$1 ').trim()),
               h('div', { className: 'pm-hint' }, 'Peer ID 由该指纹派生；对方连接时会验证公钥与 Peer ID 绑定、hello 签名有效后标记「已验签」。'),
             ) : null,
             identityError ? h('div', { className: 'pm-warn' }, '身份错误：' + identityError) : null,
-            h('div', { className: 'pm-warn' }, '私钥只保存在本机 localStorage，请勿把浏览器配置/私钥备份发给他人。更换身份 = 生成新密钥对：Peer ID 会变化，旧好友仍在列表但需要重新添加你的新 ID；对方若关闭「广播」，新连接可能被当陌生人拒收。'),
+            h('div', { className: 'pm-warn' }, '私钥只保存在本机 localStorage，请勿把浏览器配置/私钥备份发给他人。更换身份 = 生成新密钥对：Peer ID 会变化，旧好友仍在列表但需要重新添加你；对方若关闭「广播」，新连接可能被当陌生人拒收。'),
             h('div', { className: 'pm-modal-btns' },
               h('button', { className: 'pm-btn', type: 'button', onClick: () => setShowIdentity(false) }, '关闭'),
               identityFingerprint ? h('button', {

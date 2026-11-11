@@ -112,7 +112,8 @@ test('identity: 校验失败会断开连接，ID/公钥不匹配或签名无效�
 
 test('identity: unavailable-id 提示说明「ID 由公钥派生」，提供重试/身份密钥入口', () => {
   const branch = slice("if (type === 'unavailable-id') {", "} else if (type === 'network'");
-  assert.ok(branch.includes('公钥派生'));
+  assert.ok(branch.includes('Peer ID 被占用'));
+  assert.ok(branch.includes('身份密钥（公钥）派生'));
   assert.ok(branch.includes('其他 DSH 标签页'));
   assert.ok(branch.includes('重试连接') && branch.includes('身份密钥'));
   assert.ok(!branch.includes('请刷新页面重试'));
@@ -123,7 +124,7 @@ test('identity: 重试连接沿用同一密钥身份，不再随机生成 ID', (
   const retry = slice('retryPeer() {', 'async regenerateIdentity() {');
   assert.ok(retry.includes('this.identity.peerId'));
   assert.ok(retry.includes('this.initPeer()'));
-  assert.ok(retry.includes('同一密钥身份重新连接'));
+  assert.ok(retry.includes('同一身份密钥重连'));
 });
 
 test('identity: 新身份=重新生成密钥对并持久化，UI 有身份密钥入口', () => {
@@ -142,7 +143,7 @@ test('identity: 生成新身份有二次确认与私钥/身份变化风险说明
   assert.ok(SRC.includes('window.confirm('));
   assert.ok(SRC.includes('Peer ID 会变化，好友需要重新添加你'));
   assert.ok(SRC.includes('私钥只保存在本机 localStorage'));
-  assert.ok(SRC.includes('旧好友仍在列表但需要重新添加你的新 ID'));
+  assert.ok(SRC.includes('旧好友仍在列表但需要重新添加你'));
 });
 
 test('identity: 好友已验签显示 🔐，聊天状态区分已验签/未验签', () => {
@@ -155,4 +156,14 @@ test('identity: 昵称/备注/身份密钥弹窗支持 Escape 关闭', () => {
   for (const state of ['showNickname', 'editFriend', 'showIdentity']) {
     assert.ok(effect.includes(state), 'Escape 处理缺少 ' + state);
   }
+});
+
+
+test('identity: 术语统一——只有 Peer ID 一个词，不再混用「身份 ID/我的 ID/重置 ID」', () => {
+  for (const banned of ['身份 ID', '我的 ID', '复制 ID', '好友 ID', '重置 ID', '固定 ID']) {
+    assert.ok(!SRC.includes(banned), '仍存在混用术语: ' + banned);
+  }
+  // 关系说明必须出现在身份密钥弹窗，明确「Peer ID = 公钥指纹派生」
+  assert.ok(SRC.includes('Peer ID = 由公钥指纹算出的网络标识'));
+  assert.ok(SRC.includes('私钥不变，Peer ID 就不变'));
 });
