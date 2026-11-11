@@ -177,9 +177,11 @@ test('identity: 身份在侧栏/聊天头/二维码里持续表达（不只是�
   // 侧栏图标上的 🔐 角标已按要求移除（信息由身份行表达，角标无意义）
   assert.ok(!CLIENT.includes("title: '密钥身份已启用 · 指纹 ' + identity.fingerprint"), '侧栏图标仍挂着锁角标');
   assert.ok(!CLIENT.includes('pmIdentityStore'), '已无订阅者的身份 store 应删除');
-  // 身份行前缀和好友已验签标记保留
-  assert.ok(CLIENT.includes("className: 'pm-identity-lock'"), '身份行锁图标被误删');
+  // 所有 emoji 锁角标都已移除：身份行用文字表达，好友用「已验签」文字小标
+  assert.ok(!CLIENT.includes('pm-identity-lock'), '身份行仍有锁图标');
+  assert.ok(!CLIENT.includes('🔐'), '仍存在 🔐 锁图标');
   assert.ok(CLIENT.includes("className: 'pm-verified-badge'"), '好友已验签标记被误删');
+  assert.ok(CLIENT.includes("}, '已验签')"), '好友验签标记应为文字而非图标');
 });
 
 test('identity: 连接状态由 Host 持有并广播给所有标签页', () => {

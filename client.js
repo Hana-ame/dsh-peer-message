@@ -254,10 +254,9 @@ window.__ModuleLoader__.load({
       '.pm-friend-name{font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.pm-friend-last{font-size:11px;color:var(--dsw-alias-label-secondary,inherit);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.pm-friend-note{font-size:10px;opacity:.75;flex:none;}',
-      '.pm-verified-badge{font-size:10px;flex:none;opacity:.9;}',
+      '.pm-verified-badge{font-size:9px;flex:none;padding:0 4px;border-radius:4px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.3));color:var(--dsw-alias-label-secondary,inherit);line-height:1.6;white-space:nowrap;}',
       '.pm-identity-row{display:flex;align-items:center;gap:6px;margin-top:8px;padding:4px 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.18));background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.06));font-size:10px;color:var(--dsw-alias-label-secondary,inherit);cursor:pointer;min-width:0;}',
       '.pm-identity-row:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.12));}',
-      '.pm-identity-lock{flex:none;font-size:10px;}',
       '.pm-role-row{margin-top:4px;font-size:10px;color:var(--dsw-alias-label-secondary,inherit);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       // 「更多设置」折叠开关：整行可点，右侧 carets 指示展开状态。
       '.pm-more-toggle{display:flex;align-items:center;justify-content:space-between;gap:6px;width:100%;margin-top:8px;padding:4px 8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.18));background:transparent;color:var(--dsw-alias-label-secondary,inherit);font-size:10px;font-family:inherit;cursor:pointer;text-align:left;transition:background .15s;}',
@@ -1279,7 +1278,6 @@ window.__ModuleLoader__.load({
               title: secured ? '公钥指纹：' + identityFingerprint : (identityError || '后台进程未启用密钥身份（密钥文件缺失或损坏）'),
               onClick: () => setShowIdentity(true),
             },
-              h('span', { className: 'pm-identity-lock' }, secured ? '🔐' : '⚠️'),
               h('span', { className: 'pm-identity-row-text' }, secured
                 ? '身份已启用 · 指纹 ' + shortFingerprint(identityFingerprint)
                 : '身份未启用（后台密钥缺失）'),
@@ -1376,7 +1374,8 @@ window.__ModuleLoader__.load({
                     h('div', { className: 'pm-friend-last' },
                       f.lastMsg ? ((f.lastOrigin === 'model' ? 'AI｜' : '') + f.lastMsg) : (f.online ? '在线' : '离线')),
                   ),
-                  f.verified ? h('span', { className: 'pm-verified-badge', title: '身份已验签 · 公钥指纹 ' + (f.fingerprint ? f.fingerprint.slice(0, 16) + '…' : '') }, '🔐') : null,
+                  // 已验签只用一行小字表达；不放图标角标（图标会被误读成状态灯）。
+                  f.verified ? h('span', { className: 'pm-verified-badge', title: '身份已验签 · 公钥指纹 ' + (f.fingerprint ? f.fingerprint.slice(0, 16) + '…' : '') }, '已验签') : null,
                   f.note ? h('span', { className: 'pm-friend-note', title: '好友备注（注入自动回复上下文）：' + f.note }, '📝') : null,
                   f.unread > 0 ? h('span', { className: 'pm-unread' }, f.unread > 99 ? '99+' : f.unread) : null,
                   h('span', { className: 'pm-status-dot', style: { marginLeft: 'auto', background: f.online ? 'var(--dsw-alias-state-success-primary,#22c55e)' : 'var(--dsw-alias-state-idle-primary,rgba(127,127,127,.5))' } }),
