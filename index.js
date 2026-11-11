@@ -57,7 +57,7 @@ export function apply(ctx) {
   ctx.inject(['sessionController', 'sessions'], (child) => {
     const controller = child.get('sessionController');
     const projections = child.get('sessionProjections');
-    void import('./reply-runner.js?rev=20261111-origin2').then(({ createReplyRunner }) => {
+    void import('./reply-runner.js?rev=20261111-note1').then(({ createReplyRunner }) => {
       if (child.fiber && child.fiber.state === 5 /* disposed */) return;
       runner = createReplyRunner({
         on: (event, handler) => child.on(event, handler),
@@ -126,6 +126,7 @@ export function apply(ctx) {
       const result = runner.request({
         peerId,
         peerName: typeof body?.peerName === 'string' ? body.peerName : '',
+        peerNote: typeof body?.peerNote === 'string' ? body.peerNote : '',
         text,
         config: body?.config,
       });

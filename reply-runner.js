@@ -33,6 +33,7 @@ import {
   isModelText,
   permissionPolicyFor,
   sanitizeInboundText,
+  sanitizePeerNote,
   sanitizeReplyText,
   wrapAutoReply,
   wrapManualReply,
@@ -252,6 +253,8 @@ export function createReplyRunner(deps) {
       const promptText = buildReplyPrompt({
         peerId: record.peerId,
         peerName: record.peerName,
+        // 本机用户维护的好友备注：作为可信上下文注入，不参与不可信正文围栏。
+        peerNote: record.peerNote,
         text: record.text,
       });
       const replyText = await promptAndCollect(session.sessionId, promptText, 'pm-reply-' + uuid());
@@ -316,6 +319,7 @@ export function createReplyRunner(deps) {
         id: 'req-' + uuid(),
         peerId,
         peerName: typeof input.peerName === 'string' ? input.peerName.slice(0, 80) : '',
+        peerNote: sanitizePeerNote(input && input.peerNote),
         text,
         config,
         // auto 模式由模型直接决定；manual 由人批准后才运行。
@@ -367,6 +371,7 @@ export function createReplyRunner(deps) {
           ts: record.ts,
           permission: record.config.permission,
           sessionMode: record.config.sessionMode,
+          peerNote: record.peerNote,
         })),
         running: [...running.values()].map((entry) => ({
           id: entry.id,

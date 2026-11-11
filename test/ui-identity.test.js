@@ -74,7 +74,7 @@ test('identity: 好友列表/搜索/聊天标题/右键菜单都用 displayName'
   assert.ok(SRC.includes('displayName(f)'));
   assert.ok(SRC.includes("h('div', { className: 'pm-chat-header-name'"), '聊天标题缺失');
   assert.ok(SRC.includes('displayName(active)'));
-  assert.ok(SRC.includes("'✎'), '设置备注名…'"), '右键菜单缺少备注入口');
+  assert.ok(SRC.includes("'✎'), '编辑备注…'"), '右键菜单缺少备注入口');
 });
 
 // ── Peer ID 占用 / 重置 ─────────────────────────────────────────────────────
@@ -107,7 +107,7 @@ test('identity: 重置 ID 有二次确认与风险说明', () => {
 
 test('identity: 昵称/备注/重置 ID 弹窗支持 Escape 关闭', () => {
   const effect = slice('// 自动回复设置 / 待批准 / 昵称 / 备注 / 重置 ID 弹窗：Escape 关闭。', '// 自动滚动到底部');
-  for (const state of ['showNickname', 'renameFriend', 'showResetId']) {
+  for (const state of ['showNickname', 'editFriend', 'showResetId']) {
     assert.ok(effect.includes(state), 'Escape 处理缺少 ' + state);
   }
 });

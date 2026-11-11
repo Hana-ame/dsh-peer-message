@@ -54,6 +54,7 @@ window.__ModuleLoader__.load({
     const MAX_MSGS_PER_FRIEND = 500;   // 每好友消息历史上限
     const MAX_FRIENDS = 100;           // 好友数上限
     const MAX_NAME_LEN = 32;           // hello 握手昵称长度上限
+    const MAX_NOTE_LEN = 500;          // 好友备注长度上限（会注入自动回复上下文）
     const MAX_DELIVERY_TRIES = 10;     // agent 队列投递重试上限（防无限回环）
 
     // ── 后台运行开关（随主 state 持久化，面板关闭也生效） ────────────────
@@ -246,6 +247,7 @@ window.__ModuleLoader__.load({
       '.pm-friend-info{flex:1;min-width:0;}',
       '.pm-friend-name{font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.pm-friend-last{font-size:11px;color:var(--dsw-alias-label-secondary,inherit);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.pm-friend-note{font-size:10px;opacity:.75;flex:none;}',
       '.pm-unread{min-width:18px;height:18px;border-radius:9px;background:var(--dsw-alias-state-error-primary,#ef4444);color:var(--dsw-alias-label-primary-foreground,#fff);font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;padding:0 5px;flex:none;}',
 
       // 好友右键菜单：右键只打开菜单，删除必须走菜单 + 二次确认，防误删。
@@ -358,6 +360,8 @@ window.__ModuleLoader__.load({
       '.pm-pending-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:10px;color:var(--dsw-alias-label-secondary,inherit);flex-wrap:wrap;}',
       '.pm-pending-origin{display:inline-flex;align-items:center;gap:4px;font-size:9px;padding:0 5px;border-radius:4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b);}',
       '.pm-pending-subhead{font-size:10px;color:var(--dsw-alias-label-secondary,inherit);margin-top:2px;}',
+      '.pm-pending-note{font-size:10px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit);margin-top:2px;white-space:pre-wrap;word-break:break-word;max-height:60px;overflow-y:auto;}',
+      '.pm-note-input{min-height:88px;resize:vertical;line-height:1.5;font-family:inherit;}',
       '.pm-pending-text{font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:110px;overflow-y:auto;margin:6px 0;color:var(--dsw-alias-label-primary,inherit);}',
       '.pm-pending-btns{display:flex;gap:6px;justify-content:flex-end;}',
       '.pm-btn.small{padding:4px 10px;font-size:11px;flex:none;}',
@@ -747,7 +751,7 @@ window.__ModuleLoader__.load({
             const friends = prev.friends.slice();
             const idx = friends.findIndex(f => f.id === remoteId);
             if (idx >= 0) friends[idx] = Object.assign({}, friends[idx], { online: true });
-            else friends.push({ id: remoteId, name: shortId(remoteId), alias: '', online: true, unread: 0, lastMsg: '', lastTs: Date.now() });
+            else friends.push({ id: remoteId, name: shortId(remoteId), alias: '', note: '', online: true, unread: 0, lastMsg: '', lastTs: Date.now() });
             return Object.assign({}, prev, { friends });
           });
           // 回发 hello：让主动连接方也能看到本端昵称（原来只单向发）。
@@ -816,6 +820,40 @@ window.__ModuleLoader__.load({
           return Object.assign({}, prev, { friends });
         });
         this.showToast(alias ? '备注名已设为「' + alias + '」' : '已清除备注名');
+        return true;
+      },
+
+      // 好友备注（注入自动回复上下文，见 maybeRequestReply → Host buildReplyPrompt）。
+      setFriendNote(id, raw) {
+        const text = raw == null ? '' : String(raw).trim();
+        if (text && text.length > MAX_NOTE_LEN) { this.showToast('备注最多 ' + MAX_NOTE_LEN + ' 字'); return false; }
+        const note = text;
+        this.update(prev => {
+          const idx = prev.friends.findIndex(f => f.id === id);
+          if (idx < 0) return prev;
+          const friends = prev.friends.slice();
+          friends[idx] = Object.assign({}, friends[idx], { note });
+          return Object.assign({}, prev, { friends });
+        });
+        this.showToast(note ? '备注已保存（会注入自动回复上下文）' : '已清除备注');
+        return true;
+      },
+
+      // 备注弹窗一次保存显示名 + 上下文备注，只触发一次持久化/广播。
+      setFriendProfile(id, aliasRaw, noteRaw) {
+        const aliasText = aliasRaw == null ? '' : String(aliasRaw).trim();
+        const alias = aliasText ? sanitizeName(aliasText) : '';
+        if (aliasText && !alias) { this.showToast('显示备注名不合法（最多 ' + MAX_NAME_LEN + ' 字）'); return false; }
+        const noteText = noteRaw == null ? '' : String(noteRaw).trim();
+        if (noteText.length > MAX_NOTE_LEN) { this.showToast('备注最多 ' + MAX_NOTE_LEN + ' 字'); return false; }
+        this.update(prev => {
+          const idx = prev.friends.findIndex(f => f.id === id);
+          if (idx < 0) return prev;
+          const friends = prev.friends.slice();
+          friends[idx] = Object.assign({}, friends[idx], { alias, note: noteText });
+          return Object.assign({}, prev, { friends });
+        });
+        this.showToast('好友备注已保存');
         return true;
       },
 
@@ -933,7 +971,7 @@ window.__ModuleLoader__.load({
         if (this.state.friends.some(f => f.id === id)) return;
         this.update(prev => {
           if (prev.friends.some(f => f.id === id)) return prev;
-          const friends = prev.friends.concat([{ id, name: shortId(id), alias: '', online: false, unread: 0, lastMsg: '', lastTs: Date.now() }]);
+          const friends = prev.friends.concat([{ id, name: shortId(id), alias: '', note: '', online: false, unread: 0, lastMsg: '', lastTs: Date.now() }]);
           return Object.assign({}, prev, { friends });
         });
       },
@@ -1112,6 +1150,8 @@ window.__ModuleLoader__.load({
           body: JSON.stringify({
             peerId,
             peerName: friend ? displayName(friend) : '',
+            // 本机备注注入 Host 的回复 prompt（可信上下文，见 reply-core.buildReplyPrompt）。
+            peerNote: friend && typeof friend.note === 'string' ? friend.note : '',
             text: clean,
             config: reply,
           }),
@@ -1353,6 +1393,7 @@ window.__ModuleLoader__.load({
                   h('span', null, '来自 ' + (item.peerName || shortId(item.peerId)) + ' · ' + fmtTime(item.ts)),
                 ),
                 h('div', { className: 'pm-pending-subhead' }, '权限：' + (REPLY_PERMISSION_LABELS[item.permission] || item.permission)),
+                item.peerNote ? h('div', { className: 'pm-pending-note' }, '本机备注（会注入模型上下文）：' + item.peerNote) : null,
                 h('div', { className: 'pm-pending-text' }, item.text),
                 h('div', { className: 'pm-pending-btns' },
                   h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.rejectReply(item.id) }, '忽略'),
@@ -1401,7 +1442,7 @@ window.__ModuleLoader__.load({
       // 显示名称 / 好友备注 / 重置 Peer ID
       const [showNickname, setShowNickname] = React.useState(false);
       const [nicknameDraft, setNicknameDraft] = React.useState('');
-      const [renameFriend, setRenameFriend] = React.useState(null); // { id, alias }
+      const [editFriend, setEditFriend] = React.useState(null); // { id, alias, note }
       const [showResetId, setShowResetId] = React.useState(false);
       // 右键菜单：{ id, left, top }。右键只负责开菜单，绝不直接改好友数据。
       const [ctxMenu, setCtxMenu] = React.useState(null);
@@ -1450,18 +1491,18 @@ window.__ModuleLoader__.load({
 
       // 自动回复设置 / 待批准 / 昵称 / 备注 / 重置 ID 弹窗：Escape 关闭。
       React.useEffect(() => {
-        if (!showReplySettings && !showPending && !showNickname && !renameFriend && !showResetId) return;
+        if (!showReplySettings && !showPending && !showNickname && !editFriend && !showResetId) return;
         const onKey = (e) => {
           if (e.key !== 'Escape') return;
           setShowReplySettings(false);
           setShowPending(false);
           setShowNickname(false);
-          setRenameFriend(null);
+          setEditFriend(null);
           setShowResetId(false);
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-      }, [showReplySettings, showPending, showNickname, renameFriend, showResetId]);
+      }, [showReplySettings, showPending, showNickname, editFriend, showResetId]);
 
       // 自动滚动到底部
       React.useEffect(() => {
@@ -1494,9 +1535,9 @@ window.__ModuleLoader__.load({
 
       const ctxFriend = ctxMenu ? state.friends.find(f => f.id === ctxMenu.id) : null;
 
-      const openRenameFriend = (f) => {
+      const openFriendEdit = (f) => {
         setCtxMenu(null);
-        setRenameFriend({ id: f.id, alias: f.alias || '' });
+        setEditFriend({ id: f.id, alias: f.alias || '', note: f.note || '' });
       };
 
       const requestDeleteFriend = (f) => {
@@ -1600,10 +1641,11 @@ window.__ModuleLoader__.load({
                 },
                   h('div', { className: 'pm-avatar', style: { background: avatarColor(f.id) } }, (displayName(f) || '?').slice(0, 1).toUpperCase()),
                   h('div', { className: 'pm-friend-info' },
-                    h('div', { className: 'pm-friend-name', title: f.alias ? displayName(f) + ' · ' + f.id : (f.name && f.name !== shortId(f.id) ? f.name + ' · ' + f.id : f.id) }, displayName(f)),
+                    h('div', { className: 'pm-friend-name', title: (f.alias ? displayName(f) + ' · ' + f.id : (f.name && f.name !== shortId(f.id) ? f.name + ' · ' + f.id : f.id)) + (f.note ? '\n备注：' + f.note : '') }, displayName(f)),
                     h('div', { className: 'pm-friend-last' },
                       f.lastMsg ? ((f.lastOrigin === 'model' ? 'AI｜' : '') + f.lastMsg) : (f.online ? '在线' : '离线')),
                   ),
+                  f.note ? h('span', { className: 'pm-friend-note', title: '好友备注（注入自动回复上下文）：' + f.note }, '📝') : null,
                   f.unread > 0 ? h('span', { className: 'pm-unread' }, f.unread > 99 ? '99+' : f.unread) : null,
                   h('span', { className: 'pm-status-dot', style: { marginLeft: 'auto', background: f.online ? 'var(--dsw-alias-state-success-primary,#22c55e)' : 'var(--dsw-alias-state-idle-primary,rgba(127,127,127,.5))' } }),
                 )),
@@ -1620,7 +1662,7 @@ window.__ModuleLoader__.load({
               h('div', { className: 'pm-chat-header' },
                 h('div', { className: 'pm-avatar', style: { background: avatarColor(active.id), width: 32, height: 32, fontSize: 13 } }, (displayName(active) || '?').slice(0, 1).toUpperCase()),
                 h('div', { className: 'pm-chat-header-info' },
-                  h('div', { className: 'pm-chat-header-name', title: active.alias ? active.alias + ' · ' + active.name + ' · ' + active.id : (active.name ? active.name + ' · ' + active.id : active.id) }, displayName(active)),
+                  h('div', { className: 'pm-chat-header-name', title: (active.alias ? active.alias + ' · ' + active.name + ' · ' + active.id : (active.name ? active.name + ' · ' + active.id : active.id)) + (active.note ? '\n备注：' + active.note : '') }, displayName(active)),
                   h('div', { className: 'pm-chat-header-status' }, active.online ? '在线' : '离线'),
                 ),
               ),
@@ -1702,8 +1744,8 @@ window.__ModuleLoader__.load({
             }, h('span', { 'aria-hidden': 'true' }, '✓'), '标记已读'),
             h('button', {
               className: 'pm-ctx-item', role: 'menuitem', type: 'button',
-              onClick: () => openRenameFriend(ctxFriend),
-            }, h('span', { 'aria-hidden': 'true' }, '✎'), '设置备注名…'),
+              onClick: () => openFriendEdit(ctxFriend),
+            }, h('span', { 'aria-hidden': 'true' }, '✎'), '编辑备注…'),
             h('div', { className: 'pm-ctx-sep' }),
             h('button', {
               className: 'pm-ctx-item danger', role: 'menuitem', type: 'button',
@@ -1746,27 +1788,34 @@ window.__ModuleLoader__.load({
             ),
           ),
         ) : null,
-        renameFriend ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setRenameFriend(null) },
+        editFriend ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setEditFriend(null) },
           h('div', { className: 'pm-modal pm-modal-narrow', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
-            h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setRenameFriend(null) }, '✕'),
-            h('div', { className: 'pm-modal-title' }, '设置备注名'),
-            h('div', { className: 'pm-field-static' }, renameFriend.id),
+            h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setEditFriend(null) }, '✕'),
+            h('div', { className: 'pm-modal-title' }, '好友备注'),
+            h('div', { className: 'pm-field-static' }, editFriend.id),
             h('div', { className: 'pm-field' },
-              h('label', { className: 'pm-field-label' }, '备注名（只保存在本机）'),
+              h('label', { className: 'pm-field-label' }, '显示备注名（本机显示用）'),
               h('input', {
-                className: 'pm-text-input', maxLength: MAX_NAME_LEN, value: renameFriend.alias,
+                className: 'pm-text-input', maxLength: MAX_NAME_LEN, value: editFriend.alias,
                 placeholder: '留空 = 使用对方昵称',
-                onChange: e => setRenameFriend(prev => Object.assign({}, prev, { alias: e.target.value })),
-                onKeyDown: e => {
-                  if (e.key !== 'Enter') return;
-                  if (pmService.setFriendAlias(renameFriend.id, renameFriend.alias)) setRenameFriend(null);
-                },
+                onChange: e => setEditFriend(prev => Object.assign({}, prev, { alias: e.target.value })),
               }),
-              h('div', { className: 'pm-hint' }, '备注名优先于对方 hello 发来的昵称；对方改名不会覆盖你的备注。'),
+              h('div', { className: 'pm-hint' }, '优先于对方 hello 发来的昵称；对方改名不会覆盖。'),
+            ),
+            h('div', { className: 'pm-field' },
+              h('label', { className: 'pm-field-label' }, '备注内容（注入自动回复上下文）'),
+              h('textarea', {
+                className: 'pm-text-input pm-note-input', maxLength: MAX_NOTE_LEN, value: editFriend.note,
+                placeholder: '例如：这是我同事小王，回复简洁一点，称呼他「王工」',
+                onChange: e => setEditFriend(prev => Object.assign({}, prev, { note: e.target.value })),
+              }),
+              h('div', { className: 'pm-hint' }, '只保存在本机，最多 ' + MAX_NOTE_LEN + ' 字。生成自动回复时会作为「可信的本机上下文」注入 prompt；对方消息正文仍按不可信内容处理。'),
             ),
             h('div', { className: 'pm-modal-btns' },
-              h('button', { className: 'pm-btn', type: 'button', onClick: () => setRenameFriend(null) }, '取消'),
-              h('button', { className: 'pm-btn primary', type: 'button', onClick: () => { if (pmService.setFriendAlias(renameFriend.id, renameFriend.alias)) setRenameFriend(null); } }, '保存'),
+              h('button', { className: 'pm-btn', type: 'button', onClick: () => setEditFriend(null) }, '取消'),
+              h('button', { className: 'pm-btn primary', type: 'button', onClick: () => {
+                if (pmService.setFriendProfile(editFriend.id, editFriend.alias, editFriend.note)) setEditFriend(null);
+              } }, '保存'),
             ),
           ),
         ) : null,
