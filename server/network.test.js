@@ -173,3 +173,16 @@ test('host network: daemon 模块存在并暴露健康/状态/动作端点', asy
   assert.ok(daemon.includes('delete require.cache[entry]'));
   assert.ok(daemon.includes("if (util && util.supports && !util.supports.data)"));
 });
+
+
+test('host network: 重连永不放弃（PeerJS 云端旧 ID 释放后必须能自愈，且不换身份）', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./network.js', import.meta.url), 'utf8');
+  // 不再有「尝试 N 次后永久放弃」的短路
+  assert.ok(!/retryAttempts\s*>\s*\d+\s*\)\s*return/.test(src), '仍存在放弃重试的短路');
+  assert.ok(src.includes('永不放弃'), '缺少永不放弃的说明与实现');
+  // 延迟封顶 30s
+  assert.ok(src.includes('Math.min(2000 * Math.pow(2, Math.min(net.retryAttempts - 1, 4)), 30000)'));
+  // 重试沿用同一身份
+  assert.ok(src.includes('net.peer = null;') && src.includes('initPeer()'));
+});
