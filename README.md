@@ -234,10 +234,13 @@ and offers:
 
 - **重试连接** — reconnect with the *same key-derived ID* (close the other tab or
   wait for the stale session to drop);
+- **重置 Peer ID** — direct button in the error box: one confirmation dialog,
+  then a new keypair is generated immediately, so the Peer ID changes and the
+  client reconnects. The dialog warns that friends stay in the list but must
+  re-add the new Peer ID, and broadcast-off peers may reject the new connection;
 - **身份密钥** — open the identity dialog (Peer ID, algorithm, public-key
-  fingerprint). It can **生成新身份密钥**: a new keypair, i.e. a new identity.
-  This asks for confirmation and warns that the Peer ID changes, friends stay in
-  the list but must re-add the new ID, and broadcast-off peers may reject it.
+  fingerprint), which also offers the same **重置 Peer ID（生成新身份密钥）**
+  action plus fingerprint copy.
 
 Private keys are **not** exported by the UI; anyone with a backup of the browser
 profile can impersonate this identity, so do not share it. A WebCrypto-less

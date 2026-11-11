@@ -900,7 +900,7 @@ window.__ModuleLoader__.load({
           if (type === 'unavailable-id') {
             this.peerStatus = 'error';
             this.peerErrorType = 'unavailable-id';
-            this.peerError = 'Peer ID 被占用：这个 Peer ID 由你本机的身份密钥（公钥）派生，同一个身份密钥同时只能有一个在线连接。常见原因：①同一浏览器开了多个 DSH 标签页，另一个标签页已经用了同一个 Peer ID；②上一次会话的 PeerJS 连接还没释放。处理：先关闭其他 DSH 标签页（或等旧连接释放），再点「重试连接」。如果确实要换一个 Peer ID：打开「身份密钥」→「生成新身份密钥」；这会生成新的密钥对，Peer ID 随之改变，好友需要重新添加你，对方若关闭「广播」还可能把新连接当陌生人拒收。';
+            this.peerError = 'Peer ID 被占用：这个 Peer ID 由你本机的身份密钥（公钥）派生，同一个身份密钥同时只能有一个在线连接。常见原因：①同一浏览器开了多个 DSH 标签页，另一个标签页已经用了同一个 Peer ID；②上一次会话的 PeerJS 连接还没释放。处理：先关闭其他 DSH 标签页（或等旧连接释放），再点「重试连接」。如果「重试连接」仍失败、或你确实要换一个 Peer ID：点「重置 Peer ID」；这会生成新的身份密钥对，Peer ID 随之改变，好友需要重新添加你，对方若关闭「广播」还可能把新连接当陌生人拒收。';
             this.emit();
           } else if (type === 'network' || type === 'server-error') {
             this.peerStatus = 'error';
@@ -1129,7 +1129,7 @@ window.__ModuleLoader__.load({
           this.identityError = '';
           pmIdentityStore.publish(true, next.fingerprint);
           this.retryPeer();
-          this.showToast('已生成新身份密钥，新 Peer ID：' + next.peerId + '（好友需重新添加）');
+          this.showToast('已生成新身份密钥，并重置 Peer ID：' + next.peerId + '（好友需重新添加）');
           return true;
         } catch (err) {
           this.showToast('生成新身份失败：' + String(err && err.message || err));
@@ -1731,6 +1731,7 @@ window.__ModuleLoader__.load({
       const [nicknameDraft, setNicknameDraft] = React.useState('');
       const [editFriend, setEditFriend] = React.useState(null); // { id, alias, note }
       const [showIdentity, setShowIdentity] = React.useState(false);
+      const [showResetPeerId, setShowResetPeerId] = React.useState(false);
       // 右键菜单：{ id, left, top }。右键只负责开菜单，绝不直接改好友数据。
       const [ctxMenu, setCtxMenu] = React.useState(null);
       // 删除确认：{ id, name }。确认框打开前不会有任何 removeFriend 调用。
@@ -1778,7 +1779,7 @@ window.__ModuleLoader__.load({
 
       // 自动回复设置 / 待批准 / 昵称 / 备注 / 身份密钥弹窗：Escape 关闭。
       React.useEffect(() => {
-        if (!showQR && !showReplySettings && !showPending && !showNickname && !editFriend && !showIdentity) return;
+        if (!showQR && !showReplySettings && !showPending && !showNickname && !editFriend && !showIdentity && !showResetPeerId) return;
         const onKey = (e) => {
           if (e.key !== 'Escape') return;
           setShowQR(false);
@@ -1787,10 +1788,11 @@ window.__ModuleLoader__.load({
           setShowNickname(false);
           setEditFriend(null);
           setShowIdentity(false);
+          setShowResetPeerId(false);
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-      }, [showQR, showReplySettings, showPending, showNickname, editFriend, showIdentity]);
+      }, [showQR, showReplySettings, showPending, showNickname, editFriend, showIdentity, showResetPeerId]);
 
       // 自动滚动到底部
       React.useEffect(() => {
@@ -1891,6 +1893,7 @@ window.__ModuleLoader__.load({
               h('div', { className: 'pm-peer-error' }, peerError),
               h('div', { className: 'pm-peer-error-actions' },
                 h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.retryPeer() }, '重试连接'),
+                peerErrorType === 'unavailable-id' ? h('button', { className: 'pm-btn small danger', type: 'button', onClick: () => setShowResetPeerId(true) }, '重置 Peer ID') : null,
                 peerErrorType === 'unavailable-id' ? h('button', { className: 'pm-btn small', type: 'button', onClick: () => setShowIdentity(true) }, '身份密钥') : null,
               ),
             ) : null,
@@ -2072,7 +2075,22 @@ window.__ModuleLoader__.load({
           ),
         ) : null,
 
-        // 显示名称 / 好友备注 / 身份密钥弹窗
+        // 显示名称 / 好友备注 / 重置 Peer ID / 身份密钥弹窗
+        showResetPeerId ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setShowResetPeerId(false) },
+          h('div', { className: 'pm-modal pm-modal-narrow', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
+            h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setShowResetPeerId(false) }, '✕'),
+            h('div', { className: 'pm-modal-title' }, '重置 Peer ID'),
+            h('div', { className: 'pm-field-static' }, '当前 Peer ID：' + (myId || '生成中…')),
+            h('div', { className: 'pm-confirm-text', style: { textAlign: 'left' } }, '会立即生成新的身份密钥对并重连，Peer ID 随公钥指纹改变。用于这个 Peer ID 被其他标签页/旧会话占用且「重试连接」无效的情况。'),
+            h('div', { className: 'pm-warn' }, '旧好友仍在列表，但对方需要重新添加你的新 Peer ID；对方若关闭「广播」，新连接可能被当陌生人拒收。私钥只存本机，旧密钥删除后不可恢复。'),
+            h('div', { className: 'pm-modal-btns' },
+              h('button', { className: 'pm-btn', type: 'button', onClick: () => setShowResetPeerId(false) }, '取消'),
+              h('button', { className: 'pm-btn danger', type: 'button', onClick: () => {
+                pmService.regenerateIdentity().then(ok => { if (ok) setShowResetPeerId(false); });
+              } }, '重置 Peer ID'),
+            ),
+          ),
+        ) : null,
         showNickname ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setShowNickname(false) },
           h('div', { className: 'pm-modal pm-modal-narrow', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
             h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setShowNickname(false) }, '✕'),
@@ -2153,7 +2171,7 @@ window.__ModuleLoader__.load({
               h('button', {
                 className: 'pm-btn danger', type: 'button', disabled: !secured,
                 onClick: () => { if (window.confirm('确定生成新的身份密钥？Peer ID 会变化，好友需要重新添加你。')) { pmService.regenerateIdentity().then(ok => { if (ok) setShowIdentity(false); }); } },
-              }, '生成新身份密钥'),
+              }, '重置 Peer ID（生成新身份密钥）'),
             ),
           ),
         ) : null,

@@ -115,7 +115,8 @@ test('identity: unavailable-id 提示说明「ID 由公钥派生」，提供重�
   assert.ok(branch.includes('Peer ID 被占用'));
   assert.ok(branch.includes('身份密钥（公钥）派生'));
   assert.ok(branch.includes('其他 DSH 标签页'));
-  assert.ok(branch.includes('重试连接') && branch.includes('身份密钥'));
+  assert.ok(branch.includes('重试连接') && branch.includes('重置 Peer ID') && branch.includes('身份密钥'));
+  assert.ok(branch.includes('点「重置 Peer ID」'), '提示未指向直接重置按钮');
   assert.ok(!branch.includes('请刷新页面重试'));
   assert.ok(SRC.includes("peerErrorType === 'unavailable-id'"));
 });
@@ -183,4 +184,14 @@ test('identity: 身份在侧栏/图标/聊天头/二维码里持续表达（不�
   assert.ok(SRC.includes("className: 'pm-modal-fp'"));
   // 指纹短形式可复现
   assert.ok(SRC.includes('function shortFingerprint(fingerprint)'));
+});
+
+
+test('identity: 占用错误框直接提供「重置 Peer ID」按钮与二次确认', () => {
+  assert.ok(SRC.includes("onClick: () => setShowResetPeerId(true) }, '重置 Peer ID'"), '错误框缺少直接重置按钮');
+  const modal = slice("showResetPeerId ? h('div'", 'showNickname ?');
+  assert.ok(modal.includes("'重置 Peer ID'"));
+  assert.ok(modal.includes('会立即生成新的身份密钥对并重连'));
+  assert.ok(modal.includes('旧好友仍在列表，但对方需要重新添加你的新 Peer ID'));
+  assert.ok(modal.includes('pmService.regenerateIdentity()'));
 });
