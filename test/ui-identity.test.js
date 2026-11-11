@@ -244,3 +244,20 @@ test('identity: 已有 daemon 在启动/运行时不另起第二个（避免抢�
   assert.ok(HOST.includes('waitForDaemon(30000)'), '已有 daemon 启动时等待过短');
   assert.ok(HOST.includes('waitForDaemon(45000)'), '新 spawn 后等待过短');
 });
+
+
+test('identity: initPeer 有互斥，避免并发用同一 Peer ID 连接把自己踢下线', () => {
+  assert.ok(NET.includes('net.peerInitBusy'), '缺少 initPeer 互斥标志');
+  assert.ok(NET.includes('if (net.peerInitBusy) return;'), '互斥未生效');
+  assert.ok(NET.includes('if (net.peer && net.peer.open) return;'), '已有连接仍会重建');
+});
+
+
+test('identity: 重连好友严格限流，避免信令洪泛把自己踢下线', () => {
+  assert.ok(NET.includes('const RECONNECT_BATCH = 3'), '缺少重连批量上限');
+  assert.ok(NET.includes('const RECONNECT_GAP_MS = 1500'), '缺少重连间隔');
+  assert.ok(NET.includes('if (!net.peer || !net.peer.open) return;'), '未确认信令就绪再重连');
+  assert.ok(NET.includes('f.online !== false'), '不应给从未连上的假 id 反复拨号');
+  const block = NET.slice(NET.indexOf('function reconnectAll()'), NET.indexOf('function reconnectAll()') + 900);
+  assert.ok(block.includes('.slice(0, RECONNECT_BATCH)'), '未限制批量');
+});
