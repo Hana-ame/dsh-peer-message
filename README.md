@@ -24,9 +24,11 @@ a session's agent send P2P messages through the `pm_send` tool, alongside
 - **Unread-count badges** — each friend row shows the number of unread messages.
 - **Night-mode compatible** — the UI styles use `--dsw-alias-*` design tokens,
   so it adapts to the active DSH theme (light/dark).
-- **Stable peer ID with recovery** — the peer ID is persisted in `localStorage`
-  and reused across page reloads. If another DSH tab or a stale session still
-  holds it, the panel offers **重试连接** and **重置 ID** instead of a dead end.
+- **Local public-key identity** — identity is an **ECDSA P-256 keypair generated
+  locally** and stored only in this browser. The PeerJS ID is derived from the
+  public-key fingerprint (`dsh-pm-<40 hex>`), and the `hello` handshake carries
+  the public key, fingerprint and a signature; the peer verifies the ID↔key
+  binding before marking the friend 🔐 **身份已验签**. No random ID to reset.
 - **Display names and remarks** — set your own nickname (sent over the `hello`
   handshake in both directions) and give friends local-only remarks that always
   win over the nickname their client sends.
@@ -201,19 +203,42 @@ ping-pong. The outbox also carries `meta: {origin, trigger, model}`; queue items
 written by older versions without meta (or without a marker) are treated as
 model/Agent messages, since only agent-side code writes the outbox.
 
-### Peer ID occupied / reset
+### Keypair identity and ID occupancy
 
-The peer ID is a stable localStorage identity, so it is normally reused after a
-reload. PeerJS allows only one live connection per ID, so the ID can be reported
-as `unavailable-id` when another DSH tab in the same browser — or a stale
-session — still holds it. The panel then shows a box with:
+Identity is not a random string any more:
 
-- **重试连接** — reconnect with the same stable ID (use after closing the other
-  tab or waiting for the stale session to drop);
-- **重置 ID** — generate a new peer ID, persist it and reconnect immediately.
-  This is a confirmation dialog because the identity changes: friends stay in
-  the list, but they must add your new ID, and peers with broadcast disabled may
-  reject the new connection as a stranger. The new ID is also shown in a toast.
+1. On first use the client generates an **ECDSA P-256 keypair** with WebCrypto
+   and stores the private JWK in `localStorage`
+   (`dsh-peer-message-identity-v1`, local only — never transmitted).
+2. The **Peer ID is derived from the public-key fingerprint**:
+   `dsh-pm-` + first 40 hex chars of `SHA-256("EC|P-256|<x>|<y>")`. The same key
+   always yields the same ID; different keys cannot collide in practice.
+3. `hello` carries `{name, pub, fp, sig}` where `sig` signs the canonical
+   `{v,id,fp,name}` payload. The receiver verifies:
+   - fingerprint recomputed from `pub` equals `fp` **and** `conn.peer ===
+     "dsh-pm-" + fp` (PeerJS ID ↔ key binding),
+   - the signature verifies against `pub`.
+
+   Success stores `friend.pubKey/fingerprint` and shows 🔐 + “身份已验签”;
+   failure closes that connection, shows “身份校验失败（签名无效/公钥与 Peer ID
+   不匹配）” and marks the friend unverified. Peers on older versions that send a
+   `hello` without `pub` are still compatible but shown as **未验签**.
+
+Because two tabs share the same local key, only one can hold the derived ID at a
+time. On `unavailable-id` the panel explains that the **identity ID** is occupied
+and offers:
+
+- **重试连接** — reconnect with the *same key-derived ID* (close the other tab or
+  wait for the stale session to drop);
+- **身份密钥** — open the identity dialog (Peer ID, algorithm, public-key
+  fingerprint). It can **生成新身份密钥**: a new keypair, i.e. a new identity.
+  This asks for confirmation and warns that the Peer ID changes, friends stay in
+  the list but must re-add the new ID, and broadcast-off peers may reject it.
+
+Private keys are **not** exported by the UI; anyone with a backup of the browser
+profile can impersonate this identity, so do not share it. A WebCrypto-less
+(non-secure-context) page falls back to the legacy random ID with `secured=false`
+and peers will see it as unverified.
 
 ## Installation
 

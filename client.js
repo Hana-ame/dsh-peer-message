@@ -190,20 +190,172 @@ window.__ModuleLoader__.load({
       } catch (e) { /* ignore */ }
     }
 
-    // 固定 Peer ID：首次生成后存入 localStorage，跨页面刷新/重启不变。
-    // 唯一 ID 被别的标签页/旧会话占用时，可显式重置（见 pmService.resetPeerId）。
-    const PEER_ID_KEY = 'dsh-peer-message-peer-id-v1';
-    function generatePeerId() {
+    // ── 本地身份：ECDSA P-256 公私钥 ────────────────────────────────────
+    // Peer ID 由公钥指纹派生（dsh-pm-<40 hex>），身份由本机私钥决定，不再
+    // 依赖随机字符串。私钥只存本机 localStorage；hello 握手携带公钥 + 对
+    // (id|name|fp) 的签名，对方据此验证「PeerJS ID ↔ 公钥」绑定。
+    const IDENTITY_KEY = 'dsh-peer-message-identity-v1';
+    const LEGACY_PEER_ID_KEY = 'dsh-peer-message-peer-id-v1';
+    const IDENTITY_FP_HEX_LEN = 40; // 160-bit 指纹作为 peer-id body（总长 47）
+    const HELLO_VERSION = 1;
+    const IDENTITY_ALGORITHM = 'ECDSA P-256 / SHA-256';
+    const PUB_KEY_MAX_LEN = 200;
+    const HELLO_SIG_MAX_LEN = 200;
+
+    function bytesToBase64(bytes) {
+      let binary = '';
+      const view = new Uint8Array(bytes);
+      for (let i = 0; i < view.length; i++) binary += String.fromCharCode(view[i]);
+      return btoa(binary);
+    }
+    function base64ToBytes(text) {
+      const binary = atob(text);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    }
+    function utf8Bytes(text) { return new TextEncoder().encode(text); }
+
+    async function sha256Hex(input) {
+      const data = typeof input === 'string' ? utf8Bytes(input) : input;
+      const digest = await crypto.subtle.digest('SHA-256', data);
+      return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    function publicKeyCanonical(pub) {
+      return 'EC|P-256|' + pub.x + '|' + pub.y;
+    }
+    function helloSignPayload(peerId, name, fingerprint) {
+      // 固定字段顺序的 canonical JSON：双方必须逐字节一致。
+      return JSON.stringify({ v: HELLO_VERSION, id: peerId, fp: fingerprint, name });
+    }
+    function isValidPublicKey(pub) {
+      return !!pub && typeof pub === 'object' && pub.kty === 'EC' && pub.crv === 'P-256'
+        && typeof pub.x === 'string' && pub.x.length > 8 && pub.x.length <= PUB_KEY_MAX_LEN
+        && typeof pub.y === 'string' && pub.y.length > 8 && pub.y.length <= PUB_KEY_MAX_LEN
+        && Object.keys(pub).every(k => k === 'kty' || k === 'crv' || k === 'x' || k === 'y');
+    }
+    async function fingerprintOfPublicKey(pub) {
+      return (await sha256Hex(publicKeyCanonical(pub))).slice(0, IDENTITY_FP_HEX_LEN);
+    }
+    function cryptoIdentityAvailable() {
+      return !!(window.crypto && window.crypto.subtle && typeof window.crypto.subtle.generateKey === 'function');
+    }
+    function randomPeerIdFallback() {
       return 'dsh-pm-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36);
     }
-    function getStablePeerId() {
+    function legacyStablePeerId() {
       let id = null;
-      try { id = localStorage.getItem(PEER_ID_KEY); } catch (e) { /* ignore */ }
+      try { id = localStorage.getItem(LEGACY_PEER_ID_KEY); } catch (e) { /* ignore */ }
       if (!id) {
-        id = generatePeerId();
-        try { localStorage.setItem(PEER_ID_KEY, id); } catch (e) { /* ignore */ }
+        id = randomPeerIdFallback();
+        try { localStorage.setItem(LEGACY_PEER_ID_KEY, id); } catch (e) { /* ignore */ }
       }
       return id;
+    }
+    async function importIdentityPrivateKey(jwk) {
+      return crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+    }
+
+    async function generateIdentity() {
+      const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+      const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+      const exported = await crypto.subtle.exportKey('jwk', pair.publicKey);
+      const pubJwk = { kty: 'EC', crv: 'P-256', x: exported.x, y: exported.y };
+      const fingerprint = await fingerprintOfPublicKey(pubJwk);
+      return {
+        v: 1,
+        secured: true,
+        privateJwk,
+        privateKey: pair.privateKey,
+        pubJwk,
+        fingerprint,
+        peerId: PEER_ID_PREFIX + fingerprint,
+        createdAt: Date.now(),
+      };
+    }
+
+    function persistIdentity(identity) {
+      try {
+        localStorage.setItem(IDENTITY_KEY, JSON.stringify({
+          v: 1,
+          privateJwk: identity.privateJwk,
+          pubJwk: identity.pubJwk,
+          fingerprint: identity.fingerprint,
+          peerId: identity.peerId,
+          createdAt: identity.createdAt,
+        }));
+        // 兼容旧代码/排障：把派生 ID 也写进旧 key（不再参与身份生成）。
+        localStorage.setItem(LEGACY_PEER_ID_KEY, identity.peerId);
+      } catch (e) { /* ignore */ }
+    }
+
+    async function loadIdentity() {
+      // 非安全上下文（无 crypto.subtle）无法生成/验签密钥：退回旧随机 ID，
+      // 标记 secured=false，hello 不携带公钥，对端会显示「未验签」。
+      if (!cryptoIdentityAvailable()) {
+        return { v: 0, secured: false, privateJwk: null, privateKey: null, pubJwk: null, fingerprint: '', peerId: legacyStablePeerId(), createdAt: 0 };
+      }
+      let stored = null;
+      try { stored = JSON.parse(localStorage.getItem(IDENTITY_KEY) || 'null'); } catch (e) { stored = null; }
+      if (stored && stored.privateJwk && isValidPublicKey(stored.pubJwk)) {
+        try {
+          const fingerprint = await fingerprintOfPublicKey(stored.pubJwk);
+          const privateKey = await importIdentityPrivateKey(stored.privateJwk);
+          return {
+            v: 1,
+            secured: true,
+            privateJwk: stored.privateJwk,
+            privateKey,
+            pubJwk: stored.pubJwk,
+            fingerprint,
+            peerId: PEER_ID_PREFIX + fingerprint,
+            createdAt: typeof stored.createdAt === 'number' ? stored.createdAt : 0,
+          };
+        } catch (e) { /* 私钥损坏 → 重新生成 */ }
+      }
+      const created = await generateIdentity();
+      persistIdentity(created);
+      return created;
+    }
+
+    async function buildHello(identity, name) {
+      if (!identity || !identity.secured) return { type: 'hello', v: HELLO_VERSION, name, secured: false };
+      const payload = helloSignPayload(identity.peerId, name, identity.fingerprint);
+      const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, identity.privateKey, utf8Bytes(payload));
+      return {
+        type: 'hello',
+        v: HELLO_VERSION,
+        name,
+        fp: identity.fingerprint,
+        pub: identity.pubJwk,
+        sig: bytesToBase64(signature),
+      };
+    }
+
+    // 校验 hello：公钥指纹必须等于 PeerJS ID 派生值，且签名必须匹配。
+    // 返回 {ok, verified, reason, fingerprint, pubKey, name}
+    async function verifyHello(remoteId, data) {
+      if (!data || typeof data !== 'object') return { ok: false, reason: 'bad-hello' };
+      const hasProof = data.fp !== undefined || data.pub !== undefined || data.sig !== undefined;
+      if (!hasProof) {
+        // 旧版客户端：不提供公钥，兼容但标记未验签。
+        return { ok: true, verified: false, reason: 'legacy' };
+      }
+      if (!isValidPublicKey(data.pub)) return { ok: false, reason: 'bad-pub' };
+      if (typeof data.fp !== 'string' || typeof data.sig !== 'string' || data.sig.length === 0 || data.sig.length > HELLO_SIG_MAX_LEN) return { ok: false, reason: 'bad-hello' };
+      if (typeof data.name !== 'string' || data.name.length > MAX_NAME_LEN) return { ok: false, reason: 'bad-name' };
+      const fingerprint = await fingerprintOfPublicKey(data.pub);
+      if (data.fp !== fingerprint || remoteId !== PEER_ID_PREFIX + fingerprint) return { ok: false, reason: 'id-mismatch' };
+      let verifier;
+      try {
+        verifier = await crypto.subtle.importKey('jwk', data.pub, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+      } catch (e) { return { ok: false, reason: 'bad-pub' }; }
+      let ok = false;
+      try {
+        ok = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, verifier, base64ToBytes(data.sig), utf8Bytes(helloSignPayload(remoteId, data.name, fingerprint)));
+      } catch (e) { ok = false; }
+      if (!ok) return { ok: false, reason: 'bad-signature' };
+      return { ok: true, verified: true, fingerprint, pubKey: data.pub, name: data.name };
     }
 
     // 把一条投递失败的消息放回 host 队列（POST 回 /api/pm-outbox）
@@ -248,6 +400,11 @@ window.__ModuleLoader__.load({
       '.pm-friend-name{font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.pm-friend-last{font-size:11px;color:var(--dsw-alias-label-secondary,inherit);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
       '.pm-friend-note{font-size:10px;opacity:.75;flex:none;}',
+      '.pm-verified-badge{font-size:10px;flex:none;opacity:.9;}',
+      '.pm-identity-grid{display:grid;grid-template-columns:64px 1fr;gap:6px 10px;font-size:11px;line-height:1.6;}',
+      '.pm-identity-grid dt{color:var(--dsw-alias-label-secondary,inherit);}',
+      '.pm-identity-grid dd{margin:0;color:var(--dsw-alias-label-primary,inherit);word-break:break-all;}',
+      '.pm-identity-fp{font-family:monospace;font-size:10px;line-height:1.7;word-break:break-all;background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.1));padding:6px 8px;border-radius:6px;}',
       '.pm-unread{min-width:18px;height:18px;border-radius:9px;background:var(--dsw-alias-state-error-primary,#ef4444);color:var(--dsw-alias-label-primary-foreground,#fff);font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;padding:0 5px;flex:none;}',
 
       // 好友右键菜单：右键只打开菜单，删除必须走菜单 + 二次确认，防误删。
@@ -358,7 +515,7 @@ window.__ModuleLoader__.load({
       '.pm-modal-section-title{font-size:12px;font-weight:600;margin:4px 0 8px;padding-top:8px;border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.15));}',
       '.pm-pending-item{border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.25));border-radius:8px;padding:8px 10px;margin-bottom:8px;background:var(--dsw-alias-bg-layer-2,transparent);}',
       '.pm-pending-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:10px;color:var(--dsw-alias-label-secondary,inherit);flex-wrap:wrap;}',
-      '.pm-pending-origin{display:inline-flex;align-items:center;gap:4px;font-size:9px;padding:0 5px;border-radius:4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b);}',
+      '.pm-pending-origin{display:inline-flex;align-items:center;gap:4px;font-size:9px;padding:0 5px;border-radius:4px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-warning-primary,#f59e0b) 70%,var(--dsw-alias-label-primary,#000));color:color-mix(in srgb,var(--dsw-alias-state-warning-primary,#f59e0b) 70%,var(--dsw-alias-label-primary,#000));}',
       '.pm-pending-subhead{font-size:10px;color:var(--dsw-alias-label-secondary,inherit);margin-top:2px;}',
       '.pm-pending-note{font-size:10px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit);margin-top:2px;white-space:pre-wrap;word-break:break-word;max-height:60px;overflow-y:auto;}',
       '.pm-note-input{min-height:88px;resize:vertical;line-height:1.5;font-family:inherit;}',
@@ -485,7 +642,10 @@ window.__ModuleLoader__.load({
     // 面板只是订阅服务快照的视图；面板不打开也照样收消息、投递 agent 消息。
     const pmService = {
       state: loadState(),          // {friends, messages}，每次变更同步 localStorage
-      myId: '',                    // 本端 PeerJS id（peer open 后回填）
+      myId: '',                    // 本端 PeerJS id（= 公钥指纹派生，identity 就绪后回填）
+      identity: null,              // {secured, peerId, fingerprint, pubJwk, privateKey}
+      identityPromise: null,
+      identityError: '',
       peerStatus: 'connecting',    // connecting | online | offline | error | closed
       peerError: '',
       peerErrorType: '',           // PeerJS error.type，如 unavailable-id / network
@@ -526,6 +686,9 @@ window.__ModuleLoader__.load({
           this._snap = {
             state: this.state,
             myId: this.myId,
+            secured: !!(this.identity && this.identity.secured),
+            fingerprint: this.identity ? this.identity.fingerprint : '',
+            identityError: this.identityError,
             peerStatus: this.peerStatus,
             peerError: this.peerError,
             peerErrorType: this.peerErrorType,
@@ -588,11 +751,22 @@ window.__ModuleLoader__.load({
         // 侧栏徽标初值（后台服务启动即发布，不等面板挂载）。
         pmUnreadStore.publish(computeUnreadTotal(this.state.friends));
         this.emit();
-        loadPeerJS().then(() => this.initPeer()).catch(err => {
-          this.peerStatus = 'error';
-          this.peerError = 'PeerJS 加载失败: ' + String(err && err.message || err);
-          this.emit();
-        });
+        // 身份先于 Peer 就绪：Peer ID 由公钥指纹派生。
+        this.ensureIdentity()
+          .then(() => {
+            this.myId = this.identity.peerId;
+            this.emit();
+            if (!this.identity.secured) {
+              this.showToast('当前页面不是安全上下文，无法生成密钥身份：已退回随机 ID（对端显示未验签）');
+            }
+            return loadPeerJS();
+          })
+          .then(() => this.initPeer())
+          .catch(err => {
+            this.peerStatus = 'error';
+            this.peerError = '身份/PeerJS 初始化失败: ' + String(err && err.message || err);
+            this.emit();
+          });
         // agent 队列轮询：面板不打开也照常排水投递（消息要跑在后台）。
         this.pollTimer = setInterval(() => this.drainOutbox(), 1000);
         // 自动回复状态轮询：待批准请求 / 正在回复 / 最近结果（面板不打开也跑）。
@@ -628,11 +802,40 @@ window.__ModuleLoader__.load({
         this.emit();
       },
 
+      // 加载/生成密钥身份（并发去重）。
+      ensureIdentity() {
+        if (this.identity) return Promise.resolve(this.identity);
+        if (this.identityPromise) return this.identityPromise;
+        this.identityPromise = loadIdentity()
+          .then(identity => {
+            this.identity = identity;
+            this.identityError = '';
+            this.myId = identity.peerId;
+            this.emit();
+            return identity;
+          })
+          .catch(err => {
+            this.identityError = String(err && err.message || err);
+            this.emit();
+            throw err;
+          })
+          .finally(() => { this.identityPromise = null; });
+        return this.identityPromise;
+      },
+
       initPeer() {
         if (!this.started) return;
+        if (!this.identity) {
+          this.ensureIdentity().then(() => this.initPeer()).catch(err => {
+            this.peerStatus = 'error';
+            this.peerError = '身份初始化失败: ' + String(err && err.message || err);
+            this.emit();
+          });
+          return;
+        }
         let peer = null;
         try {
-          peer = new window.Peer(getStablePeerId(), DEFAULT_PEER_CONFIG);
+          peer = new window.Peer(this.identity.peerId, DEFAULT_PEER_CONFIG);
         } catch (err) {
           this.peerStatus = 'error';
           this.peerErrorType = 'init';
@@ -664,7 +867,7 @@ window.__ModuleLoader__.load({
           if (type === 'unavailable-id') {
             this.peerStatus = 'error';
             this.peerErrorType = 'unavailable-id';
-            this.peerError = 'ID 被占用：同一浏览器的其他 DSH 标签页或上一次会话仍占着这个固定 ID。请关闭其他标签页后点「重试连接」；或点「重置 ID」换一个新 ID（好友需要重新加你）。';
+            this.peerError = '身份 ID 被占用：Peer ID 由你的本机公钥派生，同一密钥只能有一个在线连接；通常是同一浏览器的其他 DSH 标签页或上一次会话仍占着。关闭其他标签页后点「重试连接」；如确需换新身份，可在「身份密钥」里生成新密钥（等同新账号，好友需重新添加）。';
             this.emit();
           } else if (type === 'network' || type === 'server-error') {
             this.peerStatus = 'error';
@@ -785,10 +988,15 @@ window.__ModuleLoader__.load({
         return sanitizeName(this.settings.nickname) || shortId(this.myId) || '我';
       },
 
-      // 双向 hello：主动连接和收到的连接打开后都发一次，双方才能互相显示昵称。
-      sendHello(conn) {
+      // 双向 hello：携带公钥 + 指纹 + 对 (id|name|fp) 的签名；对方据此验证身份。
+      async sendHello(conn) {
         if (!conn || !conn.open) return;
-        try { conn.send({ type: 'hello', name: this.getNickname() }); } catch (e) { /* ignore */ }
+        try {
+          const identity = await this.ensureIdentity();
+          if (!conn.open) return;
+          const message = await buildHello(identity, this.getNickname());
+          conn.send(message);
+        } catch (e) { /* ignore */ }
       },
 
       broadcastHello() {
@@ -866,23 +1074,33 @@ window.__ModuleLoader__.load({
           try { this.conns[id].close(); } catch (e) { /* ignore */ }
         }
         this.conns = {};
-        this.myId = '';
+        this.myId = this.identity ? this.identity.peerId : '';
         this.peerStatus = 'connecting';
         this.peerError = '';
         this.peerErrorType = '';
         this.reconnectAttempts = 0;
         this.emit();
         this.initPeer();
-        this.showToast('正在用固定 ID 重新连接…');
+        this.showToast('正在用同一密钥身份重新连接…');
       },
 
-      // 换一个新 Peer ID（旧 ID 被别处占用时的兜底）。好友列表保留，但对方要重新加新 ID。
-      resetPeerId() {
-        const oldId = this.myId || (() => { try { return localStorage.getItem(PEER_ID_KEY); } catch (e) { return ''; } })();
-        const nextId = generatePeerId();
-        try { localStorage.setItem(PEER_ID_KEY, nextId); } catch (e) { /* ignore */ }
-        this.retryPeer();
-        this.showToast('已重置 Peer ID：' + nextId + (oldId ? '（旧 ID：' + shortId(oldId) + '）' : ''));
+      // 生成新的身份密钥对（等同新账号）：Peer ID 随公钥指纹变化，
+      // 旧好友仍留在列表但需要重新添加新 ID。私钥只存本机，旧钥删除不可恢复。
+      async regenerateIdentity() {
+        if (!cryptoIdentityAvailable()) { this.showToast('当前页面不是安全上下文，无法生成密钥身份'); return false; }
+        try {
+          const next = await generateIdentity();
+          persistIdentity(next);
+          this.identity = next;
+          this.myId = next.peerId;
+          this.identityError = '';
+          this.retryPeer();
+          this.showToast('已生成新身份密钥：' + next.peerId + '（好友需重新添加）');
+          return true;
+        } catch (err) {
+          this.showToast('生成新身份失败：' + String(err && err.message || err));
+          return false;
+        }
       },
 
       // 入站数据：文本消息清洗 + hello 握手昵称清洗。
@@ -914,17 +1132,49 @@ window.__ModuleLoader__.load({
           if (this.state.friends.some(f => f.id === remoteId)) this.maybeRequestReply(remoteId, text);
         } else if (data && typeof data === 'object') {
           if (data.type === 'hello') {
-            // 攻防加固：昵称非字符串/空 → 丢弃，绝不写进 state（防对象打崩渲染）。
-            const name = sanitizeName(data.name);
-            if (!name) return;
-            this.update(prev => {
-              const idx = prev.friends.findIndex(f => f.id === remoteId);
-              if (idx < 0) return prev;
-              const friends = prev.friends.slice();
-              friends[idx] = Object.assign({}, friends[idx], { name });
-              return Object.assign({}, prev, { friends });
-            });
+            // 身份校验是异步 WebCrypto；失败只影响该连接，不阻塞聊天数据。
+            this.handleHello(remoteId, data).catch(() => { /* ignore */ });
           }
+        }
+      },
+
+      // 校验并落库好友身份：公钥指纹必须匹配 PeerJS ID，hello 签名必须有效。
+      async handleHello(remoteId, data) {
+        const verified = await verifyHello(remoteId, data);
+        if (!verified.ok) {
+          const reasonText = verified.reason === 'id-mismatch' ? '公钥与 Peer ID 不匹配'
+            : verified.reason === 'bad-signature' ? '签名无效'
+            : verified.reason === 'bad-pub' ? '公钥格式非法'
+            : '握手校验失败';
+          this.update(prev => {
+            const idx = prev.friends.findIndex(f => f.id === remoteId);
+            if (idx < 0) return prev;
+            const friends = prev.friends.slice();
+            friends[idx] = Object.assign({}, friends[idx], { online: false, verified: false, verifyError: reasonText });
+            return Object.assign({}, prev, { friends });
+          });
+          this.showToast('身份校验失败（' + reasonText + '），已断开「' + shortId(remoteId) + '」');
+          const conn = this.conns[remoteId];
+          try { if (conn) conn.close(); } catch (e) { /* ignore */ }
+          delete this.conns[remoteId];
+          return;
+        }
+        const name = sanitizeName(data.name);
+        this.update(prev => {
+          const idx = prev.friends.findIndex(f => f.id === remoteId);
+          if (idx < 0) return prev;
+          const friends = prev.friends.slice();
+          const patch = { verified: !!verified.verified, verifyError: '' };
+          if (name) patch.name = name;
+          if (verified.fingerprint) patch.fingerprint = verified.fingerprint;
+          if (verified.pubKey) patch.pubKey = verified.pubKey;
+          if (verified.verified) patch.verifiedAt = Date.now();
+          friends[idx] = Object.assign({}, friends[idx], patch);
+          return Object.assign({}, prev, { friends });
+        });
+        if (verified.verified) {
+          const friend = this.state.friends.find(f => f.id === remoteId);
+          this.showToast('「' + (friend ? displayName(friend) : shortId(remoteId)) + '」身份已验签');
         }
       },
 
@@ -1424,6 +1674,9 @@ window.__ModuleLoader__.load({
       const peerStatus = snap.peerStatus;
       const peerError = snap.peerError;
       const peerErrorType = snap.peerErrorType;
+      const secured = !!snap.secured;
+      const identityFingerprint = snap.fingerprint || '';
+      const identityError = snap.identityError || '';
       const toast = snap.toast;
       const settings = snap.settings || { allowBroadcast: false, allowIncoming: true };
       const reply = snap.reply || DEFAULT_REPLY;
@@ -1439,11 +1692,11 @@ window.__ModuleLoader__.load({
       const [showQR, setShowQR] = React.useState(false);
       const [showReplySettings, setShowReplySettings] = React.useState(false);
       const [showPending, setShowPending] = React.useState(false);
-      // 显示名称 / 好友备注 / 重置 Peer ID
+      // 显示名称 / 好友备注 / 身份密钥
       const [showNickname, setShowNickname] = React.useState(false);
       const [nicknameDraft, setNicknameDraft] = React.useState('');
       const [editFriend, setEditFriend] = React.useState(null); // { id, alias, note }
-      const [showResetId, setShowResetId] = React.useState(false);
+      const [showIdentity, setShowIdentity] = React.useState(false);
       // 右键菜单：{ id, left, top }。右键只负责开菜单，绝不直接改好友数据。
       const [ctxMenu, setCtxMenu] = React.useState(null);
       // 删除确认：{ id, name }。确认框打开前不会有任何 removeFriend 调用。
@@ -1489,20 +1742,20 @@ window.__ModuleLoader__.load({
         return () => window.removeEventListener('keydown', onKey);
       }, [confirmDel]);
 
-      // 自动回复设置 / 待批准 / 昵称 / 备注 / 重置 ID 弹窗：Escape 关闭。
+      // 自动回复设置 / 待批准 / 昵称 / 备注 / 身份密钥弹窗：Escape 关闭。
       React.useEffect(() => {
-        if (!showReplySettings && !showPending && !showNickname && !editFriend && !showResetId) return;
+        if (!showReplySettings && !showPending && !showNickname && !editFriend && !showIdentity) return;
         const onKey = (e) => {
           if (e.key !== 'Escape') return;
           setShowReplySettings(false);
           setShowPending(false);
           setShowNickname(false);
           setEditFriend(null);
-          setShowResetId(false);
+          setShowIdentity(false);
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-      }, [showReplySettings, showPending, showNickname, editFriend, showResetId]);
+      }, [showReplySettings, showPending, showNickname, editFriend, showIdentity]);
 
       // 自动滚动到底部
       React.useEffect(() => {
@@ -1574,7 +1827,7 @@ window.__ModuleLoader__.load({
               h('button', { className: 'pm-icon-btn', title: '显示二维码', onClick: () => setShowQR(true), disabled: !myId }, '▦'),
               h('button', { className: 'pm-icon-btn', title: '自动回复设置', onClick: openReplySettings }, '⚙'),
             ),
-            // 显示名称（hello 握手）+ 重置 Peer ID 入口
+            // 显示名称（hello 握手）+ 身份密钥入口
             h('div', { className: 'pm-nick-row' },
               h('span', { className: 'pm-nick-label' }, '显示名称'),
               h('span', { className: 'pm-nick-value', title: settings.nickname || '默认：ID 前缀' }, settings.nickname || '（默认：ID 前缀）'),
@@ -1583,15 +1836,15 @@ window.__ModuleLoader__.load({
                 onClick: () => { setNicknameDraft(settings.nickname || ''); setShowNickname(true); },
               }, '✎'),
               h('button', {
-                className: 'pm-link-btn', title: '重置 Peer ID（生成新 ID）',
-                onClick: () => setShowResetId(true),
-              }, '重置 ID'),
+                className: 'pm-link-btn', title: '身份密钥：查看公钥指纹 / 更换密钥身份',
+                onClick: () => setShowIdentity(true),
+              }, '身份密钥'),
             ),
             peerError ? h('div', { className: 'pm-peer-error-box' },
               h('div', { className: 'pm-peer-error' }, peerError),
               h('div', { className: 'pm-peer-error-actions' },
                 h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.retryPeer() }, '重试连接'),
-                peerErrorType === 'unavailable-id' ? h('button', { className: 'pm-btn small danger', type: 'button', onClick: () => setShowResetId(true) }, '重置 ID') : null,
+                peerErrorType === 'unavailable-id' ? h('button', { className: 'pm-btn small', type: 'button', onClick: () => setShowIdentity(true) }, '身份密钥') : null,
               ),
             ) : null,
             // 后台运行开关（持久化；面板关闭时由 pmService 继续生效）
@@ -1645,6 +1898,7 @@ window.__ModuleLoader__.load({
                     h('div', { className: 'pm-friend-last' },
                       f.lastMsg ? ((f.lastOrigin === 'model' ? 'AI｜' : '') + f.lastMsg) : (f.online ? '在线' : '离线')),
                   ),
+                  f.verified ? h('span', { className: 'pm-verified-badge', title: '身份已验签 · 公钥指纹 ' + (f.fingerprint ? f.fingerprint.slice(0, 16) + '…' : '') }, '🔐') : null,
                   f.note ? h('span', { className: 'pm-friend-note', title: '好友备注（注入自动回复上下文）：' + f.note }, '📝') : null,
                   f.unread > 0 ? h('span', { className: 'pm-unread' }, f.unread > 99 ? '99+' : f.unread) : null,
                   h('span', { className: 'pm-status-dot', style: { marginLeft: 'auto', background: f.online ? 'var(--dsw-alias-state-success-primary,#22c55e)' : 'var(--dsw-alias-state-idle-primary,rgba(127,127,127,.5))' } }),
@@ -1663,7 +1917,8 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'pm-avatar', style: { background: avatarColor(active.id), width: 32, height: 32, fontSize: 13 } }, (displayName(active) || '?').slice(0, 1).toUpperCase()),
                 h('div', { className: 'pm-chat-header-info' },
                   h('div', { className: 'pm-chat-header-name', title: (active.alias ? active.alias + ' · ' + active.name + ' · ' + active.id : (active.name ? active.name + ' · ' + active.id : active.id)) + (active.note ? '\n备注：' + active.note : '') }, displayName(active)),
-                  h('div', { className: 'pm-chat-header-status' }, active.online ? '在线' : '离线'),
+                  h('div', { className: 'pm-chat-header-status', title: active.fingerprint ? '公钥指纹：' + active.fingerprint : '' },
+                    active.online ? (active.verified ? '在线 · 身份已验签' : '在线 · 未验签') : '离线'),
                 ),
               ),
               h('div', { className: 'pm-chat-messages', ref: chatRef },
@@ -1767,7 +2022,7 @@ window.__ModuleLoader__.load({
           ),
         ) : null,
 
-        // 显示名称 / 好友备注 / 重置 Peer ID 弹窗
+        // 显示名称 / 好友备注 / 身份密钥弹窗
         showNickname ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setShowNickname(false) },
           h('div', { className: 'pm-modal pm-modal-narrow', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
             h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setShowNickname(false) }, '✕'),
@@ -1819,16 +2074,35 @@ window.__ModuleLoader__.load({
             ),
           ),
         ) : null,
-        showResetId ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setShowResetId(false) },
+        showIdentity ? h('div', { className: 'pm-modal-overlay', onMouseDown: () => setShowIdentity(false) },
           h('div', { className: 'pm-modal pm-modal-narrow', style: { position: 'relative' }, onMouseDown: e => e.stopPropagation() },
-            h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setShowResetId(false) }, '✕'),
-            h('div', { className: 'pm-modal-title' }, '重置 Peer ID'),
-            h('div', { className: 'pm-field-static' }, '当前 ID：' + (myId || '未连接')),
-            h('div', { className: 'pm-confirm-text', style: { textAlign: 'left' } }, '将为这台浏览器生成一个新的 Peer ID 并立即重连。适用于固定 ID 被其他标签页或旧会话占用、重试也无效的情况。'),
-            h('div', { className: 'pm-warn' }, '旧好友仍保留在列表，但对方需要重新添加你的新 ID；如果对方关闭了「广播」，你的新连接可能被当成陌生人拒收。'),
+            h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: () => setShowIdentity(false) }, '✕'),
+            h('div', { className: 'pm-modal-title' }, '身份密钥'),
+            h('dl', { className: 'pm-identity-grid' },
+              h('dt', null, 'Peer ID'),
+              h('dd', null, myId || '生成中…'),
+              h('dt', null, '算法'),
+              h('dd', null, secured ? IDENTITY_ALGORITHM : '不可用（非安全上下文，已退回随机 ID）'),
+              h('dt', null, '状态'),
+              h('dd', null, secured ? '已启用密钥身份；连接时通过 hello 公钥+签名验证' : '未启用：当前页面无法使用 WebCrypto'),
+            ),
+            identityFingerprint ? h('div', null,
+              h('div', { className: 'pm-field-label' }, '公钥指纹（用于核对身份）'),
+              h('div', { className: 'pm-identity-fp' }, identityFingerprint.replace(/(.{8})/g, '$1 ').trim()),
+              h('div', { className: 'pm-hint' }, 'Peer ID 由该指纹派生；对方连接时会验证公钥与 Peer ID 绑定、hello 签名有效后标记「已验签」。'),
+            ) : null,
+            identityError ? h('div', { className: 'pm-warn' }, '身份错误：' + identityError) : null,
+            h('div', { className: 'pm-warn' }, '私钥只保存在本机 localStorage，请勿把浏览器配置/私钥备份发给他人。更换身份 = 生成新密钥对：Peer ID 会变化，旧好友仍在列表但需要重新添加你的新 ID；对方若关闭「广播」，新连接可能被当陌生人拒收。'),
             h('div', { className: 'pm-modal-btns' },
-              h('button', { className: 'pm-btn', type: 'button', onClick: () => setShowResetId(false) }, '取消'),
-              h('button', { className: 'pm-btn danger', type: 'button', onClick: () => { pmService.resetPeerId(); setShowResetId(false); } }, '重置 ID'),
+              h('button', { className: 'pm-btn', type: 'button', onClick: () => setShowIdentity(false) }, '关闭'),
+              identityFingerprint ? h('button', {
+                className: 'pm-btn', type: 'button',
+                onClick: () => copyText(identityFingerprint).then(() => pmService.showToast('公钥指纹已复制')).catch(() => pmService.showToast('复制失败')),
+              }, '复制指纹') : null,
+              h('button', {
+                className: 'pm-btn danger', type: 'button', disabled: !secured,
+                onClick: () => { if (window.confirm('确定生成新的身份密钥？Peer ID 会变化，好友需要重新添加你。')) { pmService.regenerateIdentity().then(ok => { if (ok) setShowIdentity(false); }); } },
+              }, '生成新身份密钥'),
             ),
           ),
         ) : null,
