@@ -367,19 +367,25 @@ export function createNetwork(options) {
       if (net.peer && net.peer.open) { net.retryAttempts = 0; return; }
       // 关键：重试前必须先 destroy 旧 Peer，并留出足够时间让云端释放 ID。
       // 立刻新建会让新连接与自己的旧登记互撞 → 永远 unavailable-id。
+      const wasUnavailable = net.peerErrorType === 'unavailable-id';
       if (net.peer) {
         try { net.peer.destroy(); } catch (e) { /* ignore */ }
       }
       net.peer = null;
       net.peerStatus = 'connecting';
-      net.peerError = '';
-      net.peerErrorType = '';
+      if (!wasUnavailable) {
+        net.peerError = '';
+        net.peerErrorType = '';
+      }
       touch();
-      // 销毁后至少再等 1.5s 才重建，避免和刚关闭的信令会话抢同一 ID。
+      // unavailable-id 时绝不能立刻重建：PeerJS 的旧登记还在云端，立刻重连就是
+      // 自己跟自己的旧会话抢，会无限自我占用（观测到的 300s+ 卡死就是这样）。
+      // 先彻底释放、静默等待，再尝试。
+      const quiet = wasUnavailable ? 12000 : 1500;
       setTimeout(() => {
         if (!net.started) return;
         initPeer().catch(() => {});
-      }, 1500).unref?.();
+      }, quiet).unref?.();
     }, delay);
     net.retryTimer.unref?.();
   }
