@@ -67,7 +67,7 @@ test('client-reply: 入站消息会 POST 到 Host 回调路由并携带持久化
 test('client-reply: 自动回复标记不会再次触发回调（防互刷循环）', () => {
   assert.ok(SRC.includes('AUTO_REPLY_PREFIX = '), '缺少 AUTO_REPLY_PREFIX 常量');
   const block = SRC.slice(SRC.indexOf('maybeRequestReply(peerId, text)'), SRC.indexOf('// ── 面板调用的操作'));
-  assert.ok(block.includes('startsWith(AUTO_REPLY_PREFIX)'), '缺少循环标记守卫');
+  assert.ok(block.includes('isModelText(clean)'), '缺少模型标记守卫（防 AI 互刷）');
   assert.ok(block.includes("if (reply.mode === 'off') return;"), '关闭模式必须直接跳过');
 });
 

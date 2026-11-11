@@ -12,14 +12,24 @@
 export const outbox = [];
 
 /**
- * Queue one outbound message.
- * @param {{id:string,to:string,text:string,ts?:number}} item
+ * Queue one outbound message. `meta` (if present) is whitelisted so the client
+ * can distinguish model auto-replies, human-approved replies and pm_send agent
+ * messages without parsing text alone.
+ * @param {{id:string,to:string,text:string,ts?:number,meta?:{origin?:string,trigger?:string,model?:string}}} item
  */
 export function pushItem(item) {
+  const meta = item.meta && typeof item.meta === 'object' && !Array.isArray(item.meta) ? item.meta : null;
   outbox.push({
     id: item.id,
     to: item.to,
     text: item.text,
     ts: item.ts ?? Date.now(),
+    ...meta ? {
+      meta: {
+        ...typeof meta.origin === 'string' ? { origin: meta.origin } : {},
+        ...typeof meta.trigger === 'string' ? { trigger: meta.trigger } : {},
+        ...typeof meta.model === 'string' ? { model: meta.model } : {},
+      },
+    } : {},
   });
 }

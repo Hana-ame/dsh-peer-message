@@ -73,7 +73,43 @@ window.__ModuleLoader__.load({
     };
     const REPLY_MODES = ['off', 'manual', 'auto'];
     const PERMISSION_MODES = ['deny-all', 'read', 'write', 'readwrite', 'auto'];
+    // 消息来源标记（与 Host reply-core.js 保持同步）：
+    //   [自动回复] …  = 模型生成的自动回复（自动模式或人工批准后发送）
+    //   [AI] …        = 模型通过 Agent / pm_send 工具发送
+    //   普通文本      = 人类输入。接收端解析后剥离标记，改由 UI 徽标区分。
     const AUTO_REPLY_PREFIX = '[自动回复] ';
+    const AI_AGENT_PREFIX = '[AI] ';
+    const MANUAL_APPROVAL_MARKER = '[人工批准] ';
+    const MODEL_TEXT_PREFIXES = [
+      { prefix: AUTO_REPLY_PREFIX, trigger: 'auto' },
+      { prefix: AI_AGENT_PREFIX, trigger: 'agent' },
+    ];
+
+    function modelTextInfo(text) {
+      if (typeof text !== 'string') return { isModel: false, trigger: 'human', display: '' };
+      const leading = text.length - text.trimStart().length;
+      const body = text.slice(leading);
+      for (const { prefix, trigger } of MODEL_TEXT_PREFIXES) {
+        if (!body.startsWith(prefix)) continue;
+        const rest = body.slice(prefix.length).trim();
+        if (trigger === 'auto' && rest.startsWith(MANUAL_APPROVAL_MARKER)) {
+          return { isModel: true, trigger: 'manual', display: rest.slice(MANUAL_APPROVAL_MARKER.length).trim() };
+        }
+        return { isModel: true, trigger, display: rest };
+      }
+      return { isModel: false, trigger: 'human', display: text };
+    }
+
+    function isModelText(text) { return modelTextInfo(text).isModel; }
+
+    // 人类消息没有徽标；模型消息按「谁决定发送」再细分。
+    function originLabel(trigger, from) {
+      const mine = from === 'me';
+      if (trigger === 'manual') return mine ? 'AI · 你已批准' : 'AI · 人工批准';
+      if (trigger === 'agent') return mine ? 'AI · Agent 发送' : 'AI · 对方 Agent';
+      if (trigger === 'auto') return mine ? 'AI · 自动回复' : 'AI · 对方自动回复';
+      return 'AI';
+    }
     const REPLY_MODE_LABELS = { off: '关闭', manual: '手动批准', auto: '全自动' };
     // 选项文案只保留能力描述（“=”右侧），不再重复“只读/只写/全自动”等模式名。
     const REPLY_PERMISSION_LABELS = {
@@ -246,6 +282,11 @@ window.__ModuleLoader__.load({
       '.pm-msg-mine .pm-msg-time{color:inherit;opacity:.72;}',
       '.pm-msg-theirs{align-self:flex-start;background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.12));color:var(--dsw-alias-label-primary,inherit);border-bottom-left-radius:3px;}',
       '.pm-msg-time{font-size:10px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary,inherit));margin-top:3px;}',
+      // 模型来源徽标：人类消息没有，模型消息按决策方式细分。
+      '.pm-msg-model{padding-top:6px;}',
+      '.pm-msg-origin{display:inline-flex;align-items:center;gap:4px;font-size:9px;line-height:1.5;padding:0 5px;border-radius:4px;border:1px solid currentColor;opacity:.72;margin-bottom:4px;white-space:nowrap;}',
+      '.pm-msg-mine .pm-msg-origin{opacity:.85;}',
+      '.pm-msg-origin .pm-origin-icon{font-weight:700;letter-spacing:.02em;}',
       '.pm-chat-input{padding:12px 20px;border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.15));display:flex;gap:8px;align-items:flex-end;}',
       '.pm-chat-textarea{flex:1;min-height:40px;max-height:120px;padding:8px 12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.25));background:var(--dsw-specific-input-major,var(--dsw-alias-bg-layer-1,transparent));color:var(--dsw-alias-label-primary,inherit);font-size:13px;resize:none;outline:none;font-family:inherit;}',
       '.pm-chat-textarea:focus{border-color:var(--dsw-alias-brand-primary,inherit);}',
@@ -314,7 +355,9 @@ window.__ModuleLoader__.load({
       '.pm-warn{font-size:10px;line-height:1.6;color:var(--dsw-alias-state-error-primary,#ef4444);margin-top:4px;}',
       '.pm-modal-section-title{font-size:12px;font-weight:600;margin:4px 0 8px;padding-top:8px;border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.15));}',
       '.pm-pending-item{border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.25));border-radius:8px;padding:8px 10px;margin-bottom:8px;background:var(--dsw-alias-bg-layer-2,transparent);}',
-      '.pm-pending-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:10px;color:var(--dsw-alias-label-secondary,inherit);}',
+      '.pm-pending-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:10px;color:var(--dsw-alias-label-secondary,inherit);flex-wrap:wrap;}',
+      '.pm-pending-origin{display:inline-flex;align-items:center;gap:4px;font-size:9px;padding:0 5px;border-radius:4px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);color:var(--dsw-alias-state-warning-primary,#f59e0b);}',
+      '.pm-pending-subhead{font-size:10px;color:var(--dsw-alias-label-secondary,inherit);margin-top:2px;}',
       '.pm-pending-text{font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:110px;overflow-y:auto;margin:6px 0;color:var(--dsw-alias-label-primary,inherit);}',
       '.pm-pending-btns{display:flex;gap:6px;justify-content:flex-end;}',
       '.pm-btn.small{padding:4px 10px;font-size:11px;flex:none;}',
@@ -810,20 +853,26 @@ window.__ModuleLoader__.load({
           // 攻防加固：清洗并截断入站文本（防超大 payload / 控制字符注入）。
           const text = sanitizeText(data);
           if (!text) return; // 空或全控制字符 → 丢弃
+          // 来源标记解析：AI 标记从显示文本里剥离，改由消息徽标表达。
+          const info = modelTextInfo(text);
+          const display = info.isModel ? info.display : text;
+          const origin = info.isModel ? 'model' : 'human';
           this.update(prev => {
             const idx = prev.friends.findIndex(f => f.id === remoteId);
             if (idx < 0) return prev; // 非好友（或已删除）：丢弃
             const friends = prev.friends.slice();
             friends[idx] = Object.assign({}, friends[idx], {
-              lastMsg: text, lastTs: Date.now(),
+              lastMsg: display, lastTs: Date.now(),
+              lastOrigin: origin, lastTrigger: info.trigger,
               unread: (friends[idx].unread || 0) + 1, online: true,
             });
-            const msgs = (prev.messages[remoteId] || []).concat([{ from: 'them', text, ts: Date.now() }]);
+            const msgs = (prev.messages[remoteId] || []).concat([{ from: 'them', text: display, ts: Date.now(), origin, trigger: info.trigger }]);
             const messages = Object.assign({}, prev.messages);
             messages[remoteId] = msgs;
             return Object.assign({}, prev, { friends, messages });
           });
           // 好友文本入站 → 交给 Host 回调管线（关闭/全不允许等策略在 Host 再校验）。
+          // 模型标记消息不会再次触发自动回复（防 AI 互刷）。
           if (this.state.friends.some(f => f.id === remoteId)) this.maybeRequestReply(remoteId, text);
         } else if (data && typeof data === 'object') {
           if (data.type === 'hello') {
@@ -910,33 +959,50 @@ window.__ModuleLoader__.load({
         const target = item && item.to;
         // 攻防加固：host 队列可能被任意本地进程写入，投递前必须校验。
         if (!target || !isValidPeerId(target)) return; // 恶意/畸形 id：丢弃
-        const safeText = sanitizeText(item.text);
-        if (!safeText) return;
+        const rawText = sanitizeText(item.text);
+        if (!rawText) return;
         const tries = ((item.tries || 0) + 1);
         this.ensureFriend(target); // agent 可向任意合法 id 发消息
+
+        // 出站队列只由 agent 侧写入（pm_send 工具 / 自动回复 runner），因此
+        // 无 meta 的旧队列项也按模型来源处理；带 [AI] 标记的则说明是 Agent 消息。
+        const info = modelTextInfo(rawText);
+        const meta = item.meta && typeof item.meta === 'object' && !Array.isArray(item.meta) ? item.meta : {};
+        // outbox 只由 agent 侧写入：旧队列项（无 meta）也按模型来源处理，
+        // 除非显式标注 origin:'human'。
+        const isModel = meta.origin === 'model' || info.isModel || meta.origin === undefined;
+        const trigger = !isModel ? 'human'
+          : (meta.trigger === 'manual' || meta.trigger === 'auto' || meta.trigger === 'agent') ? meta.trigger
+          : info.trigger === 'auto' ? 'auto'
+          : 'agent'; // 无 meta 且无文本标记的 outbox 项 = pm_send Agent 消息
+
+        const display = info.isModel ? info.display : rawText;
+        // 旧版工具/runner 写队列时可能没带标记：发送前补上 [AI]，让对端也能区分。
+        const wireText = isModel && !info.isModel ? AI_AGENT_PREFIX + rawText : rawText;
+
         const conn = this.conns[target];
         if (!conn || !conn.open) {
           this.connectTo(target, { silent: true });
           // 对方不在线：放回队列（带上重试计数），超过上限则放弃。
-          if (tries < MAX_DELIVERY_TRIES) outboxPush(Object.assign({}, item, { text: safeText, tries }));
+          if (tries < MAX_DELIVERY_TRIES) outboxPush(Object.assign({}, item, { text: rawText, tries }));
           else this.showToast('P2P 消息多次投递失败，已放弃');
           return;
         }
         try {
-          conn.send(safeText);
+          conn.send(wireText);
         } catch (e) {
-          if (tries < MAX_DELIVERY_TRIES) outboxPush(Object.assign({}, item, { text: safeText, tries }));
+          if (tries < MAX_DELIVERY_TRIES) outboxPush(Object.assign({}, item, { text: rawText, tries }));
           else this.showToast('P2P 消息多次投递失败，已放弃');
           return;
         }
         this.update(prev => {
-          const msgs = (prev.messages[target] || []).concat([{ from: 'me', text: safeText, ts: Date.now() }]);
-          const friends = prev.friends.map(f => f.id === target ? Object.assign({}, f, { lastMsg: safeText, lastTs: Date.now() }) : f);
+          const msgs = (prev.messages[target] || []).concat([{ from: 'me', text: display, ts: Date.now(), origin: isModel ? 'model' : 'human', trigger }]);
+          const friends = prev.friends.map(f => f.id === target ? Object.assign({}, f, { lastMsg: display, lastTs: Date.now(), lastOrigin: isModel ? 'model' : 'human', lastTrigger: trigger }) : f);
           const messages = Object.assign({}, prev.messages);
           messages[target] = msgs;
           return Object.assign({}, prev, { friends, messages });
         });
-        this.showToast('已投递 agent 消息');
+        this.showToast(trigger === 'auto' ? '已投递自动回复' : trigger === 'manual' ? '已投递已批准的回复' : '已投递 agent 消息');
       },
 
       // ── 自动回复（Host 回气管线） ─────────────────────────────────────
@@ -1038,7 +1104,7 @@ window.__ModuleLoader__.load({
         if (reply.mode === 'off') return;
         const clean = typeof text === 'string' ? text.trim() : '';
         if (!clean) return;
-        if (clean.startsWith(AUTO_REPLY_PREFIX)) return; // 对方也是自动回复：不再回调，避免互刷
+        if (isModelText(clean)) return; // 对方也是模型/自动回复：不再回调，避免 AI 互刷
         const friend = this.state.friends.find(f => f.id === peerId);
         fetch('/api/pm-reply/request', {
           method: 'POST',
@@ -1100,8 +1166,8 @@ window.__ModuleLoader__.load({
           return false;
         }
         this.update(prev => {
-          const msgs = (prev.messages[id] || []).concat([{ from: 'me', text, ts: Date.now() }]);
-          const friends = prev.friends.map(f => f.id === id ? Object.assign({}, f, { lastMsg: text, lastTs: Date.now() }) : f);
+          const msgs = (prev.messages[id] || []).concat([{ from: 'me', text, ts: Date.now(), origin: 'human', trigger: 'human' }]);
+          const friends = prev.friends.map(f => f.id === id ? Object.assign({}, f, { lastMsg: text, lastTs: Date.now(), lastOrigin: 'human', lastTrigger: 'human' }) : f);
           const messages = Object.assign({}, prev.messages);
           messages[id] = msgs;
           return Object.assign({}, prev, { friends, messages });
@@ -1283,9 +1349,10 @@ window.__ModuleLoader__.load({
             ? h('div', { className: 'pm-hint' }, '暂无待批准回复。收到好友消息且回复模式为「手动批准」时会出现在这里。')
             : items.map(item => h('div', { className: 'pm-pending-item', key: item.id },
                 h('div', { className: 'pm-pending-head' },
+                  h('span', { className: 'pm-pending-origin' }, 'AI · 模型生成 · 待批准'),
                   h('span', null, '来自 ' + (item.peerName || shortId(item.peerId)) + ' · ' + fmtTime(item.ts)),
-                  h('span', null, '权限：' + (REPLY_PERMISSION_LABELS[item.permission] || item.permission)),
                 ),
+                h('div', { className: 'pm-pending-subhead' }, '权限：' + (REPLY_PERMISSION_LABELS[item.permission] || item.permission)),
                 h('div', { className: 'pm-pending-text' }, item.text),
                 h('div', { className: 'pm-pending-btns' },
                   h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.rejectReply(item.id) }, '忽略'),
@@ -1534,7 +1601,8 @@ window.__ModuleLoader__.load({
                   h('div', { className: 'pm-avatar', style: { background: avatarColor(f.id) } }, (displayName(f) || '?').slice(0, 1).toUpperCase()),
                   h('div', { className: 'pm-friend-info' },
                     h('div', { className: 'pm-friend-name', title: f.alias ? displayName(f) + ' · ' + f.id : (f.name && f.name !== shortId(f.id) ? f.name + ' · ' + f.id : f.id) }, displayName(f)),
-                    h('div', { className: 'pm-friend-last' }, f.lastMsg || (f.online ? '在线' : '离线')),
+                    h('div', { className: 'pm-friend-last' },
+                      f.lastMsg ? ((f.lastOrigin === 'model' ? 'AI｜' : '') + f.lastMsg) : (f.online ? '在线' : '离线')),
                   ),
                   f.unread > 0 ? h('span', { className: 'pm-unread' }, f.unread > 99 ? '99+' : f.unread) : null,
                   h('span', { className: 'pm-status-dot', style: { marginLeft: 'auto', background: f.online ? 'var(--dsw-alias-state-success-primary,#22c55e)' : 'var(--dsw-alias-state-idle-primary,rgba(127,127,127,.5))' } }),
@@ -1559,8 +1627,15 @@ window.__ModuleLoader__.load({
               h('div', { className: 'pm-chat-messages', ref: chatRef },
                 activeMsgs.length === 0
                   ? h('div', { style: { textAlign: 'center', color: 'var(--dsw-alias-label-secondary,inherit)', padding: '40px', fontSize: 12 } }, '开始聊天吧')
-                  : activeMsgs.map((m, i) => h('div', { key: i, className: 'pm-msg ' + (m.from === 'me' ? 'pm-msg-mine' : 'pm-msg-theirs') },
-                      h('div', null, m.text),
+                  : activeMsgs.map((m, i) => h('div', {
+                      key: i,
+                      className: 'pm-msg ' + (m.from === 'me' ? 'pm-msg-mine' : 'pm-msg-theirs') + (m.origin === 'model' ? ' pm-msg-model' : ''),
+                    },
+                      m.origin === 'model' ? h('div', { className: 'pm-msg-origin' },
+                        h('span', { className: 'pm-origin-icon' }, 'AI'),
+                        h('span', null, originLabel(m.trigger, m.from)),
+                      ) : null,
+                      h('div', { className: 'pm-msg-body' }, m.text),
                       h('div', { className: 'pm-msg-time' }, fmtTime(m.ts)),
                     )),
               ),

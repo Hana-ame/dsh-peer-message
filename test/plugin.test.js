@@ -78,6 +78,15 @@ test('pushItem appends with defaults and a timestamp', () => {
   assert.equal(typeof outbox[0].ts, 'number');
 });
 
+test('pushItem preserves validated meta and drops unknown fields', () => {
+  outbox.length = 0;
+  pushItem({ id: 'm-3', to: 'dsh-pm-aaaabbbb-cccccc', text: 'x', meta: { origin: 'model', trigger: 'manual', model: 'm1', evil: 'ignored' } });
+  assert.deepEqual(outbox[0].meta, { origin: 'model', trigger: 'manual', model: 'm1' });
+  outbox.length = 0;
+  pushItem({ id: 'm-4', to: 'dsh-pm-aaaabbbb-cccccc', text: 'y', meta: 'evil' });
+  assert.equal(outbox[0].meta, undefined);
+});
+
 test('pushItem preserves a caller-supplied timestamp', () => {
   outbox.length = 0;
   pushItem({ id: 'm-2', to: 'dsh-pm-aaaabbbb-cccccc', text: 'x', ts: 12345 });

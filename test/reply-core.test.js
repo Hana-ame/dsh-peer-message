@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   AUTO_REPLY_PREFIX,
+  AI_AGENT_PREFIX,
   DEFAULT_REPLY_CONFIG,
   MAX_INBOUND_TEXT,
   PERMISSION_MODES,
@@ -12,10 +13,15 @@ import {
   createRateGate,
   decideToolCall,
   isAutoReplyText,
+  isModelText,
+  MANUAL_APPROVAL_MARKER,
+  modelTextInfo,
   permissionPolicyFor,
   sanitizeInboundText,
   sanitizeReplyText,
+  wrapAgentMessage,
   wrapAutoReply,
+  wrapManualReply,
 } from '../reply-core.js';
 
 // ── config coercion ────────────────────────────────────────────────────────
@@ -143,6 +149,34 @@ test('reply text: auto marker wraps once and is recognized', () => {
   assert.equal(isAutoReplyText('你好'), false);
   assert.equal(isAutoReplyText(null), false);
   assert.equal(wrapAutoReply(''), '');
+});
+
+test('origin marker: modelTextInfo classifies human/auto/agent and strips the marker', () => {
+  const human = modelTextInfo('你好');
+  assert.deepEqual(human, { isModel: false, trigger: 'human', display: '你好' });
+  const auto = modelTextInfo(AUTO_REPLY_PREFIX + '收到！');
+  assert.deepEqual(auto, { isModel: true, trigger: 'auto', display: '收到！' });
+  const agent = modelTextInfo('  ' + AI_AGENT_PREFIX + '查询结果如下');
+  assert.deepEqual(agent, { isModel: true, trigger: 'agent', display: '查询结果如下' });
+  assert.equal(isModelText(AUTO_REPLY_PREFIX + 'x'), true);
+  assert.equal(isModelText(AI_AGENT_PREFIX + 'x'), true);
+  assert.equal(isModelText('x'), false);
+  assert.equal(isModelText(null), false);
+});
+
+test('origin marker: wrapAgentMessage prefixes [AI] and both wrappers sanitize', () => {
+  assert.equal(wrapAgentMessage('结果'), AI_AGENT_PREFIX + '结果');
+  assert.equal(wrapAgentMessage(''), '');
+  assert.equal(modelTextInfo(wrapAgentMessage('a\u0000b')).display, 'ab');
+});
+
+test('origin marker: 人工批准的回复带内层标记，解析为 trigger=manual', () => {
+  const wired = wrapManualReply('收到');
+  assert.equal(wired, AUTO_REPLY_PREFIX + MANUAL_APPROVAL_MARKER + '收到');
+  // 旧客户端仍以 [自动回复] 开头做循环守卫
+  assert.equal(wired.startsWith(AUTO_REPLY_PREFIX), true);
+  assert.deepEqual(modelTextInfo(wired), { isModel: true, trigger: 'manual', display: '收到' });
+  assert.equal(modelTextInfo(AUTO_REPLY_PREFIX + '自动').trigger, 'auto');
 });
 
 test('inbound sanitation: non-strings rejected, controls stripped, bounded', () => {

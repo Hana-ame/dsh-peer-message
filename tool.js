@@ -90,7 +90,9 @@ export function apply(ctx) {
       if (!text) return { queued: false, messageId: '' };
       const messageId =
         'm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
-      pushItem({ id: messageId, to: args.to, text });
+      // meta.origin=model / trigger=agent：浏览器端据此把这条消息标成 AI Agent，
+      // 入站方也会收到带 [AI] 标记的文本，不会误当成人类发言。
+      pushItem({ id: messageId, to: args.to, text, meta: { origin: 'model', trigger: 'agent' } });
       return { queued: true, messageId };
     },
   });

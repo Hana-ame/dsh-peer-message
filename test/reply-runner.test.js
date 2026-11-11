@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createReplyRunner } from '../reply-runner.js';
-import { AUTO_REPLY_PREFIX } from '../reply-core.js';
+import { AUTO_REPLY_PREFIX, AI_AGENT_PREFIX, MANUAL_APPROVAL_MARKER } from '../reply-core.js';
 
 /** Minimal synchronous event bus matching `ctx.on`'s disposer contract. */
 function makeBus() {
@@ -134,7 +134,8 @@ test('runner: malformed/empty text and auto-marker messages are skipped', () => 
   assert.equal(runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: '   ', config: CONFIG }).reason, 'empty');
   assert.equal(runner.request({ peerId: '', text: 'hi', config: CONFIG }).reason, 'bad-peer');
   const marked = AUTO_REPLY_PREFIX + '已经回复过了';
-  assert.equal(runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: marked, config: CONFIG }).reason, 'auto-marker');
+  assert.equal(runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: marked, config: CONFIG }).reason, 'model-marker');
+  assert.equal(runner.request({ peerId: 'dsh-pm-aaaaaaaa-2', text: AI_AGENT_PREFIX + 'agent 发过了', config: CONFIG }).reason, 'model-marker');
   assert.equal(controller.prompts.length, 0);
 });
 
@@ -151,6 +152,8 @@ test('runner: manual mode parks the request until approved', async () => {
   const approved = runner.approve(result.pendingId);
   assert.equal(approved.ok, true);
   await waitFor(() => outbox.length === 1);
+  assert.equal(outbox[0].meta.trigger, 'manual', '人工批准的回复必须带 manual trigger');
+  assert.equal(outbox[0].text, AUTO_REPLY_PREFIX + MANUAL_APPROVAL_MARKER + '好的，收到。', '人工批准 wire 标记错误');
   assert.equal(runner.snapshot().pending.length, 0);
   assert.equal(runner.snapshot().recent[0].status, 'sent');
 });
@@ -174,6 +177,7 @@ test('runner: auto mode runs one turn and queues a marked reply to the sender', 
   await waitFor(() => outbox.length === 1);
   assert.equal(outbox[0].to, 'dsh-pm-aaaaaaaa-1');
   assert.equal(outbox[0].text, AUTO_REPLY_PREFIX + '你好呀！');
+  assert.deepEqual(outbox[0].meta, { origin: 'model', trigger: 'auto', model: 'deepseek-v4-flash' });
   const snap = runner.snapshot();
   assert.equal(snap.running.length, 0);
   assert.equal(snap.recent[0].status, 'sent');

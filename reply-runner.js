@@ -30,10 +30,12 @@ import {
   createRateGate,
   decideToolCall,
   isAutoReplyText,
+  isModelText,
   permissionPolicyFor,
   sanitizeInboundText,
   sanitizeReplyText,
   wrapAutoReply,
+  wrapManualReply,
 } from './reply-core.js';
 
 /** How long one reply turn may run before it is abandoned. */
@@ -255,9 +257,22 @@ export function createReplyRunner(deps) {
       const replyText = await promptAndCollect(session.sessionId, promptText, 'pm-reply-' + uuid());
       const clean = sanitizeReplyText(replyText);
       if (!clean) throw new Error('模型没有生成可发送的回复');
-      const outgoing = wrapAutoReply(clean);
+      // 人工批准 vs 自动决定在 wire 上也区分：前者多一个 [人工批准] 内层标记。
+      const outgoing = record.trigger === 'manual' ? wrapManualReply(clean) : wrapAutoReply(clean);
       if (disposed) throw new Error('插件已卸载，取消自动回复');
-      deps.pushOutbox({ id: 'pm-auto-' + uuid(), to: record.peerId, text: outgoing, ts: now() });
+      deps.pushOutbox({
+        id: 'pm-auto-' + uuid(),
+        to: record.peerId,
+        text: outgoing,
+        ts: now(),
+        // origin/trigger 让浏览器端区分「模型自动决定」与「人工批准后发送」；
+        // text 仍带 [自动回复] 标记，对方也能据此判定为 AI 消息。
+        meta: {
+          origin: 'model',
+          trigger: record.trigger === 'manual' ? 'manual' : 'auto',
+          model: record.config.model || '',
+        },
+      });
       entry.status = 'sent';
       entry.reply = outgoing;
       entry.finishedAt = now();
@@ -291,7 +306,7 @@ export function createReplyRunner(deps) {
       if (config.mode === 'off') return { accepted: false, reason: 'off' };
       const text = sanitizeInboundText(input && input.text);
       if (!text) return { accepted: false, reason: 'empty' };
-      if (isAutoReplyText(text)) return { accepted: false, reason: 'auto-marker' };
+      if (isModelText(text)) return { accepted: false, reason: 'model-marker' };
       const peerId = typeof (input && input.peerId) === 'string' ? input.peerId.trim() : '';
       if (!peerId) return { accepted: false, reason: 'bad-peer' };
       const gate = rate.check(peerId, now());
@@ -303,6 +318,8 @@ export function createReplyRunner(deps) {
         peerName: typeof input.peerName === 'string' ? input.peerName.slice(0, 80) : '',
         text,
         config,
+        // auto 模式由模型直接决定；manual 由人批准后才运行。
+        trigger: config.mode === 'auto' ? 'auto' : 'manual',
         ts: now(),
       };
 

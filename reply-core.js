@@ -35,6 +35,19 @@ export const MAX_INBOUND_TEXT = 4096;
 export const MAX_REPLY_OUTPUT = 2000;
 /** Visible marker so a human knows the message is AI-generated. */
 export const AUTO_REPLY_PREFIX = '[自动回复] ';
+/** Visible marker for model-authored messages sent by the preset's pm_send tool. */
+export const AI_AGENT_PREFIX = '[AI] ';
+/**
+ * Inner marker appended after AUTO_REPLY_PREFIX for a reply that a human
+ * approved. Keeping it inside the auto prefix means older clients' loop guard
+ * still matches; new clients read it and show "人工批准" instead of "自动".
+ */
+export const MANUAL_APPROVAL_MARKER = '[人工批准] ';
+/** Ordered wire markers; first match wins. */
+export const MODEL_TEXT_PREFIXES = [
+  { prefix: AUTO_REPLY_PREFIX, trigger: 'auto' },
+  { prefix: AI_AGENT_PREFIX, trigger: 'agent' },
+];
 /** Cap on queued manual approvals. */
 export const MAX_PENDING_REPLIES = 20;
 /** Cap on remembered finished runs for the client status list. */
@@ -148,7 +161,38 @@ export function sanitizeReplyText(text, max = MAX_REPLY_OUTPUT) {
   return clean.slice(0, max);
 }
 
-/** Whether a text already carries the auto-reply marker (loop guard). */
+/**
+ * Classify a wire message by its model-origin marker.
+ *
+ * Plain strings are human messages; `[自动回复] ` marks an agent auto-reply
+ * (auto or human-approved) and `[AI] ` marks a model-authored `pm_send`
+ * message. The display text has the marker stripped so the UI can render a
+ * structured badge instead of raw prefix text.
+ * @param {unknown} text
+ * @returns {{isModel: boolean, trigger: 'human'|'auto'|'agent', display: string}}
+ */
+export function modelTextInfo(text) {
+  if (typeof text !== 'string') return { isModel: false, trigger: 'human', display: '' };
+  const leading = text.length - text.trimStart().length;
+  const body = text.slice(leading);
+  for (const { prefix, trigger } of MODEL_TEXT_PREFIXES) {
+    if (!body.startsWith(prefix)) continue;
+    const rest = body.slice(prefix.length).trim();
+    // 人工批准的自动回复：trigger 细化成 manual，展示前剥掉内层标记。
+    if (trigger === 'auto' && rest.startsWith(MANUAL_APPROVAL_MARKER)) {
+      return { isModel: true, trigger: 'manual', display: rest.slice(MANUAL_APPROVAL_MARKER.length).trim() };
+    }
+    return { isModel: true, trigger, display: rest };
+  }
+  return { isModel: false, trigger: 'human', display: text };
+}
+
+/** Whether a text carries any model-origin marker (loop guard). */
+export function isModelText(text) {
+  return modelTextInfo(text).isModel;
+}
+
+/** Whether a text already carries the auto-reply marker (compat helper). */
 export function isAutoReplyText(text) {
   return typeof text === 'string' && text.trimStart().startsWith(AUTO_REPLY_PREFIX.trimStart());
 }
@@ -157,6 +201,21 @@ export function isAutoReplyText(text) {
 export function wrapAutoReply(text) {
   const clean = sanitizeReplyText(text);
   return clean ? AUTO_REPLY_PREFIX + clean : '';
+}
+
+/**
+ * Prefix a human-approved auto reply: `[自动回复] [人工批准] …`.
+ * @param {unknown} text
+ */
+export function wrapManualReply(text) {
+  const clean = sanitizeReplyText(text);
+  return clean ? AUTO_REPLY_PREFIX + MANUAL_APPROVAL_MARKER + clean : '';
+}
+
+/** Prefix a model-authored pm_send message with the visible AI marker. */
+export function wrapAgentMessage(text) {
+  const clean = sanitizeReplyText(text);
+  return clean ? AI_AGENT_PREFIX + clean : '';
 }
 
 /**
