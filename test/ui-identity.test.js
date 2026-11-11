@@ -257,7 +257,7 @@ test('identity: 重连好友严格限流，避免信令洪泛把自己踢下线'
   assert.ok(NET.includes('const RECONNECT_BATCH = 3'), '缺少重连批量上限');
   assert.ok(NET.includes('const RECONNECT_GAP_MS = 1500'), '缺少重连间隔');
   assert.ok(NET.includes('if (!net.peer || !net.peer.open) return;'), '未确认信令就绪再重连');
-  assert.ok(NET.includes('f.online !== false'), '不应给从未连上的假 id 反复拨号');
+  assert.ok(NET.includes('f.online === true'), '只给确认在线过的好友拨号');
   const block = NET.slice(NET.indexOf('function reconnectAll()'), NET.indexOf('function reconnectAll()') + 900);
   assert.ok(block.includes('.slice(0, RECONNECT_BATCH)'), '未限制批量');
 });

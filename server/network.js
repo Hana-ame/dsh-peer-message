@@ -363,8 +363,11 @@ export function createNetwork(options) {
   const RECONNECT_GAP_MS = 1500;
   function reconnectAll() {
     if (!net.peer || !net.peer.open) return;
+    // 只给「确认在线过」的好友拨号（online === true）。历史脏数据（测试用假 id）
+    // 的 online 为 undefined，绝不能拿来拨号：一次打开会打出几十个
+    // peer-unavailable，直接把信令连接打掉。
     const targets = net.state.friends
-      .filter((f) => f && !net.conns.has(f.id) && f.online !== false)
+      .filter((f) => f && !net.conns.has(f.id) && f.online === true)
       .slice(0, RECONNECT_BATCH);
     targets.forEach((friend, index) => {
       const timer = setTimeout(() => {
@@ -416,16 +419,18 @@ export function createNetwork(options) {
 
   async function initPeer() {
     if (!net.started) return;
-    // 互斥：同一时刻只允许一个 initPeer 在飞。否则 start/retryPeer/rotate/
-    // scheduleRetry/看门狗 各自 new 一个 Peer，用同一个确定性 ID 同时连信令，
-    // 会把自己的会话踢掉，表现为永久的 unavailable-id。
+    // 互斥必须是「同步占位」：调用点都在同一 tick 里，若等到 await 之后才置位，
+    // 多个调用会同时通过检查 → 同时 new Peer（日志里 creating Peer 连续两条）。
     if (net.peerInitBusy) return;
     net.peerInitBusy = true;
     try {
       await initPeerInner();
-    } finally {
+    } catch (error) {
       net.peerInitBusy = false;
+      throw error;
     }
+    // 连接建立或彻底失败后由事件回调/下面的兜底释放；这里给一个保守的兜底。
+    setTimeout(() => { net.peerInitBusy = false; }, 3000).unref?.();
   }
 
   async function initPeerInner() {
