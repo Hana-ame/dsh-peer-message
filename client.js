@@ -4,11 +4,10 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
 
-    // ── PeerJS / QR 库动态加载 ──────────────────────────────────────────
-    const PEERJS_CDN = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js';
+    // ── QR 库动态加载（PeerJS/WebRTC 已移到 Host 进程，浏览器不再加载） ──
     const QRCODE_CDN = 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js';
+    const IDENTITY_ALGORITHM = 'ECDSA P-256 / SHA-256（密钥存于 Host 本地文件 0600）';
 
-    let peerjsPromise = null;
     let qrcodePromise = null;
 
     function loadScript(src) {
@@ -23,13 +22,6 @@ window.__ModuleLoader__.load({
       });
     }
 
-    function loadPeerJS() {
-      if (!peerjsPromise) {
-        peerjsPromise = loadScript(PEERJS_CDN).then(() => window.Peer || window.peerjs?.Peer);
-      }
-      return peerjsPromise;
-    }
-
     function loadQRCode() {
       if (!qrcodePromise) {
         qrcodePromise = loadScript(QRCODE_CDN).then(() => window.qrcode);
@@ -39,7 +31,7 @@ window.__ModuleLoader__.load({
 
     // ── 常量与状态 ──────────────────────────────────────────────────────
     const PANEL_ID = 'peer-message';
-    const STORAGE_KEY = 'dsh-peer-message-state-v1';
+    const STORAGE_KEY = 'dsh-peer-message-state-v1'; // 仅用于读取旧版数据做一次性迁移
 
     // ── 安全边界（攻防加固） ────────────────────────────────────────────
     // 最大单条文本长度；超过则截断，防止超大 payload 撑爆内存/渲染。
@@ -148,9 +140,20 @@ window.__ModuleLoader__.load({
       },
     };
 
-    // ── 持久化 ──────────────────────────────────────────────────────────
-    // 主 state：{ friends, messages, settings }。settings 是后台运行开关
-    // （广播/接收新连接），随 state 一起持久化——面板关闭、页面重启都不丢。
+    // ── Host 权威状态（浏览器只做视图） ─────────────────────────────────
+    // 身份密钥、好友/消息/设置、WebRTC 连接全部由 Host 进程持有并落盘：
+    //   ~/.dsh/peer-message/identity.json  (0600, ECDSA P-256 私钥)
+    //   ~/.dsh/peer-message/state.json     (0600, 好友/消息/设置)
+    // 页面只轮询 /api/pm-net/state 并 POST /api/pm-net/action，因此关闭标签页
+    // 不会让 P2P 掉线，也不可能出现两个标签页抢同一个 Peer ID。
+    const API_STATE = '/api/pm-net/state';
+    const API_ACTION = '/api/pm-net/action';
+    const API_MIGRATE = '/api/pm-net/migrate';
+    // 旧版浏览器本地存储的 key：一次性迁移到 Host 文件后停用。
+    const LEGACY_STATE_KEY = 'dsh-peer-message-state-v1';
+    const LEGACY_IDENTITY_KEY = 'dsh-peer-message-identity-v1';
+    const LEGACY_MIGRATED_KEY = 'dsh-peer-message-host-migrated-v1';
+
     function coerceSettings(raw) {
       const d = DEFAULT_SETTINGS;
       return {
@@ -161,225 +164,37 @@ window.__ModuleLoader__.load({
       };
     }
 
-    function loadState() {
-      let st = { friends: [], messages: {} };
+    // 旧版 localStorage 数据（迁移用）：读不到就返回 null。
+    function readLegacyState() {
       try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) st = JSON.parse(raw) || st;
-      } catch (e) { /* ignore */ }
-      if (!Array.isArray(st.friends)) st.friends = [];
-      if (!st.messages || typeof st.messages !== 'object') st.messages = {};
-      // 迁移：旧版开关存独立 key（dsh-peer-message-settings-v1），并入主 state 后清掉
-      let migrated = null;
+        const raw = localStorage.getItem(LEGACY_STATE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || !Array.isArray(parsed.friends)) return null;
+        return parsed;
+      } catch (e) { return null; }
+    }
+
+    function readLegacyIdentity() {
       try {
-        const raw = localStorage.getItem('dsh-peer-message-settings-v1');
-        if (raw) { migrated = JSON.parse(raw); localStorage.removeItem('dsh-peer-message-settings-v1'); }
-      } catch (e) { /* ignore */ }
-      st.settings = coerceSettings(migrated || st.settings);
-      return st;
+        const raw = localStorage.getItem(LEGACY_IDENTITY_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || !parsed.privateJwk || !parsed.pubJwk) return null;
+        return parsed;
+      } catch (e) { return null; }
     }
 
-    function saveState(state) {
-      try {
-        // 只持久化 friends/messages/settings 三个白名单字段，其余内存态丢弃
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({
-          friends: state.friends,
-          messages: state.messages,
-          settings: state.settings,
-        }));
-      } catch (e) { /* ignore */ }
+    function markLegacyMigrated() {
+      try { localStorage.setItem(LEGACY_MIGRATED_KEY, '1'); } catch (e) { /* ignore */ }
     }
 
-    // ── 本地身份：ECDSA P-256 公私钥 ────────────────────────────────────
-    // Peer ID 由公钥指纹派生（dsh-pm-<40 hex>），身份由本机私钥决定，不再
-    // 依赖随机字符串。私钥只存本机 localStorage；hello 握手携带公钥 + 对
-    // (id|name|fp) 的签名，对方据此验证「PeerJS ID ↔ 公钥」绑定。
-    const IDENTITY_KEY = 'dsh-peer-message-identity-v1';
-    const LEGACY_PEER_ID_KEY = 'dsh-peer-message-peer-id-v1';
-    const IDENTITY_FP_HEX_LEN = 40; // 160-bit 指纹作为 peer-id body（总长 47）
-    const HELLO_VERSION = 1;
-    const IDENTITY_ALGORITHM = 'ECDSA P-256 / SHA-256';
-    const PUB_KEY_MAX_LEN = 200;
-    const HELLO_SIG_MAX_LEN = 200;
-
-    // ── 单连接持有（多标签页协调）──────────────────────────────────────
-    // PeerJS 同一 ID 只允许一个在线连接。Peer ID 完全由公钥派生（确定性），
-    // 因此不再随机换 ID；同一浏览器多标签页通过 Web Locks 选主：只有一个标签
-    // 页持有 PeerJS 连接，其余标签页通过 BroadcastChannel 转发操作、镜像状态。
-    const NETWORK_LOCK_NAME = 'dsh-peer-message-network-owner';
-    const NET_CHANNEL_NAME = 'dsh-peer-message-net-v1';
-    const IDENTITY_LOCK_NAME = 'dsh-peer-message-identity';
-
-    function bytesToBase64(bytes) {
-      let binary = '';
-      const view = new Uint8Array(bytes);
-      for (let i = 0; i < view.length; i++) binary += String.fromCharCode(view[i]);
-      return btoa(binary);
-    }
-    function base64ToBytes(text) {
-      const binary = atob(text);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      return bytes;
-    }
-    function utf8Bytes(text) { return new TextEncoder().encode(text); }
-
-    async function sha256Hex(input) {
-      const data = typeof input === 'string' ? utf8Bytes(input) : input;
-      const digest = await crypto.subtle.digest('SHA-256', data);
-      return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
-    }
-    function publicKeyCanonical(pub) {
-      return 'EC|P-256|' + pub.x + '|' + pub.y;
-    }
-    function helloSignPayload(peerId, name, fingerprint) {
-      // 固定字段顺序的 canonical JSON：双方必须逐字节一致。
-      return JSON.stringify({ v: HELLO_VERSION, id: peerId, fp: fingerprint, name });
-    }
-    function isValidPublicKey(pub) {
-      return !!pub && typeof pub === 'object' && pub.kty === 'EC' && pub.crv === 'P-256'
-        && typeof pub.x === 'string' && pub.x.length > 8 && pub.x.length <= PUB_KEY_MAX_LEN
-        && typeof pub.y === 'string' && pub.y.length > 8 && pub.y.length <= PUB_KEY_MAX_LEN
-        && Object.keys(pub).every(k => k === 'kty' || k === 'crv' || k === 'x' || k === 'y');
-    }
-    async function fingerprintOfPublicKey(pub) {
-      return (await sha256Hex(publicKeyCanonical(pub))).slice(0, IDENTITY_FP_HEX_LEN);
-    }
-    function cryptoIdentityAvailable() {
-      return !!(window.crypto && window.crypto.subtle && typeof window.crypto.subtle.generateKey === 'function');
-    }
-    function randomPeerIdFallback() {
-      return 'dsh-pm-' + Math.random().toString(36).slice(2, 10) + '-' + Date.now().toString(36);
-    }
-    function legacyStablePeerId() {
-      let id = null;
-      try { id = localStorage.getItem(LEGACY_PEER_ID_KEY); } catch (e) { /* ignore */ }
-      if (!id) {
-        id = randomPeerIdFallback();
-        try { localStorage.setItem(LEGACY_PEER_ID_KEY, id); } catch (e) { /* ignore */ }
-      }
-      return id;
-    }
-    async function importIdentityPrivateKey(jwk) {
-      return crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+    function legacyAlreadyMigrated() {
+      try { return localStorage.getItem(LEGACY_MIGRATED_KEY) === '1'; } catch (e) { return false; }
     }
 
-    async function generateIdentity() {
-      const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
-      const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
-      const exported = await crypto.subtle.exportKey('jwk', pair.publicKey);
-      const pubJwk = { kty: 'EC', crv: 'P-256', x: exported.x, y: exported.y };
-      const fingerprint = await fingerprintOfPublicKey(pubJwk);
-      return {
-        v: 1,
-        secured: true,
-        privateJwk,
-        privateKey: pair.privateKey,
-        pubJwk,
-        fingerprint,
-        peerId: PEER_ID_PREFIX + fingerprint,
-        createdAt: Date.now(),
-      };
-    }
-
-    function persistIdentity(identity) {
-      try {
-        localStorage.setItem(IDENTITY_KEY, JSON.stringify({
-          v: 1,
-          privateJwk: identity.privateJwk,
-          pubJwk: identity.pubJwk,
-          fingerprint: identity.fingerprint,
-          peerId: identity.peerId,
-          createdAt: identity.createdAt,
-        }));
-        // 兼容旧代码/排障：把派生 Peer ID 也写进旧 key（不再参与身份生成）。
-        localStorage.setItem(LEGACY_PEER_ID_KEY, identity.peerId);
-      } catch (e) { /* ignore */ }
-    }
-
-    // 多标签页同时首次加载会并发生成不同密钥：用 Web Lock 串行化
-    // 「读 localStorage → 生成 → 持久化」，保证所有标签页得到同一身份。
-    async function loadIdentity() {
-      if (typeof navigator === 'undefined' || !navigator.locks || typeof navigator.locks.request !== 'function') {
-        return loadIdentityUnlocked();
-      }
-      return new Promise((resolve, reject) => {
-        navigator.locks.request(IDENTITY_LOCK_NAME, { mode: 'exclusive' }, async () => {
-          try { resolve(await loadIdentityUnlocked()); } catch (error) { reject(error); }
-        }).catch(reject);
-      });
-    }
-
-    async function loadIdentityUnlocked() {
-      // 非安全上下文（无 crypto.subtle）无法生成/验签密钥：退回旧的随机 Peer ID，
-      // 标记 secured=false，hello 不携带公钥，对端会显示「未验签」。
-      if (!cryptoIdentityAvailable()) {
-        return { v: 0, secured: false, privateJwk: null, privateKey: null, pubJwk: null, fingerprint: '', peerId: legacyStablePeerId(), createdAt: 0 };
-      }
-      let stored = null;
-      try { stored = JSON.parse(localStorage.getItem(IDENTITY_KEY) || 'null'); } catch (e) { stored = null; }
-      if (stored && stored.privateJwk && isValidPublicKey(stored.pubJwk)) {
-        try {
-          const fingerprint = await fingerprintOfPublicKey(stored.pubJwk);
-          const privateKey = await importIdentityPrivateKey(stored.privateJwk);
-          return {
-            v: 1,
-            secured: true,
-            privateJwk: stored.privateJwk,
-            privateKey,
-            pubJwk: stored.pubJwk,
-            fingerprint,
-            peerId: PEER_ID_PREFIX + fingerprint,
-            createdAt: typeof stored.createdAt === 'number' ? stored.createdAt : 0,
-          };
-        } catch (e) { /* 私钥损坏 → 重新生成 */ }
-      }
-      const created = await generateIdentity();
-      persistIdentity(created);
-      return created;
-    }
-
-    async function buildHello(identity, name) {
-      if (!identity || !identity.secured) return { type: 'hello', v: HELLO_VERSION, name, secured: false };
-      const payload = helloSignPayload(identity.peerId, name, identity.fingerprint);
-      const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, identity.privateKey, utf8Bytes(payload));
-      return {
-        type: 'hello',
-        v: HELLO_VERSION,
-        name,
-        fp: identity.fingerprint,
-        pub: identity.pubJwk,
-        sig: bytesToBase64(signature),
-      };
-    }
-
-    // 校验 hello：公钥指纹必须等于 PeerJS ID 派生值，且签名必须匹配。
-    // 返回 {ok, verified, reason, fingerprint, pubKey, name}
-    async function verifyHello(remoteId, data) {
-      if (!data || typeof data !== 'object') return { ok: false, reason: 'bad-hello' };
-      const hasProof = data.fp !== undefined || data.pub !== undefined || data.sig !== undefined;
-      if (!hasProof) {
-        // 旧版客户端：不提供公钥，兼容但标记未验签。
-        return { ok: true, verified: false, reason: 'legacy' };
-      }
-      if (!isValidPublicKey(data.pub)) return { ok: false, reason: 'bad-pub' };
-      if (typeof data.fp !== 'string' || typeof data.sig !== 'string' || data.sig.length === 0 || data.sig.length > HELLO_SIG_MAX_LEN) return { ok: false, reason: 'bad-hello' };
-      if (typeof data.name !== 'string' || data.name.length > MAX_NAME_LEN) return { ok: false, reason: 'bad-name' };
-      const fingerprint = await fingerprintOfPublicKey(data.pub);
-      if (data.fp !== fingerprint || remoteId !== PEER_ID_PREFIX + fingerprint) return { ok: false, reason: 'id-mismatch' };
-      let verifier;
-      try {
-        verifier = await crypto.subtle.importKey('jwk', data.pub, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
-      } catch (e) { return { ok: false, reason: 'bad-pub' }; }
-      let ok = false;
-      try {
-        ok = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, verifier, base64ToBytes(data.sig), utf8Bytes(helloSignPayload(remoteId, data.name, fingerprint)));
-      } catch (e) { ok = false; }
-      if (!ok) return { ok: false, reason: 'bad-signature' };
-      return { ok: true, verified: true, fingerprint, pubKey: data.pub, name: data.name };
-    }
-
-    // 把一条投递失败的消息放回 host 队列（POST 回 /api/pm-outbox）
+    // 把一条投递失败的消息放回 host 队列（POST 回 /api/pm-outbox）。
+    // 正常路径下队列由 Host 进程自己排水，这里只用于 UI 侧补投。
     function outboxPush(item) {
       try {
         fetch('/api/pm-outbox', {
@@ -389,6 +204,7 @@ window.__ModuleLoader__.load({
         }).catch(() => { /* 静默 */ });
       } catch (e) { /* 静默 */ }
     }
+
 
     // ── CSS 样式（仿 QQ/微信，使用主题 token） ──────────────────────────
     const CSS = [
@@ -690,52 +506,43 @@ window.__ModuleLoader__.load({
       });
     }
 
-    // ── 模块级后台服务 ──────────────────────────────────────────────────
-    // 核心修正：PeerJS 加载、Peer 实例、连接监听、入站消息、agent 队列轮询
-    // 全部在模块级单例里，apply() 时即启动——不依赖消息面板是否打开。
-    // 面板只是订阅服务快照的视图；面板不打开也照样收消息、投递 agent 消息。
+    // ── 浏览器侧视图服务 ────────────────────────────────────────────────
+    // 全部权威状态在 Host 进程（server/network.js）：
+    //   - 身份密钥 / Peer ID 在 Host 生成并落盘，页面拿不到私钥；
+    //   - WebRTC 连接由 Host 持有，关掉标签页也不掉线；
+    //   - 好友/消息/设置写在 Host 的 state.json（0600），刷新/换浏览器都在。
+    // 这里只做三件事：轮询快照、渲染、把用户操作 POST 给 Host。
     const pmService = {
-      state: loadState(),          // {friends, messages}，每次变更同步 localStorage
-      myId: '',                    // 本端 PeerJS id（= 公钥指纹派生，identity 就绪后回填）
-      identity: null,              // {secured, peerId, fingerprint, pubJwk, privateKey}
-      identityPromise: null,
+      state: { friends: [], messages: {}, settings: coerceSettings(null) },
+      myId: '',
+      identity: null,              // {secured, fingerprint, peerId}（无私钥）
       identityError: '',
       peerStatus: 'connecting',    // connecting | online | offline | error | closed
       peerError: '',
-      peerErrorType: '',           // PeerJS error.type，如 unavailable-id / network
-      conns: {},                   // id -> DataConnection
-      peer: null,
-      pollTimer: null,
-      reconnectTimer: null,
-      polling: false,
-      // 自动回复（后台）：pending/running/recent 是 Host 侧内存态，面板只是视图。
+      peerErrorType: '',
+      role: 'host',                // 连接由 DSH Host 进程持有
+      identityFile: '',
+      stateFile: '',
+      // 自动回复 UI 状态（Host 侧 reply-runner 的内存态）
       replyCatalog: null,
       replyPending: [],
       replyRunning: [],
       replyRecent: [],
       replyUnavailable: false,
-      replyPollTimer: null,
-      replyPolling: false,
-      replyLastRecentId: '',
-      // 连接持有角色：candidate（等待选主）/ leader（持有 PeerJS）/ follower（转发）
-      role: 'candidate',
-      networkChannel: null,
-      lockRelease: null,
-      hadLeader: false,
       started: false,
       version: 0,
       _snap: null,
       listeners: new Set(),
       toast: '',
       toastTimer: null,
+      pollTimer: null,
+      polling: false,
+      hostVersion: -1,
 
-      // settings 派生自 state（loadState/saveState 持久化）：
-      // 开关写入走 update() → saveState，与好友/消息同一条持久化路径。
       get settings() {
         return this.state.settings || coerceSettings(null);
       },
 
-      // ── 订阅协议（useSyncExternalStore） ─────────────────────────────
       subscribe(fn) {
         this.listeners.add(fn);
         return () => { this.listeners.delete(fn); };
@@ -748,6 +555,8 @@ window.__ModuleLoader__.load({
             secured: !!(this.identity && this.identity.secured),
             fingerprint: this.identity ? this.identity.fingerprint : '',
             identityError: this.identityError,
+            identityFile: this.identityFile,
+            stateFile: this.stateFile,
             role: this.role,
             peerStatus: this.peerStatus,
             peerError: this.peerError,
@@ -769,15 +578,6 @@ window.__ModuleLoader__.load({
         this.version++;
         this._snap = null;
         for (const fn of this.listeners) { try { fn(); } catch (e) { /* ignore */ } }
-        // leader 把连接状态广播给同源其他标签页（它们不创建 PeerJS 连接）。
-        if (this.role === 'leader' && this.networkChannel) {
-          try {
-            this.networkChannel.postMessage({
-              type: 'status', role: 'leader', myId: this.myId,
-              peerStatus: this.peerStatus, peerError: this.peerError, peerErrorType: this.peerErrorType,
-            });
-          } catch (e) { /* ignore */ }
-        }
       },
 
       showToast(msg) {
@@ -787,752 +587,203 @@ window.__ModuleLoader__.load({
         this.emit();
       },
 
-      // state 变更唯一入口：写 localStorage + 推未读徽标 + 广播。
-      // 攻防加固：写前强制好友数/每好友消息数上限，防恶意洪泛撑爆存储。
-      update(mutator) {
-        const prev = this.state;
-        const next = mutator(prev);
-        if (next === prev) return;
-        if (Array.isArray(next.friends) && next.friends.length > MAX_FRIENDS) {
-          next.friends = next.friends.slice(-MAX_FRIENDS);
+      // ── Host 通信 ───────────────────────────────────────────────────
+      async postAction(action, payload) {
+        try {
+          const res = await fetch(API_ACTION, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(Object.assign({ action }, payload || {})),
+          });
+          let data = {};
+          try { data = await res.json(); } catch (e) { data = {}; }
+          if (data && data.snapshot) this.applySnapshot(data.snapshot);
+          return data || {};
+        } catch (error) {
+          this.showToast('Host 通信失败：' + String(error && error.message || error));
+          return { ok: false, error: 'host-unreachable' };
         }
-        if (next.messages) {
-          let messages = next.messages;
-          for (const id of Object.keys(messages)) {
-            const msgs = messages[id];
-            if (Array.isArray(msgs) && msgs.length > MAX_MSGS_PER_FRIEND) {
-              messages = Object.assign({}, messages);
-              messages[id] = msgs.slice(-MAX_MSGS_PER_FRIEND);
-            }
-          }
-          next.messages = messages;
-        }
-        this.state = next;
-        saveState(next);
-        pmUnreadStore.publish(computeUnreadTotal(next.friends));
-        this.emit();
       },
 
-      // ── 生命周期 ─────────────────────────────────────────────────────
+      applySnapshot(snap) {
+        if (!snap || typeof snap !== 'object') return;
+        const changed = snap.version !== this.hostVersion;
+        this.hostVersion = snap.version;
+        if (typeof snap.myId === 'string') this.myId = snap.myId;
+        if (typeof snap.peerStatus === 'string') this.peerStatus = snap.peerStatus;
+        if (typeof snap.peerError === 'string') this.peerError = snap.peerError;
+        if (typeof snap.peerErrorType === 'string') this.peerErrorType = snap.peerErrorType;
+        if (typeof snap.identityFile === 'string') this.identityFile = snap.identityFile;
+        if (typeof snap.stateFile === 'string') this.stateFile = snap.stateFile;
+        this.identity = { secured: !!snap.secured, fingerprint: snap.fingerprint || '', peerId: snap.myId || '' };
+        this.identityError = snap.secured ? '' : (snap.identityError || '');
+        pmIdentityStore.publish(!!snap.secured, snap.fingerprint || '');
+        if (snap.state && typeof snap.state === 'object') {
+          this.state = snap.state;
+          pmUnreadStore.publish(computeUnreadTotal(snap.state.friends));
+        }
+        // 自动回复由 Host 侧的入站泵触发（关掉所有标签页也生效），
+        // 浏览器不再重复触发，避免多标签页各触发一次。
+        if (changed) this.emit();
+      },
+
+      async pollHost() {
+        if (this.polling) return;
+        this.polling = true;
+        try {
+          const res = await fetch(API_STATE, { headers: { 'cache-control': 'no-cache' } });
+          if (res.ok) this.applySnapshot(await res.json());
+          else if (res.status === 503) this.replyUnavailable = true;
+        } catch (e) { /* 下次重试 */ }
+        this.polling = false;
+      },
+
+      // 旧版浏览器 localStorage → Host 文件的一次性迁移（私钥所有权随之转移）。
+      async migrateLegacyStorage() {
+        if (legacyAlreadyMigrated()) return null;
+        const legacyState = readLegacyState();
+        const legacyIdentity = readLegacyIdentity();
+        if (!legacyState && !legacyIdentity) { markLegacyMigrated(); return null; }
+        try {
+          const res = await fetch(API_MIGRATE, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ identity: legacyIdentity, state: legacyState }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (data && data.ok) {
+            markLegacyMigrated();
+            try {
+              localStorage.removeItem(LEGACY_STATE_KEY);
+              localStorage.removeItem(LEGACY_IDENTITY_KEY);
+              localStorage.removeItem('dsh-peer-message-peer-id-v1');
+            } catch (e) { /* ignore */ }
+            if (data.migratedIdentity) this.showToast('已把身份密钥从浏览器迁移到 Host 本地文件');
+            if (this.listeners.size) this.applySnapshot(data.snapshot);
+            return data;
+          }
+        } catch (e) { /* ignore：下次启动再试 */ }
+        return null;
+      },
+
       start() {
         if (this.started) return;
         this.started = true;
-        // 侧栏徽标初值（后台服务启动即发布，不等面板挂载）。
-        pmUnreadStore.publish(computeUnreadTotal(this.state.friends));
         this.emit();
-        // 身份先于 Peer 就绪：Peer ID 由公钥指纹派生（确定性，不随机）。
-        this.ensureIdentity()
-          .then(() => {
-            this.myId = this.identity.peerId;
-            this.emit();
-            if (!this.identity.secured) {
-              this.showToast('当前页面不是安全上下文，无法生成密钥身份：已退回旧的随机 Peer ID（对端显示未验签）');
-            }
-            return loadPeerJS();
-          })
-          .then(() => this.startNetwork())
-          .catch(err => {
-            this.peerStatus = 'error';
-            this.peerError = '身份/PeerJS 初始化失败: ' + String(err && err.message || err);
-            this.emit();
-          });
-        // agent 队列轮询：面板不打开也照常排水投递（消息要跑在后台）。
-        this.pollTimer = setInterval(() => this.drainOutbox(), 1000);
-        // 自动回复状态轮询：待批准请求 / 正在回复 / 最近结果（面板不打开也跑）。
+        this.migrateLegacyStorage().then(() => this.pollHost());
+        // 身份/连接状态都在 Host：页面只按 1s 轮询快照（面板不开也在跑）。
+        this.pollTimer = setInterval(() => this.pollHost(), 1000);
+        // 自动回复待批准/最近结果
         this.replyPollTimer = setInterval(() => this.pollReplies(), 2500);
         this.pollReplies();
-        // 慢速后台重连：每 30s 重试不在线的好友。
-        this.reconnectTimer = setInterval(() => {
-          if (this.peer && this.peer.open) this.reconnectAll();
-        }, 30000);
       },
-
-      // ── 单连接持有：Web Locks 选主 + BroadcastChannel 转发/镜像 ─────────
-      // 同一身份只允许一个 PeerJS 连接；多标签页只有一个 leader 创建 Peer，
-      // follower 通过 storage 事件镜像状态、通过 channel 转发操作。
-      startNetwork() {
-        this.setupNetworkChannel();
-        if (typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function') {
-          this.role = 'follower';
-          this.emit();
-          this.lockAbort = new AbortController();
-          navigator.locks.request(NETWORK_LOCK_NAME, { mode: 'exclusive', signal: this.lockAbort.signal }, () => new Promise((resolve) => {
-            this.lockRelease = resolve;
-            this.becomeLeader();
-          })).catch(() => {
-            // Web Locks 不可用/被中断：退回独立连接模式（仍用同一确定性 Peer ID）。
-            if (!this.started) return;
-            this.role = 'leader';
-            this.emit();
-            this.initPeer();
-          });
-        } else {
-          this.role = 'leader';
-          this.emit();
-          this.initPeer();
-        }
-      },
-
-      setupNetworkChannel() {
-        if (typeof BroadcastChannel !== 'function' || this.networkChannel) return;
-        try {
-          this.networkChannel = new BroadcastChannel(NET_CHANNEL_NAME);
-          this.networkChannel.onmessage = (event) => this.onNetworkMessage(event.data);
-        } catch (e) { this.networkChannel = null; }
-        this.onStorageSync = (event) => {
-          if (!event) return;
-          // leader 轮换身份密钥后，其它标签页同步同一身份。
-          if (event.key === IDENTITY_KEY) {
-            this.reloadIdentity().catch(() => { /* ignore */ });
-            return;
-          }
-          if (event.key !== STORAGE_KEY) return;
-          if (this.role !== 'follower') return;
-          this.state = loadState();
-          pmUnreadStore.publish(computeUnreadTotal(this.state.friends));
-          this.emit();
-        };
-        window.addEventListener('storage', this.onStorageSync);
-      },
-
-      // 从 localStorage 重新读取身份（leader 轮换后 follower 同步）。
-      async reloadIdentity() {
-        if (this.role === 'leader') return;
-        this.identity = null;
-        this.identityPromise = null;
-        await this.ensureIdentity();
-        if (this.role !== 'leader') this.myId = this.identity.peerId;
-        this.emit();
-      },
-
-      becomeLeader() {
-        if (!this.started) {
-          try { if (this.lockRelease) this.lockRelease(); } catch (e) { /* ignore */ }
-          this.lockRelease = null;
-          return;
-        }
-        const wasFollower = this.everLeader === true;
-        this.role = 'leader';
-        this.everLeader = true;
-        this.emit();
-        if (wasFollower) this.showToast('本标签页已接管 P2P 连接（身份与 Peer ID 不变）');
-        this.initPeer();
-      },
-
-      onNetworkMessage(msg) {
-        if (!msg || typeof msg !== 'object') return;
-        if (msg.type === 'status') {
-          if (this.role !== 'follower') return;
-          if (typeof msg.myId === 'string' && msg.myId) this.myId = msg.myId;
-          if (typeof msg.peerStatus === 'string') this.peerStatus = msg.peerStatus;
-          if (typeof msg.peerError === 'string') this.peerError = msg.peerError;
-          if (typeof msg.peerErrorType === 'string') this.peerErrorType = msg.peerErrorType;
-          this.emit();
-          return;
-        }
-        if (msg.type === 'action' && this.role === 'leader') {
-          this.executeForwardedAction(msg);
-        }
-      },
-
-      executeForwardedAction(msg) {
-        const args = Array.isArray(msg.args) ? msg.args : [];
-        switch (msg.action) {
-          case 'send': this.sendMessage(args[0], args[1]); break;
-          case 'addFriend': this.addFriend(args[0]); break;
-          case 'removeFriend': this.removeFriend(args[0]); break;
-          case 'markRead': this.markRead(args[0]); break;
-          case 'setNickname': this.setNickname(args[0]); break;
-          case 'setFriendProfile': this.setFriendProfile(args[0], args[1], args[2]); break;
-          case 'setFriendAlias': this.setFriendAlias(args[0], args[1]); break;
-          case 'setFriendNote': this.setFriendNote(args[0], args[1]); break;
-          case 'setAllowBroadcast': this.setAllowBroadcast(!!args[0]); break;
-          case 'setAllowIncoming': this.setAllowIncoming(!!args[0]); break;
-          case 'setReplyConfig': this.setReplyConfig(args[0]); break;
-          case 'retryPeer': this.retryPeer(); break;
-          default: break;
-        }
-      },
-
-      forwardAction(action, args) {
-        if (this.networkChannel) {
-          try { this.networkChannel.postMessage({ type: 'action', action, args }); return true; } catch (e) { /* ignore */ }
-        }
-        this.showToast('操作无法转发到持有连接的标签页');
-        return false;
-      },
-
-      isFollower() { return this.role === 'follower'; },
 
       stop() {
         if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
         if (this.replyPollTimer) { clearInterval(this.replyPollTimer); this.replyPollTimer = null; }
-        this.replyPending = [];
-        this.replyRunning = [];
-        this.replyRecent = [];
-        if (this.reconnectTimer) { clearInterval(this.reconnectTimer); this.reconnectTimer = null; }
-        if (this.reconnectTimer2) { clearTimeout(this.reconnectTimer2); this.reconnectTimer2 = null; }
-        for (const id of Object.keys(this.conns)) {
-          try { this.conns[id].close(); } catch (e) { /* ignore */ }
-        }
-        this.conns = {};
-        if (this.peer) { try { this.peer.destroy(); } catch (e) { /* ignore */ } }
-        this.peer = null;
-        try { if (this.lockAbort) this.lockAbort.abort(); } catch (e) { /* ignore */ }
-        try { if (this.lockRelease) this.lockRelease(); } catch (e) { /* ignore */ }
-        this.lockRelease = null;
-        this.lockAbort = null;
-        try { if (this.onStorageSync) window.removeEventListener('storage', this.onStorageSync); } catch (e) { /* ignore */ }
-        this.onStorageSync = null;
-        try { if (this.networkChannel) this.networkChannel.close(); } catch (e) { /* ignore */ }
-        this.networkChannel = null;
-        this.role = 'candidate';
-        this.myId = '';
-        this.peerStatus = 'connecting';
-        this.peerError = '';
-        this.peerErrorType = '';
-        this.toast = '';
         this.started = false;
-        this._snap = null;
-        this.emit();
       },
 
-      // 加载/生成密钥身份（并发去重）。
-      ensureIdentity() {
-        if (this.identity) return Promise.resolve(this.identity);
-        if (this.identityPromise) return this.identityPromise;
-        this.identityPromise = loadIdentity()
-          .then(identity => {
-            this.identity = identity;
-            this.identityError = '';
-            this.myId = identity.peerId;
-            pmIdentityStore.publish(!!identity.secured, identity.fingerprint || '');
-            this.emit();
-            return identity;
-          })
-          .catch(err => {
-            this.identityError = String(err && err.message || err);
-            this.emit();
-            throw err;
-          })
-          .finally(() => { this.identityPromise = null; });
-        return this.identityPromise;
+      // ── 用户操作（全部转发给 Host 执行并校验） ───────────────────────
+      async addFriend(targetId) {
+        const id = (targetId || '').trim();
+        if (!id) return;
+        if (!isValidPeerId(id)) { this.showToast('Peer ID 格式不合法（需以 ' + PEER_ID_PREFIX + ' 开头）'); return; }
+        const r = await this.postAction('addFriend', { id });
+        if (r && r.ok === false && r.error === 'self') this.showToast('不能添加自己');
       },
 
-      initPeer() {
-        if (!this.started) return;
-        // 只有持有网络角色的标签页才能创建 PeerJS 连接。
-        if (this.role !== 'leader') return;
-        if (!this.identity) {
-          this.ensureIdentity().then(() => this.initPeer()).catch(err => {
-            this.peerStatus = 'error';
-            this.peerError = '身份初始化失败: ' + String(err && err.message || err);
-            this.emit();
-          });
-          return;
+      async removeFriend(id) { await this.postAction('removeFriend', { id }); },
+
+      async markRead(id) { await this.postAction('markRead', { id }); },
+
+      async sendMessage(id, draft) {
+        const text = sanitizeText(draft);
+        if (!text || !id) return false;
+        const r = await this.postAction('send', { id, text });
+        if (r && r.ok === false) {
+          this.showToast(r.error === 'offline' ? '对方不在线，消息无法送达' : '发送失败');
+          return false;
         }
-        let peer = null;
-        try {
-          peer = new window.Peer(this.identity.peerId, DEFAULT_PEER_CONFIG);
-        } catch (err) {
-          this.peerStatus = 'error';
-          this.peerErrorType = 'init';
-          this.peerError = String(err && err.message || err);
-          this.emit();
-          return;
-        }
-        this.peer = peer;
-
-        peer.on('open', (id) => {
-          this.myId = id;
-          this.peerStatus = 'online';
-          this.peerError = '';
-          this.peerErrorType = '';
-          this.reconnectAttempts = 0; // 重连成功，清零退避计数
-          this.conns = {};
-          this.emit();
-          // 上线即主动连接所有已知好友（后台自动重连）。
-          this.reconnectAll();
-          this.drainOutbox();
-        });
-
-        peer.on('connection', (conn) => {
-          this.handleIncomingConn(conn);
-        });
-
-        peer.on('error', (err) => {
-          const type = err && err.type;
-          if (type === 'unavailable-id') {
-            this.peerStatus = 'error';
-            this.peerErrorType = 'unavailable-id';
-            this.peerError = 'Peer ID 被占用：Peer ID 由你的公钥指纹唯一派生，不会随机更换。同一浏览器的多个标签页已自动选一个持有连接，其他标签页转发操作；出现占用通常是上一次会话/另一个进程仍占着同一个 Peer ID。点「重试连接」会在同一身份、同一 Peer ID 上强制重建连接（不换身份、不换 Peer ID）；若确认是另一个 DSH 进程在用同一身份，关闭它即可。';
-            this.emit();
-            this.scheduleReconnect();
-          } else if (type === 'network' || type === 'server-error') {
-            this.peerStatus = 'error';
-            this.peerErrorType = type;
-            this.peerError = '信令服务器连接失败：' + (err && err.message || type);
-            this.emit();
-            this.scheduleReconnect();
-          } else if (type === 'peer-unavailable') {
-            // 目标不在线：清理进行中的连接记录，让下轮重连可重试。
-            for (const id of Object.keys(this.conns)) {
-              if (!this.conns[id].open) delete this.conns[id];
-            }
-            this.emit();
-          } else if (type === 'disconnected') {
-            this.peerStatus = 'offline';
-            this.peerError = '';
-            this.peerErrorType = '';
-            this.emit();
-            this.scheduleReconnect();
-          } else {
-            this.peerErrorType = type || '';
-            this.peerError = type || String(err && err.message || err);
-            this.emit();
-          }
-        });
-
-        peer.on('close', () => {
-          this.peerStatus = 'closed';
-          this.emit();
-          this.scheduleReconnect();
-        });
+        return true;
       },
 
-      // 信令断线自动重连（后台自愈）：指数退避 2s→30s，最多 5 次；
-      // 成功 open 或手动 stop 后清零。面板不打开也要能自己恢复。
-      scheduleReconnect() {
-        if (!this.started) return;
-        this.reconnectAttempts = this.reconnectAttempts || 0;
-        if (this.reconnectAttempts >= 5) {
-          this.peerError = this.peerError || '信令连接已断开，打开消息面板或刷新页面重试';
-          this.emit();
-          return;
-        }
-        const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempts), 30000);
-        this.reconnectAttempts++;
-        if (this.reconnectTimer2) clearTimeout(this.reconnectTimer2);
-        this.reconnectTimer2 = setTimeout(() => {
-          this.reconnectTimer2 = null;
-          if (!this.started) return;
-          if (this.peer && this.peer.open) { this.reconnectAttempts = 0; return; }
-          try { if (this.peer && !this.peer.destroyed) this.peer.destroy(); } catch (e) { /* ignore */ }
-          this.peer = null;
-          this.peerStatus = 'connecting';
-          this.peerError = '';
-          this.peerErrorType = '';
-          this.emit();
-          this.initPeer();
-        }, delay);
+      async setAllowBroadcast(on) {
+        await this.postAction('patchSettings', { patch: { allowBroadcast: !!on } });
+        this.showToast(on ? '已开启广播：陌生 peer 可发现并加你为好友' : '已关闭广播');
       },
 
-      // 入站连接：id 合法性 + 接收开关 + 白名单/广播开关（面板不打开也照常处理）。
-      handleIncomingConn(conn) {
-        const remoteId = conn.peer;
-        // 攻防加固：入站 id 必须合法格式，否则直接关闭。
-        if (!isValidPeerId(remoteId)) {
-          try { conn.close(); } catch (e) { /* ignore */ }
-          return;
-        }
-        // 总闸：不接收新连接时一律拒绝（已建立连接不受影响）。
-        if (!this.settings.allowIncoming) {
-          this.showToast('已拒收新连接「' + shortId(remoteId) + '」');
-          try { conn.close(); } catch (e) { /* ignore */ }
-          return;
-        }
-        // 白名单/广播：非好友时，仅在开启广播的情况下自动加为好友。
-        if (!this.settings.allowBroadcast && !this.state.friends.some(f => f.id === remoteId)) {
-          this.showToast('拒绝陌生连接「' + shortId(remoteId) + '」');
-          try { conn.close(); } catch (e) { /* ignore */ }
-          return;
-        }
-        conn.on('open', () => {
-          this.conns[remoteId] = conn;
-          this.update(prev => {
-            const friends = prev.friends.slice();
-            const idx = friends.findIndex(f => f.id === remoteId);
-            if (idx >= 0) friends[idx] = Object.assign({}, friends[idx], { online: true });
-            else friends.push({ id: remoteId, name: shortId(remoteId), alias: '', note: '', online: true, unread: 0, lastMsg: '', lastTs: Date.now() });
-            return Object.assign({}, prev, { friends });
-          });
-          // 回发 hello：让主动连接方也能看到本端昵称（原来只单向发）。
-          this.sendHello(conn);
-          this.showToast('「' + shortId(remoteId) + '」已连接');
-        });
-        conn.on('data', (data) => this.handleData(remoteId, data));
-        conn.on('close', () => this.handleClose(remoteId));
-        conn.on('error', () => this.handleClose(remoteId));
+      async setAllowIncoming(on) {
+        await this.postAction('patchSettings', { patch: { allowIncoming: !!on } });
+        this.showToast(on ? '已开启接收新连接' : '已关闭接收新连接：已建立连接不受影响');
       },
 
-      // 开关写入入口：走 update()（saveState 持久化 + 推未读徽标 + 广播快照）。
-      setAllowBroadcast(on) {
-        if (this.isFollower()) { this.forwardAction('setAllowBroadcast', [!!on]); return; }
-        const next = !!on;
-        this.update(prev => Object.assign({}, prev, {
-          settings: Object.assign({}, prev.settings || coerceSettings(null), { allowBroadcast: next }),
-        }));
-        this.showToast(next ? '已开启广播：陌生 peer 可发现并加你为好友' : '已关闭广播');
-      },
-      setAllowIncoming(on) {
-        if (this.isFollower()) { this.forwardAction('setAllowIncoming', [!!on]); return; }
-        const next = !!on;
-        this.update(prev => Object.assign({}, prev, {
-          settings: Object.assign({}, prev.settings || coerceSettings(null), { allowIncoming: next }),
-        }));
-        this.showToast(next ? '已开启接收新连接' : '已关闭接收新连接：已建立连接不受影响');
-      },
-
-      // ── 显示名称（hello 握手）与好友备注 ─────────────────────────────
-      // 本端显示名：settings.nickname；留空则退化到 Peer ID 前缀（不再是写死的“我”）。
-      getNickname() {
-        return sanitizeName(this.settings.nickname) || shortId(this.myId) || '我';
-      },
-
-      // 双向 hello：携带公钥 + 指纹 + 对 (id|name|fp) 的签名；对方据此验证身份。
-      async sendHello(conn) {
-        if (!conn || !conn.open) return;
-        try {
-          const identity = await this.ensureIdentity();
-          if (!conn.open) return;
-          const message = await buildHello(identity, this.getNickname());
-          conn.send(message);
-        } catch (e) { /* ignore */ }
-      },
-
-      broadcastHello() {
-        for (const conn of Object.values(this.conns)) this.sendHello(conn);
-      },
-
-      setNickname(raw) {
-        if (this.isFollower()) { this.forwardAction('setNickname', [raw]); return true; }
+      async setNickname(raw) {
         const text = typeof raw === 'string' ? raw.trim() : '';
         const clean = text ? sanitizeName(text) : '';
         if (text && !clean) { this.showToast('显示名称不合法（最多 ' + MAX_NAME_LEN + ' 字）'); return false; }
-        this.update(prev => Object.assign({}, prev, {
-          settings: Object.assign({}, prev.settings || coerceSettings(null), { nickname: clean }),
-        }));
-        this.broadcastHello();
+        const r = await this.postAction('patchSettings', { patch: { nickname: clean } });
+        if (r && r.ok === false) { this.showToast('显示名称保存失败'); return false; }
         this.showToast(clean ? '显示名称已更新为「' + clean + '」' : '已恢复默认显示名（Peer ID 前缀）');
         return true;
       },
 
-      // 好友备注名：hello 只改 name，本地 alias 永远优先，不会被对方覆盖。
-      setFriendAlias(id, raw) {
-        if (this.isFollower()) { this.forwardAction('setFriendAlias', [id, raw]); return true; }
-        const text = raw == null ? '' : String(raw).trim();
-        const alias = text ? sanitizeName(text) : '';
-        if (text && !alias) { this.showToast('备注名不合法'); return false; }
-        this.update(prev => {
-          const idx = prev.friends.findIndex(f => f.id === id);
-          if (idx < 0) return prev;
-          const friends = prev.friends.slice();
-          friends[idx] = Object.assign({}, friends[idx], { alias });
-          return Object.assign({}, prev, { friends });
-        });
-        this.showToast(alias ? '备注名已设为「' + alias + '」' : '已清除备注名');
-        return true;
-      },
+      async setFriendAlias(id, raw) { return this.setFriendProfile(id, raw, undefined); },
+      async setFriendNote(id, raw) { return this.setFriendProfile(id, undefined, raw); },
 
-      // 好友备注（注入自动回复上下文，见 maybeRequestReply → Host buildReplyPrompt）。
-      setFriendNote(id, raw) {
-        if (this.isFollower()) { this.forwardAction('setFriendNote', [id, raw]); return true; }
-        const text = raw == null ? '' : String(raw).trim();
-        if (text && text.length > MAX_NOTE_LEN) { this.showToast('备注最多 ' + MAX_NOTE_LEN + ' 字'); return false; }
-        const note = text;
-        this.update(prev => {
-          const idx = prev.friends.findIndex(f => f.id === id);
-          if (idx < 0) return prev;
-          const friends = prev.friends.slice();
-          friends[idx] = Object.assign({}, friends[idx], { note });
-          return Object.assign({}, prev, { friends });
-        });
-        this.showToast(note ? '备注已保存（会注入自动回复上下文）' : '已清除备注');
-        return true;
-      },
-
-      // 备注弹窗一次保存显示名 + 上下文备注，只触发一次持久化/广播。
-      setFriendProfile(id, aliasRaw, noteRaw) {
-        if (this.isFollower()) { this.forwardAction('setFriendProfile', [id, aliasRaw, noteRaw]); return true; }
-        const aliasText = aliasRaw == null ? '' : String(aliasRaw).trim();
-        const alias = aliasText ? sanitizeName(aliasText) : '';
-        if (aliasText && !alias) { this.showToast('显示备注名不合法（最多 ' + MAX_NAME_LEN + ' 字）'); return false; }
-        const noteText = noteRaw == null ? '' : String(noteRaw).trim();
-        if (noteText.length > MAX_NOTE_LEN) { this.showToast('备注最多 ' + MAX_NOTE_LEN + ' 字'); return false; }
-        this.update(prev => {
-          const idx = prev.friends.findIndex(f => f.id === id);
-          if (idx < 0) return prev;
-          const friends = prev.friends.slice();
-          friends[idx] = Object.assign({}, friends[idx], { alias, note: noteText });
-          return Object.assign({}, prev, { friends });
-        });
+      async setFriendProfile(id, aliasRaw, noteRaw) {
+        const patch = {};
+        if (aliasRaw !== undefined) {
+          const text = aliasRaw == null ? '' : String(aliasRaw).trim();
+          const alias = text ? sanitizeName(text) : '';
+          if (text && !alias) { this.showToast('显示备注名不合法（最多 ' + MAX_NAME_LEN + ' 字）'); return false; }
+          patch.alias = alias;
+        }
+        if (noteRaw !== undefined) {
+          const text = noteRaw == null ? '' : String(noteRaw).trim();
+          if (text.length > MAX_NOTE_LEN) { this.showToast('备注最多 ' + MAX_NOTE_LEN + ' 字'); return false; }
+          patch.note = text;
+        }
+        const r = await this.postAction('patchFriend', { id, patch });
+        if (r && r.ok === false) { this.showToast('好友备注保存失败'); return false; }
         this.showToast('好友备注已保存');
         return true;
       },
 
-      // ── Peer ID 占用恢复 ─────────────────────────────────────────────
-      // 用同一身份密钥重连：Peer ID 不变（关闭其他标签页后使用）。
-      retryPeer() {
-        if (this.isFollower()) { this.forwardAction('retryPeer', []); this.showToast('已请求持有连接的标签页重试'); return; }
-        if (this.peer) { try { this.peer.destroy(); } catch (e) { /* ignore */ } }
-        this.peer = null;
-        for (const id of Object.keys(this.conns)) {
-          try { this.conns[id].close(); } catch (e) { /* ignore */ }
-        }
-        this.conns = {};
-        this.myId = this.identity ? this.identity.peerId : '';
-        this.peerStatus = 'connecting';
-        this.peerError = '';
-        this.peerErrorType = '';
-        this.reconnectAttempts = 0;
-        this.emit();
-        this.initPeer();
-        this.showToast('正在用同一身份密钥重连（Peer ID 不变）…');
+      async retryPeer() {
+        const r = await this.postAction('retryPeer', {});
+        if (r && r.ok) this.showToast('已请求 Host 重建 P2P 连接（同一身份、同一 Peer ID）');
       },
 
-      // 生成新的身份密钥对（等同新账号）：Peer ID 随公钥指纹变化，
-      // 旧好友仍留在列表但需要重新添加你的新 Peer ID。私钥只存本机，旧钥删除不可恢复。
+      // 身份密钥轮换在 Host 侧执行（换密钥 = 换 Peer ID，好友需重新添加）。
       async regenerateIdentity() {
-        if (this.isFollower()) {
-          this.showToast('请在持有连接的标签页中轮换身份密钥（或关闭其他标签页）');
-          return false;
-        }
-        if (!cryptoIdentityAvailable()) { this.showToast('当前页面不是安全上下文，无法生成密钥身份'); return false; }
-        try {
-          const next = await generateIdentity();
-          persistIdentity(next);
-          this.identity = next;
-          this.myId = next.peerId;
-          this.identityError = '';
-          pmIdentityStore.publish(true, next.fingerprint);
-          this.retryPeer();
-          this.showToast('已轮换身份密钥，新 Peer ID：' + next.peerId + '（好友需重新添加）');
+        const r = await this.postAction('rotateIdentity', {});
+        if (r && r.ok) {
+          this.showToast('已轮换身份密钥，新 Peer ID：' + (r.peerId || '') + '（好友需重新添加）');
           return true;
-        } catch (err) {
-          this.showToast('生成新身份失败：' + String(err && err.message || err));
-          return false;
         }
+        this.showToast('身份密钥轮换失败' + (r && r.error ? '：' + r.error : ''));
+        return false;
       },
 
-      // 入站数据：文本消息清洗 + hello 握手昵称清洗。
-      handleData(remoteId, data) {
-        if (typeof data === 'string') {
-          // 攻防加固：清洗并截断入站文本（防超大 payload / 控制字符注入）。
-          const text = sanitizeText(data);
-          if (!text) return; // 空或全控制字符 → 丢弃
-          // 来源标记解析：AI 标记从显示文本里剥离，改由消息徽标表达。
-          const info = modelTextInfo(text);
-          const display = info.isModel ? info.display : text;
-          const origin = info.isModel ? 'model' : 'human';
-          this.update(prev => {
-            const idx = prev.friends.findIndex(f => f.id === remoteId);
-            if (idx < 0) return prev; // 非好友（或已删除）：丢弃
-            const friends = prev.friends.slice();
-            friends[idx] = Object.assign({}, friends[idx], {
-              lastMsg: display, lastTs: Date.now(),
-              lastOrigin: origin, lastTrigger: info.trigger,
-              unread: (friends[idx].unread || 0) + 1, online: true,
-            });
-            const msgs = (prev.messages[remoteId] || []).concat([{ from: 'them', text: display, ts: Date.now(), origin, trigger: info.trigger }]);
-            const messages = Object.assign({}, prev.messages);
-            messages[remoteId] = msgs;
-            return Object.assign({}, prev, { friends, messages });
-          });
-          // 好友文本入站 → 交给 Host 回调管线（关闭/全不允许等策略在 Host 再校验）。
-          // 模型标记消息不会再次触发自动回复（防 AI 互刷）。
-          if (this.state.friends.some(f => f.id === remoteId)) this.maybeRequestReply(remoteId, text);
-        } else if (data && typeof data === 'object') {
-          if (data.type === 'hello') {
-            // 身份校验是异步 WebCrypto；失败只影响该连接，不阻塞聊天数据。
-            this.handleHello(remoteId, data).catch(() => { /* ignore */ });
-          }
-        }
-      },
-
-      // 校验并落库好友身份：公钥指纹必须匹配 PeerJS ID，hello 签名必须有效。
-      async handleHello(remoteId, data) {
-        const verified = await verifyHello(remoteId, data);
-        if (!verified.ok) {
-          const reasonText = verified.reason === 'id-mismatch' ? '公钥与 Peer ID 不匹配'
-            : verified.reason === 'bad-signature' ? '签名无效'
-            : verified.reason === 'bad-pub' ? '公钥格式非法'
-            : '握手校验失败';
-          this.update(prev => {
-            const idx = prev.friends.findIndex(f => f.id === remoteId);
-            if (idx < 0) return prev;
-            const friends = prev.friends.slice();
-            friends[idx] = Object.assign({}, friends[idx], { online: false, verified: false, verifyError: reasonText });
-            return Object.assign({}, prev, { friends });
-          });
-          this.showToast('身份校验失败（' + reasonText + '），已断开「' + shortId(remoteId) + '」');
-          const conn = this.conns[remoteId];
-          try { if (conn) conn.close(); } catch (e) { /* ignore */ }
-          delete this.conns[remoteId];
-          return;
-        }
-        const name = sanitizeName(data.name);
-        this.update(prev => {
-          const idx = prev.friends.findIndex(f => f.id === remoteId);
-          if (idx < 0) return prev;
-          const friends = prev.friends.slice();
-          const patch = { verified: !!verified.verified, verifyError: '' };
-          if (name) patch.name = name;
-          if (verified.fingerprint) patch.fingerprint = verified.fingerprint;
-          if (verified.pubKey) patch.pubKey = verified.pubKey;
-          if (verified.verified) patch.verifiedAt = Date.now();
-          friends[idx] = Object.assign({}, friends[idx], patch);
-          return Object.assign({}, prev, { friends });
-        });
-        if (verified.verified) {
-          const friend = this.state.friends.find(f => f.id === remoteId);
-          this.showToast('「' + (friend ? displayName(friend) : shortId(remoteId)) + '」身份已验签');
-        }
-      },
-
-      handleClose(remoteId) {
-        delete this.conns[remoteId];
-        this.update(prev => {
-          if (!prev.friends.some(f => f.id === remoteId && f.online)) return prev;
-          const friends = prev.friends.map(f => f.id === remoteId ? Object.assign({}, f, { online: false }) : f);
-          return Object.assign({}, prev, { friends });
-        });
-      },
-
-      // 上线后重连所有好友（后台自动连接，不需要打开面板）。
-      reconnectAll() {
-        for (const f of this.state.friends) {
-          if (!isValidPeerId(f.id)) continue;
-          if (this.conns[f.id]) continue; // 已连接或连接中
-          this.connectTo(f.id, { silent: true });
-        }
-      },
-
-      connectTo(id, opts) {
-        opts = opts || {};
-        const peer = this.peer;
-        if (!peer || !peer.open) return false;
-        if (this.conns[id]) return !!this.conns[id].open; // 进行中或已连上
-        const conn = peer.connect(id, { reliable: true });
-        this.conns[id] = conn;
-        conn.on('open', () => {
-          this.update(prev => {
-            const friends = prev.friends.map(f => f.id === id ? Object.assign({}, f, { online: true }) : f);
-            return Object.assign({}, prev, { friends });
-          });
-          this.sendHello(conn);
-          if (!opts.silent) this.showToast('已连接「' + shortId(id) + '」');
-        });
-        conn.on('data', (data) => this.handleData(id, data));
-        conn.on('close', () => this.handleClose(id));
-        conn.on('error', () => this.handleClose(id));
-        return true;
-      },
-
-      ensureFriend(id) {
-        if (this.state.friends.some(f => f.id === id)) return;
-        this.update(prev => {
-          if (prev.friends.some(f => f.id === id)) return prev;
-          const friends = prev.friends.concat([{ id, name: shortId(id), alias: '', note: '', online: false, unread: 0, lastMsg: '', lastTs: Date.now() }]);
-          return Object.assign({}, prev, { friends });
-        });
-      },
-
-      // agent 队列排水：从 host 取回 pm_send 排队的消息并投递。
-      // 面板不打开也照常运行（这就是“消息要跑在后台”的核心）。
-      async drainOutbox() {
-        if (this.polling) return;
-        if (this.role !== 'leader') return; // follower 不拥有 PeerJS 连接，由 leader 投递
-        if (!this.peer || !this.peer.open) return; // peer 未就绪：留在 host 队列，不丢
-        this.polling = true;
-        try {
-          const res = await fetch('/api/pm-outbox', { method: 'GET' });
-          if (res.ok) {
-            const data = await res.json();
-            const items = Array.isArray(data && data.items) ? data.items : [];
-            for (const item of items) await this.deliverQueued(item);
-          }
-        } catch (e) { /* 静默：轮询失败下次重试 */ }
-        this.polling = false;
-      },
-
-      async deliverQueued(item) {
-        const target = item && item.to;
-        // 攻防加固：host 队列可能被任意本地进程写入，投递前必须校验。
-        if (!target || !isValidPeerId(target)) return; // 恶意/畸形 id：丢弃
-        const rawText = sanitizeText(item.text);
-        if (!rawText) return;
-        const tries = ((item.tries || 0) + 1);
-        this.ensureFriend(target); // agent 可向任意合法 id 发消息
-
-        // 出站队列只由 agent 侧写入（pm_send 工具 / 自动回复 runner），因此
-        // 无 meta 的旧队列项也按模型来源处理；带 [AI] 标记的则说明是 Agent 消息。
-        const info = modelTextInfo(rawText);
-        const meta = item.meta && typeof item.meta === 'object' && !Array.isArray(item.meta) ? item.meta : {};
-        // outbox 只由 agent 侧写入：旧队列项（无 meta）也按模型来源处理，
-        // 除非显式标注 origin:'human'。
-        const isModel = meta.origin === 'model' || info.isModel || meta.origin === undefined;
-        const trigger = !isModel ? 'human'
-          : (meta.trigger === 'manual' || meta.trigger === 'auto' || meta.trigger === 'agent') ? meta.trigger
-          : info.trigger === 'auto' ? 'auto'
-          : 'agent'; // 无 meta 且无文本标记的 outbox 项 = pm_send Agent 消息
-
-        const display = info.isModel ? info.display : rawText;
-        // 旧版工具/runner 写队列时可能没带标记：发送前补上 [AI]，让对端也能区分。
-        const wireText = isModel && !info.isModel ? AI_AGENT_PREFIX + rawText : rawText;
-
-        const conn = this.conns[target];
-        if (!conn || !conn.open) {
-          this.connectTo(target, { silent: true });
-          // 对方不在线：放回队列（带上重试计数），超过上限则放弃。
-          if (tries < MAX_DELIVERY_TRIES) outboxPush(Object.assign({}, item, { text: rawText, tries }));
-          else this.showToast('P2P 消息多次投递失败，已放弃');
-          return;
-        }
-        try {
-          conn.send(wireText);
-        } catch (e) {
-          if (tries < MAX_DELIVERY_TRIES) outboxPush(Object.assign({}, item, { text: rawText, tries }));
-          else this.showToast('P2P 消息多次投递失败，已放弃');
-          return;
-        }
-        this.update(prev => {
-          const msgs = (prev.messages[target] || []).concat([{ from: 'me', text: display, ts: Date.now(), origin: isModel ? 'model' : 'human', trigger }]);
-          const friends = prev.friends.map(f => f.id === target ? Object.assign({}, f, { lastMsg: display, lastTs: Date.now(), lastOrigin: isModel ? 'model' : 'human', lastTrigger: trigger }) : f);
-          const messages = Object.assign({}, prev.messages);
-          messages[target] = msgs;
-          return Object.assign({}, prev, { friends, messages });
-        });
-        this.showToast(trigger === 'auto' ? '已投递自动回复' : trigger === 'manual' ? '已投递已批准的回复' : '已投递 agent 消息');
-      },
-
-      // ── 自动回复（Host 回气管线） ─────────────────────────────────────
-      // 入站消息只是触发 Host 侧 agent；权限/模型/会话/工作路径全部由 Host
-      // 按下面持久化的 settings.reply 校验并执行，浏览器不直接跑任何工具。
-      setReplyConfig(patch) {
-        if (this.isFollower()) {
-          this.forwardAction('setReplyConfig', [patch || {}]);
-          return coerceReplyConfig(Object.assign({}, this.settings.reply, patch || {}));
-        }
+      async setReplyConfig(patch) {
         const next = coerceReplyConfig(Object.assign({}, this.settings.reply, patch || {}));
-        this.update(prev => Object.assign({}, prev, {
-          settings: Object.assign({}, prev.settings || coerceSettings(null), { reply: next }),
-        }));
+        await this.postAction('patchSettings', { patch: { reply: next } });
         return next;
       },
 
-      // 打开设置弹窗时才拉 catalog（endpoint/模型、会话列表、workspace 列表）。
+      // ── 自动回复 UI（Host 侧 runner 的视图） ─────────────────────────
       async loadReplyCatalog(force) {
         if (this.replyCatalog && !force) return this.replyCatalog;
         try {
           const res = await fetch('/api/pm-reply/catalog', { headers: { 'cache-control': 'no-cache' } });
           if (!res.ok) { this.replyUnavailable = true; this.emit(); return null; }
           const data = await res.json();
-          if (!data || data.ok === false) { this.replyUnavailable = true; this.emit(); return null; }
-          this.replyCatalog = data;
-          this.replyUnavailable = false;
+          this.replyCatalog = data && data.ok ? data : null;
+          this.replyUnavailable = !(data && data.ok);
           this.emit();
-          return data;
-        } catch (e) {
+          return this.replyCatalog;
+        } catch (error) {
           this.replyUnavailable = true;
           this.emit();
           return null;
@@ -1546,65 +797,24 @@ window.__ModuleLoader__.load({
           const res = await fetch('/api/pm-reply/requests', { headers: { 'cache-control': 'no-cache' } });
           if (res.ok) {
             const data = await res.json();
-            if (data && data.ok !== false) {
-              const pending = Array.isArray(data.pending) ? data.pending : [];
-              const running = Array.isArray(data.running) ? data.running : [];
-              const recent = Array.isArray(data.recent) ? data.recent : [];
-              this.replyPending = pending;
-              this.replyRunning = running;
-              this.replyRecent = recent;
-              this.replyUnavailable = false;
-              const latest = recent[0];
-              if (latest && latest.id !== this.replyLastRecentId) {
-                this.replyLastRecentId = latest.id;
-                if (latest.status === 'failed') this.showToast('自动回复失败：' + (latest.error || '未知错误'));
-                else if (latest.status === 'sent') this.showToast('自动回复已投递');
-              }
-              this.emit();
-            }
+            this.replyPending = Array.isArray(data.pending) ? data.pending : [];
+            this.replyRunning = Array.isArray(data.running) ? data.running : [];
+            this.replyRecent = Array.isArray(data.recent) ? data.recent : [];
+            this.replyUnavailable = false;
+            this.emit();
           } else if (res.status === 503) {
             this.replyUnavailable = true;
             this.emit();
           }
-        } catch (e) { /* 静默：下次轮询重试 */ }
+        } catch (e) { /* 静默 */ }
         this.replyPolling = false;
       },
 
-      async approveReply(id) {
-        try {
-          const res = await fetch('/api/pm-reply/approve', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ id }),
-          });
-          const data = await res.json().catch(() => ({}));
-          if (res.ok && data.ok) this.showToast('已批准，开始生成回复');
-          else this.showToast('批准失败：' + (data.error || ('HTTP ' + res.status)));
-        } catch (e) {
-          this.showToast('批准失败：无法连接 Host');
-        }
-        this.pollReplies();
-      },
+      async approveReply(id) { return this.postReplyControl('approve', id); },
+      async rejectReply(id) { return this.postReplyControl('reject', id); },
 
-      async rejectReply(id) {
-        try {
-          const res = await fetch('/api/pm-reply/reject', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ id }),
-          });
-          const data = await res.json().catch(() => ({}));
-          if (res.ok && data.ok) this.showToast('已忽略该条回复请求');
-          else this.showToast('忽略失败：' + (data.error || ('HTTP ' + res.status)));
-        } catch (e) {
-          this.showToast('忽略失败：无法连接 Host');
-        }
-        this.pollReplies();
-      },
-
-      // 入站文本 → Host 回调管线；关闭、空文本、自动回复标记（防死循环）直接跳过。
+      // 入站消息触发 Host 侧自动回复（权限/模型/会话全部由 Host 执行）。
       maybeRequestReply(peerId, text) {
-        if (this.role !== 'leader') return; // 入站只在 leader 处理，避免多标签重复回调
         const reply = this.settings.reply || DEFAULT_REPLY;
         if (reply.mode === 'off') return;
         const clean = typeof text === 'string' ? text.trim() : '';
@@ -1617,7 +827,6 @@ window.__ModuleLoader__.load({
           body: JSON.stringify({
             peerId,
             peerName: friend ? displayName(friend) : '',
-            // 本机备注注入 Host 的回复 prompt（可信上下文，见 reply-core.buildReplyPrompt）。
             peerNote: friend && typeof friend.note === 'string' ? friend.note : '',
             text: clean,
             config: reply,
@@ -1633,73 +842,25 @@ window.__ModuleLoader__.load({
         }).catch(() => { /* 静默：不阻塞聊天 */ });
       },
 
-      // ── 面板调用的操作 ───────────────────────────────────────────────
-      addFriend(targetId) {
-        if (this.isFollower()) { this.forwardAction('addFriend', [targetId]); this.showToast('已转发到持有连接的标签页'); return; }
-        const id = (targetId || '').trim();
-        if (!id) return;
-        if (!isValidPeerId(id)) {
-          this.showToast('Peer ID 格式不合法（需以 ' + PEER_ID_PREFIX + ' 开头）');
-          return;
-        }
-        if (id === this.myId) {
-          this.showToast('不能添加自己');
-          return;
-        }
-        this.ensureFriend(id);
-        this.connectTo(id);
-      },
-
-      removeFriend(id) {
-        if (this.isFollower()) { this.forwardAction('removeFriend', [id]); this.showToast('已转发到持有连接的标签页'); return; }
-        const conn = this.conns[id];
-        if (conn) { try { conn.close(); } catch (e) { /* ignore */ } }
-        delete this.conns[id];
-        this.update(prev => {
-          const friends = prev.friends.filter(f => f.id !== id);
-          const messages = Object.assign({}, prev.messages);
-          delete messages[id];
-          return { friends, messages };
-        });
-      },
-
-      sendMessage(id, draft) {
-        if (this.isFollower()) {
-          const clean = sanitizeText(draft);
-          if (!clean || !id) return false;
-          this.forwardAction('send', [id, clean]);
-          this.showToast('已通过持有连接的标签页发送');
-          return true;
-        }
-        const text = sanitizeText(draft);
-        if (!text || !id) return false;
-        const conn = this.conns[id];
-        if (!conn || !conn.open) { this.showToast('对方不在线，消息无法送达'); return false; }
+      async postReplyControl(kind, id) {
         try {
-          conn.send(text);
-        } catch (e) {
-          this.showToast('发送失败');
-          return false;
+          const res = await fetch('/api/pm-reply/' + kind, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (data && data.ok) this.showToast(kind === 'approve' ? '已批准并发送该回复' : '已拒绝该回复请求');
+          else this.showToast('操作失败');
+          this.pollReplies();
+          return data;
+        } catch (error) {
+          this.showToast('操作失败：' + String(error && error.message || error));
+          return { ok: false };
         }
-        this.update(prev => {
-          const msgs = (prev.messages[id] || []).concat([{ from: 'me', text, ts: Date.now(), origin: 'human', trigger: 'human' }]);
-          const friends = prev.friends.map(f => f.id === id ? Object.assign({}, f, { lastMsg: text, lastTs: Date.now(), lastOrigin: 'human', lastTrigger: 'human' }) : f);
-          const messages = Object.assign({}, prev.messages);
-          messages[id] = msgs;
-          return Object.assign({}, prev, { friends, messages });
-        });
-        return true;
-      },
-
-      markRead(id) {
-        if (this.isFollower()) { this.forwardAction('markRead', [id]); return; }
-        this.update(prev => {
-          if (!prev.friends.some(f => f.id === id && (f.unread || 0) > 0)) return prev;
-          const friends = prev.friends.map(f => f.id === id ? Object.assign({}, f, { unread: 0 }) : f);
-          return Object.assign({}, prev, { friends });
-        });
       },
     };
+
 
     // 攻防演练/调试钩子：从浏览器控制台可直接检查后台服务状态。
     window.__DSH_PM_SERVICE__ = pmService;
@@ -2070,10 +1231,10 @@ window.__ModuleLoader__.load({
               h('span', { className: 'pm-link-btn' }, '查看'),
             ),
             // 多标签页连接持有角色（单连接协调；不改变身份/Peer ID）
-            h('div', { className: 'pm-role-row', title: '同一浏览器多标签页共享一个 P2P 连接：一个标签页持有，其余转发操作' },
-              role === 'leader' ? '🔗 连接由本标签页持有'
-                : role === 'follower' ? '🔗 连接由其他标签页持有 · 操作自动转发'
-                : '🔗 正在接管连接…'),
+            h('div', { className: 'pm-role-row', title: 'P2P 连接由 DSH Host 进程持有：关闭标签页也不会掉线，多标签页共用同一身份' },
+              role === 'host'
+                ? '🔗 连接由 DSH Host 持有 · 关标签页不掉线'
+                : '🔗 等待 Host 连接…'),
             // 显示名称（hello 握手）+ 身份密钥入口
             h('div', { className: 'pm-nick-row' },
               h('span', { className: 'pm-nick-label' }, '显示名称'),
@@ -2332,7 +1493,7 @@ window.__ModuleLoader__.load({
               h('dt', null, 'Peer ID'),
               h('dd', null, myId || '生成中…'),
               h('dt', null, '算法'),
-              h('dd', null, secured ? IDENTITY_ALGORITHM : '不可用（非安全上下文，已退回随机 Peer ID）'),
+              h('dd', null, secured ? IDENTITY_ALGORITHM : 'Host 未启用密钥身份（身份文件缺失/损坏）'),
               h('dt', null, '状态'),
               h('dd', null, secured ? '已启用密钥身份；连接时通过 hello 公钥+签名验证' : '未启用：当前页面无法使用 WebCrypto'),
             ),
@@ -2409,8 +1570,7 @@ window.__ModuleLoader__.load({
       // 再订阅 store 接收 panel persist 的后续更新。
       const [unread, setUnread] = React.useState(() => {
         try {
-          const st = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
-          return computeUnreadTotal(st && st.friends);
+          return computeUnreadTotal(pmService.state ? pmService.state.friends : null);
         } catch (e) { return 0; }
       });
       React.useEffect(() => pmUnreadStore.subscribe(setUnread), []);

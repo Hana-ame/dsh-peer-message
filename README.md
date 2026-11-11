@@ -113,7 +113,7 @@ tool.
 
 Pending approvals, running turns, and recent results are polled every 2.5 s and
 shown in the panel (a badge appears above the friend list). Settings persist in
-the same `localStorage` state as friends/messages (`settings.reply`).
+the daemon's `state.json` alongside friends and messages (`settings.reply`).
 
 ### Security model
 
@@ -207,75 +207,83 @@ ping-pong. The outbox also carries `meta: {origin, trigger, model}`; queue items
 written by older versions without meta (or without a marker) are treated as
 model/Agent messages, since only agent-side code writes the outbox.
 
-### Keypair identity and ID occupancy
+### Identity, storage and the P2P daemon
 
-Identity is not a random string any more:
+Identity and transport do **not** live in the browser, and not in the DSH process
+either. They live in a small **daemon** process (`server/daemon.mjs`):
 
-1. On first use the client generates an **ECDSA P-256 keypair** with WebCrypto
-   and stores the private JWK in `localStorage`
-   (`dsh-peer-message-identity-v1`, local only — never transmitted).
-2. The **Peer ID is derived from the public-key fingerprint**:
-   `dsh-pm-` + first 40 hex chars of `SHA-256("EC|P-256|<x>|<y>")`. The same key
-   always yields the same ID; different keys cannot collide in practice.
-3. `hello` carries `{name, pub, fp, sig}` where `sig` signs the canonical
-   `{v,id,fp,name}` payload. The receiver verifies:
-   - fingerprint recomputed from `pub` equals `fp` **and** `conn.peer ===
-     "dsh-pm-" + fp` (PeerJS ID ↔ key binding),
-   - the signature verifies against `pub`.
+```
+~/.dsh/peer-message/
+  identity.json   ECDSA P-256 keypair + fingerprint        (0600, private key local only)
+  state.json      friends / messages / settings            (0600)
+  net.sock        unix socket, JSON API for DSH            (0600)
+  net.pid         daemon pid, single-holder marker         (0600)
+  net.log         daemon log                               (0600)
+```
 
-   Success stores `friend.pubKey/fingerprint` and shows 🔐 + “身份已验签”;
-   failure closes that connection, shows “身份校验失败（签名无效/公钥与 Peer ID
-   不匹配）” and marks the friend unverified. Peers on older versions that send a
-   `hello` without `pub` are still compatible but shown as **未验签**.
+Why a separate process instead of the DSH process: DSH plugin reloads (HMR,
+restart, second profile) recreate the plugin, and an old `Peer` left in the DSH
+process keeps holding the **deterministic** Peer ID — the new instance then gets
+`unavailable-id` forever. The daemon outlives DSH: closing the browser tab or
+restarting DSH does not drop the peer, and exactly one process can hold the
+key-derived ID at a time.
 
-Because the Peer ID is deterministic from the shared local key, two tabs would
-race for one PeerJS ID. The plugin does **not** randomize the Peer ID to escape
-that; it coordinates a single connection owner instead:
+1. **Identity** — an ECDSA P-256 keypair is generated once with Node WebCrypto
+   and stored in `identity.json` (mode 0600). The private key never leaves that
+   file: the browser receives only `{secured, fingerprint, peerId}`.
+2. **Peer ID is deterministic** — `dsh-pm-` + first 40 hex of
+   `SHA-256("EC|P-256|<x>|<y>")`. The same key always yields the same Peer ID;
+   it is **never randomized** to "fix" a conflict.
+3. **State** — friends (with alias/note/verified/fingerprint), messages and
+   settings are persisted to `state.json` (0600) by the daemon. The browser
+   keeps no authoritative copy.
+4. **hello handshake** — carries `{name, pub, fp, sig}` signing
+   `{v,id,fp,name}`. The daemon recomputes the fingerprint, checks
+   `conn.peer === "dsh-pm-" + fp`, verifies the signature, then stores
+   `friend.pubKey/fingerprint` and shows 🔐 身份已验签. Failures close the
+   connection. Peers on older versions without `pub` are accepted as 未验签.
+5. **DSH ↔ daemon transport** — unix socket (`net.sock`, 0600) speaking JSON:
+   `GET /state`, `GET /health`, `POST /action`, `POST /migrate`,
+   `POST /inbound`. The plugin proxies these as `/api/pm-net/{state,action,migrate}`
+   and auto-spawns the daemon if it is not running.
+6. **Single holder** — before listening, the daemon probes `net.pid` (process
+   liveness) and the existing socket; a healthy daemon makes the new one exit.
+7. **Browser is a view** — `client.js` polls `/api/pm-net/state` once a second
+   and POSTs actions. It no longer creates a `Peer`, computes keys or writes
+   identity/state to `localStorage`.
+8. **Auto-reply runs in DSH, not the page** — the plugin's inbound pump pulls
+   `/inbound` (the daemon peeks it in `/state` so any number of tabs can poll
+   without stealing items) and feeds the reply runner. Closing every tab does
+   not stop auto-replies.
 
-- Every tab requests an exclusive **Web Lock**
-  (`dsh-peer-message-network-owner`). The lock holder becomes the only **leader**
-  that creates the PeerJS connection with the key-derived Peer ID. Other tabs are
-  **followers**: they mirror the leader's persisted state through `storage`
-  events and forward user actions (send, add/remove friend, notes, settings)
-  through a `BroadcastChannel`.
-- Identity creation is serialized by its own Web Lock
-  (`dsh-peer-message-identity`), so two tabs opened at the same moment cannot
-  each generate a different keypair.
-- The sidebar shows the role: `🔗 连接由本标签页持有` or `🔗 连接由其他标签页持有 ·
-  操作自动转发`. Closing the leader releases the lock; a follower takes over
-  with the **same key and the same Peer ID**.
-- On `unavailable-id` the same Peer ID is retried automatically with backoff.
-  The banner offers **重试连接** (force-recreate the same identity/Peer ID) and
-  **身份密钥** (fingerprint view). It does **not** generate a new random Peer ID.
-  If another DSH process/window outside this browser uses the same identity,
-  close it. The identity dialog keeps a deliberate
-  **轮换身份密钥（会更换身份与 Peer ID）** action for a genuine identity change —
-  it is not the fix for an occupied ID.
-- Without Web Locks (non-secure context) each tab runs standalone and collisions
-  are possible again. A WebCrypto-less page falls back to the legacy random Peer
-  ID with `secured=false` and peers see it as unverified.
+On `unavailable-id` the banner offers **重试连接** (rebuild the same identity and
+the same Peer ID) and **身份密钥** (fingerprint view). It deliberately does not
+generate a new random ID. The identity dialog keeps a separate, explicit
+**轮换身份密钥（会更换身份与 Peer ID）** action for a real identity change.
 
-Private keys are **not** exported by the UI; anyone with a backup of the browser
-profile can impersonate this identity, so do not share it.
+Running the daemon manually (optional; DSH spawns it on demand):
+
+```
+node server/daemon.mjs                    # data dir ~/.dsh/peer-message
+DSH_PEER_MESSAGE_DIR=/tmp/pm node server/daemon.mjs
+```
+
+Private keys are **not** exported by the UI. Anyone with a copy of
+`identity.json` or a backup of the machine can impersonate this identity, so do
+not share it. Files are 0600 and the socket is 0600.
 
 ### Persistent identity display
 
-The identity is not hidden inside a dialog:
+The identity is continuously visible, not hidden in a dialog:
 
-- **Sidebar row** — `🔐 身份已启用 · 指纹 07b9…bb3b`, always visible next to the
-  display name; hover/click opens the full fingerprint and rotation dialog. On a
-  non-secure page it shows `⚠️ 身份未启用（非安全上下文）`.
-- **Sidebar icon** — a small 🔐 badge is rendered even when the message panel is
-  closed, so the toolbar always reflects that a key identity is active.
-- **QR dialog** — shows the full grouped public-key fingerprint under the Peer
-  ID, so sharing a QR also shares the identity you can read out loud.
-- **Friend chat header** — after verification: `在线 · 身份已验签 · 指纹
-  07b9…bb3b`; the full fingerprint is in the title attribute. The `🔐` badge and
-  stored fingerprint persist in the friend record while offline and across
-  restarts; each reconnect re-verifies the signed `hello`.
-- **Identity dialog** — Peer ID, `ECDSA P-256 / SHA-256`, full fingerprint,
-  copy-fingerprint and key rotation.
-
+- **Sidebar row** — `🔐 身份已启用 · 指纹 07b9…bb3b` next to the Peer ID; the
+  full fingerprint is in the title, click opens the identity dialog.
+- **Sidebar icon** — a 🔐 badge renders even while the message panel is closed.
+- **QR dialog** — shows the full grouped public-key fingerprint under the Peer ID.
+- **Friend chat header** — `在线 · 身份已验签 · 指纹 07b9…bb3b` (full value in
+  the title); the 🔐 badge and stored fingerprint persist in `state.json` while
+  offline and across restarts, re-verified on every signed hello.
+- **Role row** — `🔗 连接由 DSH Host 持有 · 关标签页不掉线`.
 
 ## Installation
 
@@ -316,36 +324,52 @@ Then enable the bundle `dsh-peer-message` and the preset bundle
 ## How it works
 
 ```
- agent (pm_send)          client poll (600ms)          PeerJS
-  ┌──────────┐  push  ┌──────────────────┐  GET   ┌────────────┐
-  │ tool.js  ├───────►│ /api/pm-outbox   ├───────►│  outbox.js │
-  └──────────┘        │ (Host index.js)  │        └─────┬──────┘
-                      └──────────────────┘              │ deliver over PeerJS
-                                                        ▼
-                                                friend's DSH Web tab
+  agent (pm_send)        DSH Host plugin                p2p daemon (own process)
+  ┌──────────┐  push   ┌──────────────────┐  unix    ┌──────────────────────────┐
+  │ tool.js  ├────────►│ outbox.js queue  │  socket  │ network.js + PeerJS/wrtc │
+  └──────────┘         │ index.js routes  ├─────────►│ identity.json (0600)     │
+  ┌──────────┐  POST   │ /api/pm-net/*    │  JSON    │ state.json    (0600)     │
+  │client.js ├────────►│ /api/pm-outbox   │◄─────────┤ net.sock      (0600)     │
+  │ (view)   │  poll   └──────────────────┘          └──────────┬───────────────┘
+  └──────────┘                                                   │ WebRTC
+                                                                 ▼
+                                                        friend's daemon
 ```
 
-- `tool.js` (preset plugin) registers the `pm_send` tool. When an agent calls
-  it, the message is pushed into the shared `outbox.js` queue.
-- `index.js` (Host plugin) registers the `GET/POST /api/pm-outbox` fetch route.
-  The client polls it every 600 ms to drain queued messages and re-queue any
-  delivery failure.
-- `client.js` (client plugin) owns the chat panel UI, PeerJS connectivity, and
-  localStorage persistence.
+- `server/daemon.mjs` — the owner of the identity, the state files and the
+  PeerJS/WebRTC connection. It runs in its own process so a DSH reload cannot
+  orphan a `Peer` that keeps holding the deterministic Peer ID, and so the peer
+  stays online with no browser tab open.
+- `server/network.js` — the transport itself (Node WebRTC via `@roamhq/wrtc`):
+  hello signing/verification, friend/message state machine, file persistence
+  (atomic writes, mode 0600), agent-outbox delivery.
+- `index.js` (Host plugin) — proxies `/api/pm-net/{state,action,migrate}` to the
+  daemon over its unix socket, auto-spawns the daemon when missing, drains the
+  agent outbox, and runs the inbound auto-reply pump.
+- `client.js` (client plugin) — pure view: chat panel UI, one-second snapshot
+  polling, action POSTs. No keys, no `Peer`, no authoritative state.
+- `tool.js` (preset plugin) — registers `pm_send`; pushes into `outbox.js`.
 
-The fetch route lives in the Host plugin (not the preset) because a fetch route
-is process-global; keeping it in the preset would orphan it across preset HMR
-reloads.
+**WebRTC in Node — two gotchas worth knowing.** `peerjs` ships a CJS build whose
+`util.supports` is computed **once at module evaluation** by opening a
+`RTCPeerConnection` and a data channel. Therefore (1) Node WebRTC globals must be
+installed *before* `peerjs` is first imported, and (2) if some other code already
+imported it first, the CJS `require.cache` entry must be cleared and the module
+re-evaluated. Otherwise `supports.data` stays `false` and every `Peer` aborts
+with `browser-incompatible` even though wrtc is fine. Both are handled in
+`daemon.mjs` and verified by tests.
 
 ## Files
 
 | File | Role |
 | --- | --- |
-| `index.js` | Host plugin — `/api/pm-outbox` + `/api/pm-reply/*` routes and the reply runner wiring |
+| `server/daemon.mjs` | **P2P daemon** — owns identity + state + WebRTC; unix-socket JSON API; single-instance guard |
+| `server/network.js` | Transport core — identity keypair/Peer ID, hello verify, friends/messages, atomic 0600 persistence, agent delivery |
+| `index.js` | Host plugin — proxies `/api/pm-net/*` to the daemon, auto-spawns it, `/api/pm-outbox` + `/api/pm-reply/*`, inbound auto-reply pump |
 | `reply-core.js` | Pure auto-reply config/policy/prompt/rate-limit helpers |
 | `reply-runner.js` | Host auto-reply runner — session/model/permission setup, turn capture, outbox delivery |
 | `tool.js` | Preset plugin — `pm_send` tool + tool-surface restriction |
-| `client.js` | Client plugin — chat panel UI, PeerJS, persistence, reply settings/approval UI |
+| `client.js` | Client plugin — chat panel UI and daemon snapshot polling (no keys, no `Peer`, no authoritative state) |
 | `outbox.js` | Shared outbound queue module |
 | `validate.js` | Shared peer-ID / text validation and sanitization |
 | `locale/en.json`, `locale/zh.json` | UI strings |
@@ -354,7 +378,9 @@ reloads.
 ## Development
 
 ```bash
-npm test   # runs test/*.test.js
+npm test                          # unit + static wiring tests (test/, server/*.test.js)
+node server/integration.node.mjs  # real P2P: daemon ↔ independent Node peer (needs network)
+node server/daemon.mjs            # run the daemon manually
 ```
 
 Host-side files (`index.js`, `reply-core.js`, `reply-runner.js`) are ESM

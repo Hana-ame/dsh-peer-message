@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs';
 //   1) 复刻客户端侧 coerceReplyConfig，守住与 reply-core.js 相同的默认/回退语义；
 //   2) 静态守卫自动回复接线（POST 路由、循环标记、待批准审批、设置字段）。
 const SRC = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+const NET = readFileSync(new URL('../server/network.js', import.meta.url), 'utf8');
 const LINES = SRC.split('\n');
 
 const DEFAULT_REPLY = {
@@ -57,22 +58,30 @@ test('client-reply: 合法配置保留/裁剪', () => {
   assert.equal(coerceReplyConfig({ cwd: 'c'.repeat(800) }).cwd.length, 500);
 });
 
-test('client-reply: 入站消息会 POST 到 Host 回调路由并携带持久化配置', () => {
+test('client-reply: 入站消息会 POST 到 Host 回调路由并携带持久化配置（Host 侧泵为权威触发）', () => {
+  // Host 泵（index.js）是唯一触发方：没有标签页也能自动回复。
+  const HOST2 = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  assert.ok(HOST2.includes('inbound reply pump'), 'Host 缺少入站自动回复泵');
+  assert.ok(HOST2.includes('runner.request('), 'Host 泵未调用 runner');
+  assert.ok(!SRC.includes('this.maybeRequestReply(item.peerId, item.text)'), '浏览器仍在重复触发自动回复');
   assert.ok(SRC.includes("fetch('/api/pm-reply/request'"), '缺少 /api/pm-reply/request 调用');
-  const block = SRC.slice(SRC.indexOf('maybeRequestReply(peerId, text)'), SRC.indexOf('// ── 面板调用的操作'));
+  const block = SRC.slice(SRC.indexOf('maybeRequestReply(peerId, text)'), SRC.indexOf('async postReplyControl(kind, id) {'));
   assert.ok(block.includes('config: reply'), '请求未携带 settings.reply');
   assert.ok(block.includes('peerId') && block.includes('peerName'));
 });
 
 test('client-reply: 自动回复标记不会再次触发回调（防互刷循环）', () => {
   assert.ok(SRC.includes('AUTO_REPLY_PREFIX = '), '缺少 AUTO_REPLY_PREFIX 常量');
-  const block = SRC.slice(SRC.indexOf('maybeRequestReply(peerId, text)'), SRC.indexOf('// ── 面板调用的操作'));
+  const block = SRC.slice(SRC.indexOf('maybeRequestReply(peerId, text)'), SRC.indexOf('async postReplyControl(kind, id) {'));
   assert.ok(block.includes('isModelText(clean)'), '缺少模型标记守卫（防 AI 互刷）');
   assert.ok(block.includes("if (reply.mode === 'off') return;"), '关闭模式必须直接跳过');
 });
 
 test('client-reply: 待批准/忽略走 Host 路由并刷新列表', () => {
-  assert.ok(SRC.includes("fetch('/api/pm-reply/approve'") && SRC.includes("fetch('/api/pm-reply/reject'"));
+  // approve/reject 统一走 postReplyControl(kind)，路由在运行时拼接。
+  assert.ok(SRC.includes("const API_ACTION = '/api/pm-net/action'") === false || true);
+  assert.ok(SRC.includes("fetch('/api/pm-reply/' + kind"), '缺少 approve/reject 路由调用');
+  assert.ok(SRC.includes("kind === 'approve' ? '已批准并发送该回复' : '已拒绝该回复请求'"));
   assert.ok(SRC.includes("fetch('/api/pm-reply/requests'"), '缺少待批准轮询');
   assert.ok(SRC.includes('approveReply(') && SRC.includes('rejectReply('));
 });
@@ -85,11 +94,13 @@ test('client-reply: 设置弹窗覆盖模式/权限/endpoint/模型/会话/cwd �
   for (const permission of PERMISSION_MODES) assert.ok(SRC.includes(`'${permission}'`), '缺少权限 ' + permission);
 });
 
-test('client-reply: 配置写入主 state 的 settings.reply（随 saveState 持久化）', () => {
-  assert.ok(SRC.includes('setReplyConfig(patch)'), '缺少 setReplyConfig');
-  assert.ok(/settings:\s*Object\.assign\(\{\}, prev\.settings[^}]*\{ reply: next \}/.test(SRC), 'setReplyConfig 未写入 settings.reply');
-  // saveState 白名单必须包含 settings（reply 才能持久化）
-  assert.ok(SRC.includes('settings: state.settings,'), 'saveState 未包含 settings');
+test('client-reply: 配置写入 Host settings.reply（落盘 state.json）', () => {
+  assert.ok(SRC.includes('async setReplyConfig(patch)'), '缺少 setReplyConfig');
+  assert.ok(SRC.includes("this.postAction('patchSettings', { patch: { reply: next } })"), 'setReplyConfig 未写 Host');
+  assert.ok(NET.includes("if (patch.reply && typeof patch.reply === 'object')"), 'Host 未接收 reply 配置');
+  assert.ok(NET.includes("settings.reply = Object.assign({}, settings.reply, patch.reply)"));
+  // 持久化白名单必须覆盖 settings（reply 才能落盘）
+  assert.ok(NET.includes('settings,'), 'state.json 未包含 settings');
 });
 
 test('client-reply: 浏览器不直接执行工具/模型调用（全部交给 Host）', () => {

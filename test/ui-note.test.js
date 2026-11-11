@@ -7,6 +7,7 @@ const CLIENT = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
 const RUNNER = readFileSync(new URL('../reply-runner.js', import.meta.url), 'utf8');
 const CORE = readFileSync(new URL('../reply-core.js', import.meta.url), 'utf8');
 const HOST = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+const NET = readFileSync(new URL('../server/network.js', import.meta.url), 'utf8');
 
 function slice(src, start, end) {
   const a = src.indexOf(start);
@@ -20,7 +21,8 @@ test('note: 备注字段随好友持久化，新建好友带空 note', () => {
   assert.ok(CLIENT.includes('MAX_NOTE_LEN = 500'));
   assert.ok(CLIENT.includes('setFriendNote(id, raw)'));
   assert.ok(CLIENT.includes('setFriendProfile(id, aliasRaw, noteRaw)'));
-  assert.ok(CLIENT.includes("alias: '', note: ''"), '新好友未初始化 note');
+  // 新好友由 Host 侧 upsertFriend 初始化 alias/note，浏览器只渲染。
+  assert.ok(NET.includes("alias: '', note: ''"), 'Host 新好友未初始化 note');
 });
 
 test('note: 备注弹窗同时编辑显示名与上下文备注', () => {
@@ -39,7 +41,7 @@ test('note: 有备注的好友在列表显示 📝 标记', () => {
 });
 
 test('note: 自动回复请求把备注一并发给 Host', () => {
-  const block = slice(CLIENT, 'maybeRequestReply(peerId, text) {', '// ── 面板调用的操作');
+  const block = slice(CLIENT, 'maybeRequestReply(peerId, text) {', 'async postReplyControl(kind, id) {');
   assert.ok(block.includes('peerNote: friend && typeof friend.note'), '请求未携带 peerNote');
 });
 

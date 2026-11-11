@@ -92,14 +92,18 @@ test('crypto-identity: 旧版无公钥 hello 兼容但标记未验签', async ()
   assert.deepEqual(result, { ok: true, verified: false, reason: 'legacy' });
 });
 
-test('crypto-identity: client.js 使用同一 payload/指纹约定，且不再生成随机身份 ID', () => {
-  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
-  assert.ok(src.includes("const IDENTITY_KEY = 'dsh-peer-message-identity-v1'"));
+test('crypto-identity: Host 侧使用同一 payload/指纹约定，且不再生成随机身份 ID', () => {
+  // 身份算法现在在 Host 进程（server/network.js）里跑，文件是 0600；
+  // 浏览器只读快照。两边必须沿用同一 canonical payload/指纹约定。
+  const src = readFileSync(new URL('../server/network.js', import.meta.url), 'utf8');
   assert.ok(src.includes("const IDENTITY_FP_HEX_LEN = 40"));
-  assert.ok(src.includes("return 'EC|P-256|' + pub.x + '|' + pub.y;"));
+  assert.ok(src.includes("const publicKeyCanonical = (pub) => 'EC|P-256|' + pub.x + '|' + pub.y;"));
   assert.ok(src.includes('JSON.stringify({ v: HELLO_VERSION, id: peerId, fp: fingerprint, name })'));
-  assert.ok(src.includes("peerId: PEER_ID_PREFIX + fingerprint"));
+  assert.ok(src.includes('peerId: PEER_ID_PREFIX + fingerprint'));
   assert.ok(!src.includes('getStablePeerId()'), '仍存在随机稳定 ID 入口');
-  // 迁移兼容 key 仅用于写派生 ID / 非安全上下文兜底
-  assert.ok(src.includes('LEGACY_PEER_ID_KEY'));
+  assert.ok(!src.includes('randomPeerIdFallback'), '仍存在随机 Peer ID 兜底');
+  // 私钥只允许落在 Host 本地文件，不允许回到浏览器 localStorage
+  const client = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  assert.ok(!client.includes('crypto.subtle'), '浏览器不应再做密钥运算');
+  assert.ok(!client.includes("localStorage.setItem('dsh-peer-message-identity-v1'"), '浏览器不应存私钥');
 });

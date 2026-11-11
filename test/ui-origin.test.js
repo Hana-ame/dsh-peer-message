@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 // 「模型决定的回复」vs「人决定的回复」不能只靠文本前缀：这里守卫来源标记的
 // 解析、入站/出站落库字段、以及 UI 徽标接线。
 const CLIENT = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+const NET = readFileSync(new URL('../server/network.js', import.meta.url), 'utf8');
 const RUNNER = readFileSync(new URL('../reply-runner.js', import.meta.url), 'utf8');
 const TOOL = readFileSync(new URL('../tool.js', import.meta.url), 'utf8');
 
@@ -48,32 +49,39 @@ test('origin: 三类标记语义——人类无标记 / 自动回复 / Agent', (
 });
 
 test('origin: 客户端不再把 [自动回复] 前缀当正文重复显示', () => {
-  const handler = slice(CLIENT, 'handleData(remoteId, data) {', "} else if (data && typeof data === 'object') {");
+  // 入站解析现在在 Host（server/network.js），浏览器只渲染快照里的 origin/trigger。
+  const handler = slice(NET, 'async function handleData(remoteId, data) {', "if (data && typeof data === 'object' && data.type === 'hello') {");
   assert.ok(handler.includes('modelTextInfo(text)'), '入站未解析来源标记');
   assert.ok(handler.includes('const display = info.isModel ? info.display : text'), '未剥离标记');
   assert.ok(handler.includes("const origin = info.isModel ? 'model' : 'human'"), '未计算来源');
   assert.ok(handler.includes("origin, trigger: info.trigger"), '消息未落 origin/trigger 字段');
   assert.ok(handler.includes('lastOrigin: origin') && handler.includes('lastTrigger: info.trigger'));
+  assert.ok(CLIENT.includes("m.origin === 'model' ? h('div', { className: 'pm-msg-origin' }"), 'UI 未渲染来源徽标');
 });
 
-test('origin: 出站队列按 meta 区分自动/人工批准/Agent，并给旧队列项补 [AI]', () => {
-  const deliver = slice(CLIENT, 'async deliverQueued(item) {', '// ── 自动回复（Host 回气管线）');
-  assert.ok(deliver.includes("meta.origin === 'model' || info.isModel || meta.origin === undefined"), '缺省应视为模型来源');
-  assert.ok(deliver.includes("meta.trigger === 'manual' || meta.trigger === 'auto' || meta.trigger === 'agent'"));
-  assert.ok(deliver.includes('AI_AGENT_PREFIX + rawText'), '旧队列项未补 AI 标记');
-  assert.ok(deliver.includes("origin: isModel ? 'model' : 'human', trigger"));
-  assert.ok(deliver.includes('lastOrigin') && deliver.includes('lastTrigger'));
-  assert.ok(deliver.includes('已投递自动回复') && deliver.includes('已投递已批准的回复'));
+test('origin: 出站投递在 Host 侧按 trigger 写回标记与来源', () => {
+  const deliver = slice(NET, 'deliverReply(to, replyText, meta) {', 'hasConn(id) {');
+  assert.ok(deliver.includes("meta.trigger === 'manual' || meta.trigger === 'auto' || meta.trigger === 'agent'"), '缺省 trigger 未归一');
+  assert.ok(deliver.includes('AUTO_REPLY_PREFIX + MANUAL_APPROVAL_MARKER + clean'), '人工批准未加标记');
+  assert.ok(deliver.includes('AI_AGENT_PREFIX + clean'), 'Agent 消息未加标记');
+  assert.ok(deliver.includes('AUTO_REPLY_PREFIX + clean'), '自动回复未加标记');
+  assert.ok(deliver.includes("lastOrigin: 'model', lastTrigger: trigger"));
+  assert.ok(deliver.includes("appendMessage(to, { from: 'me'"), '投递未落库');
 });
 
 test('origin: 人类发送的消息被标记为 human', () => {
-  const send = slice(CLIENT, 'sendMessage(id, draft) {', 'markRead(id) {');
-  assert.ok(send.includes("origin: 'human', trigger: 'human'"), '人类消息缺少 human 来源');
-  assert.ok(send.includes("lastOrigin: 'human'"));
+  const send = slice(NET, 'send(id, text) {', 'addFriend(id) {');
+  assert.ok(send.includes("lastOrigin: 'human', lastTrigger: 'human'"), '人类消息缺少 human 来源');
+  assert.ok(send.includes("appendMessage(id, { from: 'me', text: clean, ts: Date.now(), origin: 'human', trigger: 'human' })"));
+  // 浏览器发消息只 POST 给 Host，不自己拼来源
+  assert.ok(CLIENT.includes("this.postAction('send', { id, text })"));
 });
 
 test('origin: 模型标记消息不会再次触发自动回复（防 AI 互刷）', () => {
-  const req = slice(CLIENT, 'maybeRequestReply(peerId, text) {', '// ── 面板调用的操作');
+  // Host 侧入站就拒绝模型文本入队，浏览器侧触发前再守一次。
+  assert.ok(NET.includes('if (!info.isModel) {'), 'Host 未过滤模型消息');
+  assert.ok(NET.includes('net.inbound.push'), 'Host 未把人类入站文本交给回复管线');
+  const req = slice(CLIENT, 'maybeRequestReply(peerId, text) {', 'async postReplyControl(kind, id) {');
   assert.ok(req.includes('isModelText(clean)'), '循环守卫未覆盖 [AI] 标记');
   assert.ok(!req.includes('startsWith(AUTO_REPLY_PREFIX)'), '仍只识别旧的自动回复前缀');
 });

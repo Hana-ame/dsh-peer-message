@@ -6,7 +6,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js server/*.test.js"
   },
   "keywords": [
     "dsh",
@@ -25,7 +25,8 @@
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
     "./reply-core": "./reply-core.js",
-    "./reply-runner": "./reply-runner.js"
+    "./reply-runner": "./reply-runner.js",
+    "./server/network.js": "./server/network.js"
   },
   "files": [
     "index.js",
@@ -35,6 +36,7 @@
     "validate.js",
     "reply-runner.js",
     "reply-core.js",
+    "server",
     "locale",
     "cordis.patch.yml"
   ],
@@ -51,5 +53,9 @@
         "@deepseek-ai/dsh-client-ui-layout"
       ]
     }
+  },
+  "dependencies": {
+    "@roamhq/wrtc": "^0.10.0",
+    "peerjs": "^1.5.4"
   }
 }
