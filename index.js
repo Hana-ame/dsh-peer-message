@@ -313,11 +313,20 @@ export function apply(ctx) {
       };
       ctx.logger.info?.(`[peer-message] p2p daemon ready (socket ${sockPath()})`);
       return net;
-    })().catch((error) => {
-      ctx.logger.warn(`[peer-message] p2p daemon unavailable: ${String(error && error.message || error)}`);
-      netReady = null;
-      return null;
-    });
+    })()
+      .then((value) => {
+        // 关键：失败路径 resolve 成 null 时也必须清掉 netReady——否则
+        // `if (netReady) return netReady` 会永远返回那个已解析的 null，
+        // 此后不再重试（表现为 host-network-unavailable 永久 503，即使
+        // daemon 后来起来了也要等 dsh 重启才恢复；2026-11-20 实测复现）。
+        if (!value) netReady = null;
+        return value;
+      })
+      .catch((error) => {
+        ctx.logger.warn(`[peer-message] p2p daemon unavailable: ${String(error && error.message || error)}`);
+        netReady = null;
+        return null;
+      });
     return netReady;
   };
 

@@ -92,3 +92,16 @@ test('pushItem preserves a caller-supplied timestamp', () => {
   pushItem({ id: 'm-2', to: 'dsh-pm-aaaabbbb-cccccc', text: 'x', ts: 12345 });
   assert.equal(outbox[0].ts, 12345);
 });
+
+test('ensureNet: 失败后必须清掉缓存，daemon 后起也能恢复（不能永久 host-network-unavailable）', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const start = src.indexOf('const ensureNet = () => {');
+  const block = src.slice(start, start + 2400);
+  // 失败路径（resolve null）必须重置 netReady，否则后续请求永远拿到已解析的 null
+  assert.ok(block.includes('if (!value) netReady = null'), '缺少「resolve null 时清缓存」');
+  assert.ok(block.includes('.catch((error) =>'), '缺少异常分支');
+  assert.ok(block.includes('netReady = null;\n        return null;'), '异常分支未清缓存');
+  // 预热调用存在（冷启动主动拉起）
+  assert.ok(src.includes('\n  ensureNet();'), '缺少启动预热');
+});
