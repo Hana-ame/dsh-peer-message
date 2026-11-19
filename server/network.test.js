@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, existsSync, statSync, readFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createNetwork } from './network.js';
@@ -9,7 +9,7 @@ function fakePeerJS() {
   // Minimal Peer stand-in: opens immediately, records connects, no real WebRTC.
   let seq = 0;
   return class FakePeer {
-    constructor(id) { this.id = id; this.open = false; this.destroyed = false; this.handlers = {}; this.sent = []; }
+    constructor(id, options) { this.id = id; this.options = options || {}; this.open = false; this.destroyed = false; this.disconnected = false; this.handlers = {}; this.sent = []; }
     on(event, handler) { (this.handlers[event] ||= []).push(handler); if (event === 'open') setTimeout(() => { this.open = true; handler(this.id); }, 0); return this; }
     connect(id) {
       const conn = { peer: id, open: false, handlers: {}, send: (payload) => { this.sent.push({ id, payload }); }, close() { conn.open = false; }, on(e, fn) { (conn.handlers[e] ||= []).push(fn); return conn; } };
@@ -18,7 +18,7 @@ function fakePeerJS() {
       return conn;
     }
     destroy() { this.destroyed = true; this.open = false; }
-    reconnect() {}
+    reconnect() { this.reconnectCalls = (this.reconnectCalls || 0) + 1; }
   };
 }
 
@@ -175,32 +175,108 @@ test('host network: daemon 模块存在并暴露健康/状态/动作端点', asy
 });
 
 
-test('host network: 重连永不放弃（PeerJS 云端旧 ID 释放后必须能自愈，且不换身份）', async () => {
+test('host network: 重连永不放弃（reconnect-first + 同 token 接管，不再 destroy 放大风暴）', async () => {
   const { readFileSync } = await import('node:fs');
   const src = readFileSync(new URL('./network.js', import.meta.url), 'utf8');
   // 不再有「尝试 N 次后永久放弃」的短路
   assert.ok(!/retryAttempts\s*>\s*\d+\s*\)\s*return/.test(src), '仍存在放弃重试的短路');
   assert.ok(src.includes('永不放弃'), '缺少永不放弃的说明与实现');
-  // 延迟封顶 30s
-  // 退避封顶 45s；unavailable-id 用更长基线（云端释放需要时间）
-  assert.ok(src.includes("net.peerErrorType === 'unavailable-id' ? 6000 : 2000"), '未区分 unavailable-id 的退避基线');
-  assert.ok(src.includes('Math.min(base * Math.pow(2, Math.min(net.retryAttempts - 1, 3)), 45000)'));
-  // 重试沿用同一身份
-  assert.ok(src.includes('net.peer = null;') && src.includes('initPeer()'));
+  // reconnect-first：恢复必须先尝试同会话接管（同 token 云端直接移交登记），
+  // 绝不允许回到「收到错误立刻 destroy + 随机 token 新建」的旧路（35 分钟风暴的根源）。
+  assert.ok(src.includes('recoverOnce'), '缺少统一恢复入口 recoverOnce');
+  assert.ok(src.includes('peer.reconnect()'), '恢复必须优先 reconnect() 同 token 接管');
+  assert.ok(src.includes('token: net.identity.token'), 'Peer 构造必须携带持久 token');
+  // 重建兜底也用同一身份（initPeer 是唯一构造点）
+  assert.ok(src.includes('initPeer().catch(() => {})'));
+  // unavailable-id 退避更长（那是他方持有/升级过渡期的真冲突，密集重试无意义）
+  assert.ok(src.includes("reason === 'unavailable-id' ? 8000 : 2000"), '未区分 unavailable-id 的退避基线');
+  assert.ok(src.includes('120000'), 'unavailable-id 退避封顶应为 120s');
 });
 
 
 test('host network: 信令既不 open 也不 error 时有看门狗，不会永久卡在 connecting', async () => {
   const { readFileSync } = await import('node:fs');
   const src = readFileSync(new URL('./network.js', import.meta.url), 'utf8');
-  assert.ok(src.includes('openWatchdog'), '缺少信令看门狗');
-  assert.ok(src.includes("net.peerErrorType = 'timeout'"), '看门狗未标记超时');
+  assert.ok(src.includes('armOpenWatchdog'), '缺少信令看门狗 armOpenWatchdog');
   assert.ok(src.includes('}, 25000);'), '看门狗超时不是 25s');
-  // 看门狗触发后走同一套重试（不换身份）
-  const idx = src.indexOf('net.openWatchdog = setTimeout');
-  const block = src.slice(idx, idx + 700);
-  assert.ok(block.includes('scheduleRetry()'), '看门狗未触发重试');
+  // 看门狗触发后销毁并以同一身份同一 token 重建（接管，不是换号）
+  const idx = src.indexOf('function armOpenWatchdog');
+  const block = src.slice(idx, idx + 900);
+  assert.ok(block.includes("net.peerErrorType = 'timeout'"), '看门狗未标记超时');
+  assert.ok(block.includes("scheduleRetry('timeout')"), '看门狗未触发重试');
   assert.ok(!block.includes('generateIdentity'), '看门狗不应更换身份');
+});
+
+
+test('host network: 身份 v2 持久化信令 token（0600），跨重启稳定，且传入 Peer 构造参数', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pm-net-token-'));
+  const net = await makeNet(dir);
+  const snap = net.snapshot();
+  const stored = JSON.parse(readFileSync(snap.identityFile, 'utf8'));
+  assert.equal(stored.v, 2, '新身份必须是 v2');
+  assert.ok(typeof stored.token === 'string' && stored.token.length >= 8, '缺少持久 token');
+  assert.equal(statSync(snap.identityFile).mode & 0o777, 0o600, 'identity file must be 0600');
+  const peer = net.__peerForTest;
+  assert.equal(peer.options.token, stored.token, 'Peer 构造必须携带持久 token（云端同 token 直接接管）');
+  net.stop();
+  // 跨重启：同一文件 → 同一 Peer ID + 同一 token
+  const again = await makeNet(dir);
+  const stored2 = JSON.parse(readFileSync(snap.identityFile, 'utf8'));
+  assert.equal(again.snapshot().myId, snap.myId);
+  assert.equal(stored2.token, stored.token, 'token 必须跨重启稳定');
+  assert.equal(again.__peerForTest.options.token, stored.token);
+  again.stop();
+});
+
+
+test('host network: v1 身份文件就地升级 v2（补写 token，绝不更换 Peer ID）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pm-net-upgrade-'));
+  const seed = await makeNet(dir);
+  const snap = seed.snapshot();
+  seed.stop();
+  // 回写成 v1（无 token），模拟升级前的旧文件
+  const stored = JSON.parse(readFileSync(snap.identityFile, 'utf8'));
+  delete stored.token;
+  stored.v = 1;
+  writeFileSync(snap.identityFile, JSON.stringify(stored), { mode: 0o600 });
+  const net = await makeNet(dir);
+  assert.equal(net.snapshot().myId, snap.myId, '升级不得更换 Peer ID');
+  const upgraded = JSON.parse(readFileSync(snap.identityFile, 'utf8'));
+  assert.equal(upgraded.v, 2, '必须补写 v2');
+  assert.ok(typeof upgraded.token === 'string' && upgraded.token.length >= 8, '必须补写 token');
+  assert.equal(net.__peerForTest.options.token, upgraded.token);
+  net.stop();
+});
+
+
+test('host network: rotateIdentity 换密钥同时换 token（旧 token 绝不复用）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pm-net-rotate-'));
+  const net = await makeNet(dir);
+  const before = JSON.parse(readFileSync(net.snapshot().identityFile, 'utf8'));
+  await net.rotateIdentity();
+  const after = JSON.parse(readFileSync(net.snapshot().identityFile, 'utf8'));
+  assert.notEqual(after.fingerprint, before.fingerprint);
+  assert.ok(after.token && after.token !== before.token, '轮换身份必须同时轮换 token');
+  net.stop();
+});
+
+
+test('host network: 人工发送记 lastHumanOutAt，模型投递绝不刷新它', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pm-net-activity-'));
+  const net = await makeNet(dir);
+  const fid = 'dsh-pm-eeeeeeeeeeeeeeeeeeee';
+  net.addFriend(fid);
+  await new Promise((r) => setTimeout(r, 50)); // 等 fake conn open
+  const sent = net.send(fid, '人工消息');
+  assert.equal(sent.ok, true);
+  let friend = net.snapshot().state.friends.find((f) => f.id === fid);
+  assert.ok(friend.lastHumanOutAt > 0, '人工发送必须记 lastHumanOutAt（supersede 的依据）');
+  const before = friend.lastHumanOutAt;
+  const delivered = net.deliverReply(fid, '模型回复', { trigger: 'auto' });
+  assert.equal(delivered.ok, true);
+  friend = net.snapshot().state.friends.find((f) => f.id === fid);
+  assert.equal(friend.lastHumanOutAt, before, '模型投递绝不能刷新 lastHumanOutAt');
+  net.stop();
 });
 
 

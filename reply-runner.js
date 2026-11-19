@@ -32,6 +32,7 @@ import {
   isAutoReplyText,
   isModelText,
   permissionPolicyFor,
+  sanitizeHistory,
   sanitizeInboundText,
   sanitizePeerNote,
   sanitizeReplyText,
@@ -84,17 +85,60 @@ export function createReplyRunner(deps) {
   const pending = new Map();
   /** runId -> in-flight run */
   const running = new Map();
+  /** peerId -> runId（同一 peer 同一时刻最多一个 running run，见下方串行说明） */
+  const runningByPeer = new Map();
+  /** peerId -> record（run 进行中又收到新消息：跑完当前 run 后带新历史再续一次） */
+  const dirtyByPeer = new Map();
   /** newest-first finished runs */
   let recent = [];
   /** peerId -> dedicated session id */
   const peerSessions = new Map();
   /** sessionId -> tool family enforced by the pre-execute guard */
   const sessionTools = new Map();
+  /**
+   * peerId -> { lastHumanOutAt: number }：daemon 侧「人工出站」时间戳。
+   * 人工 vs LLM 冲突的根治：人在模型生成/待批准期间已经自己回复了，模型草稿
+   * 就必须让位（supersede），绝不再发，否则同一问题会收到人和 AI 两个矛盾答案。
+   * 由 Host 入站泵每次轮询时通过 notePeerActivity() 喂入（daemon 是唯一权威）。
+   */
+  const peerActivity = new Map();
   const rate = createRateGate(deps.rateOptions);
   let disposed = false;
 
   function remember(entry) {
     recent = [entry, ...recent].slice(0, maxRecent);
+  }
+
+  /** 该请求的入站消息之后，人工是否已经直接回过话。 */
+  function humanOutAfter(record) {
+    const act = peerActivity.get(record.peerId);
+    const ts = act && Number(act.lastHumanOutAt);
+    return Number.isFinite(ts) && ts > 0 && ts > record.ts;
+  }
+
+  /** 把一条从未开跑的 pending 记录标记为「已被人工回复取代」并移出队列。 */
+  function supersedePending(record, reason) {
+    if (!pending.delete(record.id)) return false;
+    remember({
+      id: 'reply-' + uuid(),
+      requestId: record.id,
+      peerId: record.peerId,
+      status: 'superseded',
+      startedAt: record.ts,
+      finishedAt: now(),
+      text: record.text.slice(0, 500),
+      error: reason || '人工已直接回复，模型草稿取消',
+    });
+    return true;
+  }
+
+  /** 扫掉所有「人工已经回过」的待批准草稿；返回清除数量。 */
+  function sweepSupersededPending() {
+    let removed = 0;
+    for (const record of [...pending.values()]) {
+      if (humanOutAfter(record) && supersedePending(record)) removed += 1;
+    }
+    return removed;
   }
 
   /** Append the capability pair to a session log (idempotent per run). */
@@ -230,6 +274,7 @@ export function createReplyRunner(deps) {
       config: record.config,
     };
     running.set(runId, entry);
+    runningByPeer.set(record.peerId, runId);
     let session = null;
     let restore = null;
     try {
@@ -256,10 +301,20 @@ export function createReplyRunner(deps) {
         // 本机用户维护的好友备注：作为可信上下文注入，不参与不可信正文围栏。
         peerNote: record.peerNote,
         text: record.text,
+        // 该会话最近的消息记录：模型看得到人说过什么，避免与人工回复矛盾。
+        history: record.history,
       });
       const replyText = await promptAndCollect(session.sessionId, promptText, 'pm-reply-' + uuid());
       const clean = sanitizeReplyText(replyText);
       if (!clean) throw new Error('模型没有生成可发送的回复');
+      // 投递前最后闸口：生成期间人已经自己回复了 → 模型草稿让位，绝不双发。
+      if (humanOutAfter(record)) {
+        entry.status = 'superseded';
+        entry.error = '生成期间人工已直接回复，草稿未发送';
+        entry.finishedAt = now();
+        remember(entry);
+        return entry;
+      }
       // 人工批准 vs 自动决定在 wire 上也区分：前者多一个 [人工批准] 内层标记。
       const outgoing = record.trigger === 'manual' ? wrapManualReply(clean) : wrapAutoReply(clean);
       if (disposed) throw new Error('插件已卸载，取消自动回复');
@@ -289,12 +344,41 @@ export function createReplyRunner(deps) {
       if (error && typeof error.stack === 'string') logger.warn(`p2p-reply: stack: ${error.stack.slice(0, 1800)}`);
     } finally {
       running.delete(runId);
+      if (runningByPeer.get(record.peerId) === runId) runningByPeer.delete(record.peerId);
       if (session && !session.owned) restoreKnobs(session.session, restore);
       if (session && session.owned && disposed) {
         // Dedicated sessions keep their capability pair; nothing to restore.
       }
+      // 串行续跑：run 进行期间该 peer 又来了新消息 → 带着最新历史再回复一次。
+      // 不并发：同一 peer 两个 run 会互相踩上下文，也会产生重复回复。
+      const followup = dirtyByPeer.get(record.peerId);
+      if (followup && !disposed) {
+        dirtyByPeer.delete(record.peerId);
+        // 续跑闸口：不卡 5s 冷却（续跑是对同一会话新消息的延续应答，不是新一轮
+        // 触发；互刷循环已由「模型标记不再触发」挡住），只卡窗口限制。
+        const gate = typeof rate.checkContinuation === 'function' ? rate.checkContinuation(record.peerId, now()) : rate.check(record.peerId, now());
+        if (gate.ok && !humanOutAfter(followup)) {
+          startRun(followup);
+        } else {
+          remember({
+            id: 'reply-' + uuid(),
+            requestId: followup.id,
+            peerId: followup.peerId,
+            status: 'superseded',
+            startedAt: followup.ts,
+            finishedAt: now(),
+            text: followup.text.slice(0, 500),
+            error: humanOutAfter(followup) ? '人工已直接回复，模型草稿取消' : '触发频率限制，未续跑（' + gate.reason + '）',
+          });
+        }
+      }
     }
     return entry;
+  }
+
+  /** 启动一个 run（run() 内部会登记 runningByPeer；auto 直接调用，manual 批准后调用）。 */
+  function startRun(record) {
+    return run(record);
   }
 
   return {
@@ -312,28 +396,56 @@ export function createReplyRunner(deps) {
       if (isModelText(text)) return { accepted: false, reason: 'model-marker' };
       const peerId = typeof (input && input.peerId) === 'string' ? input.peerId.trim() : '';
       if (!peerId) return { accepted: false, reason: 'bad-peer' };
-      const gate = rate.check(peerId, now());
-      if (!gate.ok) return { accepted: false, reason: gate.reason, retryAfterMs: gate.retryAfterMs };
 
-      const record = {
+      const mkRecord = () => ({
         id: 'req-' + uuid(),
         peerId,
         peerName: typeof input.peerName === 'string' ? input.peerName.slice(0, 80) : '',
         peerNote: sanitizePeerNote(input && input.peerNote),
         text,
         config,
+        // 该会话最近的消息记录（sanitize 后有界），注入 prompt 防人工/LLM 内容冲突。
+        history: sanitizeHistory(input && input.history),
         // auto 模式由模型直接决定；manual 由人批准后才运行。
         trigger: config.mode === 'auto' ? 'auto' : 'manual',
         ts: now(),
-      };
+      });
 
+      // manual 合并不产生新的模型调用，先于限流处理：同一 peer 只保留一条待批准，
+      // 新消息到来时把正文/时间/历史更新为最新——批准后模型带着全部上下文只回一次。
+      if (config.mode === 'manual') {
+        for (const existing of pending.values()) {
+          if (existing.peerId !== peerId) continue;
+          existing.text = text;
+          existing.history = sanitizeHistory(input && input.history);
+          existing.ts = now();
+          existing.peerName = typeof input.peerName === 'string' && input.peerName ? input.peerName.slice(0, 80) : existing.peerName;
+          const note = sanitizePeerNote(input && input.peerNote);
+          if (note) existing.peerNote = note;
+          return { accepted: true, mode: 'manual', pendingId: existing.id, pendingCount: pending.size, merged: true };
+        }
+      }
+
+      // auto 串行：该 peer 已有 run 在跑 → 新消息进入 dirty 槽，跑完续一次（带最新历史），
+      // 绝不让两个 run 同时回答同一个人（这正是「人和 AI 抢着答」的镜像版）。
+      // 排队本身不消耗限流额度；续跑时在 finally 里再过闸。
+      if (config.mode === 'auto' && runningByPeer.has(peerId)) {
+        const queuedRecord = mkRecord();
+        dirtyByPeer.set(peerId, queuedRecord);
+        return { accepted: true, mode: 'auto', requestId: queuedRecord.id, queued: true };
+      }
+
+      const gate = rate.check(peerId, now());
+      if (!gate.ok) return { accepted: false, reason: gate.reason, retryAfterMs: gate.retryAfterMs };
+
+      const record = mkRecord();
       if (config.mode === 'manual') {
         if (pending.size >= maxPending) return { accepted: false, reason: 'pending-full' };
         pending.set(record.id, record);
         return { accepted: true, mode: 'manual', pendingId: record.id, pendingCount: pending.size };
       }
 
-      run(record);
+      startRun(record);
       return { accepted: true, mode: 'auto', requestId: record.id };
     },
 
@@ -341,9 +453,33 @@ export function createReplyRunner(deps) {
     approve(pendingId) {
       const record = pending.get(pendingId);
       if (!record) return { ok: false, error: 'pending-not-found' };
+      // 批准闸口：等待期间人已经在聊天里直接回复了 → 草稿让位，不再开跑。
+      if (humanOutAfter(record)) {
+        supersedePending(record);
+        return { ok: false, error: 'superseded-by-human' };
+      }
       pending.delete(pendingId);
-      run(record);
+      // 批准的 run 同样遵守 per-peer 串行：该 peer 有 run 在跑就进 dirty 槽。
+      if (runningByPeer.has(record.peerId)) {
+        dirtyByPeer.set(record.peerId, record);
+        return { ok: true, requestId: record.id, queued: true };
+      }
+      startRun(record);
       return { ok: true, requestId: record.id };
+    },
+
+    /**
+     * 喂入 daemon 侧「人工出站」活动（peerId → { lastHumanOutAt }）。
+     * Host 入站泵每次轮询调用；这里顺手把所有已被人工回复取代的待批准草稿清掉。
+     * @param {Object|Map} activity
+     */
+    notePeerActivity(activity) {
+      const entries = activity instanceof Map ? activity.entries() : Object.entries(activity || {});
+      for (const [peerId, value] of entries) {
+        const lastHumanOutAt = Number(value && value.lastHumanOutAt);
+        peerActivity.set(peerId, { lastHumanOutAt: Number.isFinite(lastHumanOutAt) ? lastHumanOutAt : 0 });
+      }
+      sweepSupersededPending();
     },
 
     /** Drop one parked manual request. */
@@ -413,6 +549,9 @@ export function createReplyRunner(deps) {
       disposed = true;
       pending.clear();
       sessionTools.clear();
+      dirtyByPeer.clear();
+      runningByPeer.clear();
+      peerActivity.clear();
     },
   };
 }

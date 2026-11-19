@@ -307,11 +307,28 @@ test('runner: existing session gets the policy applied then restored', async () 
 
 // ── rate limiting / caps ───────────────────────────────────────────────────
 
-test('runner: per-peer cooldown blocks a second immediate reply', () => {
+test('runner: run 进行中的第二条消息排队续跑（冷却不再丢消息）', async () => {
   const controller = makeController();
+  controller.prompt = (request) => {
+    controller.prompts.push(request);
+    return new Promise(() => { /* 永不放行：run 一直 in-flight */ });
+  };
   const { runner } = makeRunner(controller);
   const first = runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: 'hi', config: CONFIG });
   assert.equal(first.accepted, true);
+  await waitFor(() => controller.prompts.length === 1);
+  const second = runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: 'hi again', config: CONFIG });
+  assert.equal(second.accepted, true, '运行中的第二条必须排队，不再被冷却丢弃');
+  assert.equal(second.queued, true);
+  runner.dispose();
+});
+
+test('runner: run 已结束且仍在冷却窗口内的触发才被冷却拒绝', async () => {
+  const controller = makeController();
+  const { runner, outbox } = makeRunner(controller);
+  const first = runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: 'hi', config: CONFIG });
+  assert.equal(first.accepted, true);
+  await waitFor(() => outbox.length === 1);
   const second = runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: 'hi again', config: CONFIG });
   assert.equal(second.accepted, false);
   assert.equal(second.reason, 'peer-cooldown');
@@ -359,4 +376,133 @@ test('runner: prompt rejection is reported as a failed run', async () => {
   await waitFor(() => runner.snapshot().recent.length === 1);
   assert.equal(outbox.length, 0);
   assert.match(runner.snapshot().recent[0].error, /agent busy permanently/);
+});
+// ── 人工 vs LLM 冲突治理：supersede / 合并 / 串行 / 历史 ────────────────────
+
+test('runner: 同一 peer 的第二条 manual 请求合并进同一条待批准（不堆草稿）', () => {
+  const controller = makeController();
+  const { runner } = makeRunner(controller);
+  const first = runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: '第一句', config: { ...CONFIG, mode: 'manual' } });
+  const second = runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: '第二句', config: { ...CONFIG, mode: 'manual' } });
+  assert.equal(second.merged, true);
+  assert.equal(second.pendingId, first.pendingId, '合并必须复用同一条待批准');
+  const list = runner.snapshot().pending;
+  assert.equal(list.length, 1);
+  assert.equal(list[0].text, '第二句', '合并后正文必须是最新消息');
+});
+
+test('runner: notePeerActivity 清扫「人工已回复」的待批准草稿', () => {
+  const controller = makeController();
+  const { runner } = makeRunner(controller);
+  runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: '在吗', config: { ...CONFIG, mode: 'manual' } });
+  runner.request({ peerId: 'dsh-pm-bbbbbbbb-2', text: '别的', config: { ...CONFIG, mode: 'manual' } });
+  assert.equal(runner.snapshot().pending.length, 2);
+  // 人工只回复了 peer-1（lastHumanOutAt 晚于请求时间）
+  runner.notePeerActivity({ 'dsh-pm-aaaaaaaa-1': { lastHumanOutAt: 1000001 } });
+  const snap = runner.snapshot();
+  assert.equal(snap.pending.length, 1, '只有被人工回复取代的那条被清掉');
+  assert.equal(snap.pending[0].peerId, 'dsh-pm-bbbbbbbb-2');
+  assert.equal(snap.recent[0].status, 'superseded');
+  assert.equal(snap.recent[0].peerId, 'dsh-pm-aaaaaaaa-1');
+});
+
+test('runner: 批准闸口——等待期间人工已回复则拒绝开跑（superseded-by-human）', () => {
+  const controller = makeController();
+  const { runner } = makeRunner(controller);
+  const result = runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: '在吗', config: { ...CONFIG, mode: 'manual' } });
+  runner.notePeerActivity({ 'dsh-pm-aaaaaaaa-1': { lastHumanOutAt: 1000001 } });
+  // 清扫已经把它移出 pending；手工构造「清扫前一刻点批准」的竞态：重新放一条再直接 approve
+  const again = runner.request({ peerId: 'dsh-pm-bbbbbbbb-2', text: '在吗', config: { ...CONFIG, mode: 'manual' } });
+  runner.notePeerActivity({ 'dsh-pm-bbbbbbbb-2': { lastHumanOutAt: 1000002 } });
+  // notePeerActivity 会先清扫；若仍有残留路径（如未来改动），approve 必须兜底拒绝
+  const approved = runner.approve(again.pendingId);
+  assert.equal(approved.ok, false);
+  assert.equal(controller.prompts.length, 0, '被人工取代的请求绝不能开跑');
+  void result;
+});
+
+test('runner: 生成期间人工直接回复 → 草稿让位不发送（pre-send supersede）', async () => {
+  const controller = makeController();
+  controller.prompt = (request) => {
+    controller.prompts.push(request);
+    const session = controller.sessionOf(request.sessionId);
+    setImmediate(() => controller.bus.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } }));
+    return new Promise((resolve) => {
+      controller._release = () => {
+        controller.bus.emit('session/event', session, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '模型答案' }] } } });
+        controller.bus.emit('session/event', session, { type: 'turn/end', data: { turn: 1 } });
+        resolve({ accepted: true });
+      };
+    });
+  };
+  const { runner, outbox } = makeRunner(controller);
+  runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: '在吗', config: CONFIG });
+  await waitFor(() => controller.prompts.length === 1);
+  // 模型生成期间，人在聊天里直接回复了（daemon 记 lastHumanOutAt，泵喂给 runner）
+  runner.notePeerActivity({ 'dsh-pm-aaaaaaaa-1': { lastHumanOutAt: 1000001 } });
+  controller._release();
+  await waitFor(() => runner.snapshot().recent.length === 1);
+  assert.equal(outbox.length, 0, '人工已回复后绝不能再发模型草稿');
+  assert.equal(runner.snapshot().recent[0].status, 'superseded');
+});
+
+/** 手动放行 turn 的 controller：每次 prompt 登记一个待放行 turn，releaseNext 放走最早一个。 */
+function makeManualTurnController() {
+  const controller = makeController();
+  controller.turns = [];
+  controller.prompt = (request) => {
+    controller.prompts.push(request);
+    const turnNo = controller.prompts.length;
+    const session = controller.sessionOf(request.sessionId);
+    return new Promise((resolve) => {
+      controller.turns.push(() => {
+        controller.bus.emit('session/event', session, { type: 'turn/start', data: { turn: turnNo } });
+        controller.bus.emit('session/event', session, { type: 'assistant/message', data: { turn: turnNo, message: { content: [{ type: 'text', text: '回复' + turnNo }] } } });
+        controller.bus.emit('session/event', session, { type: 'turn/end', data: { turn: turnNo } });
+        resolve({ accepted: true });
+      });
+    });
+  };
+  controller.releaseNext = () => { const turn = controller.turns.shift(); if (turn) turn(); };
+  return controller;
+}
+
+test('runner: 同 peer 自动回复严格串行（run 进行中再收到消息 → 跑完续一次，不并发）', async () => {
+  const controller = makeManualTurnController();
+  const { runner, outbox } = makeRunner(controller);
+  const first = runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: '一', config: CONFIG });
+  assert.equal(first.accepted, true);
+  assert.ok(!first.queued, '第一条必须立即开跑');
+  await waitFor(() => controller.prompts.length === 1);
+  const second = runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: '二', config: CONFIG });
+  assert.equal(second.queued, true, '第二条必须排队等第一条跑完');
+  controller.releaseNext();
+  await waitFor(() => outbox.length === 1);
+  await waitFor(() => controller.prompts.length === 2, 2000);
+  controller.releaseNext();
+  await waitFor(() => outbox.length === 2);
+  assert.match(outbox[0].text, /回复1/);
+  assert.match(outbox[1].text, /回复2/);
+  assert.equal(runner.snapshot().running.length, 0);
+});
+
+test('runner: 会话历史进入 prompt（带角色标签，模型不再盲答）', async () => {
+  const controller = makeController();
+  const { runner, outbox } = makeRunner(controller);
+  runner.request({
+    peerId: 'dsh-pm-aaaaaaaa-1',
+    text: '那明天呢',
+    config: CONFIG,
+    history: [
+      { from: 'them', origin: 'human', trigger: 'human', text: '今晚一起吃饭？' },
+      { from: 'me', origin: 'human', trigger: 'human', text: '今晚加班，改明天' },
+      { from: 'me', origin: 'model', trigger: 'auto', text: '[自动回复] 旧回复' },
+    ],
+  });
+  await waitFor(() => outbox.length === 1);
+  const promptText = controller.prompts[0].content[0].text;
+  assert.ok(promptText.includes('<conversation_history>'), 'prompt 缺少对话记录块');
+  assert.ok(promptText.includes('[对方] 今晚一起吃饭？'), '对方条目角色标签错误');
+  assert.ok(promptText.includes('[我（人工）] 今晚加班，改明天'), '人工条目角色标签错误');
+  assert.ok(promptText.includes('[我（AI·自动回复）]'), 'AI 条目角色标签错误');
 });

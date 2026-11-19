@@ -110,23 +110,34 @@ export function apply(ctx) {
           // 先看有没有待处理消息，避免每条都消耗一次 socket 往返；
           // 真正消费用 /inbound（唯一消费方，浏览器只窥视）。
           const snapshot = await instance.snapshot();
+          const friends = (snapshot.state && snapshot.state.friends) || [];
+          // 每个周期都喂「人工出站」活动（daemon 权威）：人在聊天里直接回复后，
+          // 待批准/生成中的模型草稿必须让位（supersede），不能人答一遍 AI 再答一遍。
+          if (runner && typeof runner.notePeerActivity === 'function') {
+            const activity = {};
+            for (const friend of friends) activity[friend.id] = { lastHumanOutAt: friend.lastHumanOutAt || 0 };
+            try { runner.notePeerActivity(activity); } catch (error) { /* ignore */ }
+          }
           const pending = Array.isArray(snapshot.inbound) ? snapshot.inbound : [];
           if (!pending.length) return;
           const settings = (snapshot.state && snapshot.state.settings) || {};
           const reply = settings.reply || {};
           if (reply.mode === 'off') return; // 关闭时保留在队列里，不消费
-          const friends = (snapshot.state && snapshot.state.friends) || [];
           const { items } = await instance.drainInbound();
           const inbound = Array.isArray(items) ? items : [];
+          const allMessages = (snapshot.state && snapshot.state.messages) || {};
           for (const item of inbound) {
             if (!item || typeof item.peerId !== 'string' || typeof item.text !== 'string') continue;
             const friend = friends.find((f) => f.id === item.peerId);
+            // 会话最近消息一并交给 runner（模型看得到人刚说过什么，不再盲答冲突）。
+            const history = Array.isArray(allMessages[item.peerId]) ? allMessages[item.peerId].slice(-15) : [];
             runner.request({
               peerId: item.peerId,
               peerName: friend ? (friend.alias || friend.name || '') : '',
               // 本机备注是可信上下文，正文是不可信对端文本（reply-core 会围栏）。
               peerNote: friend && typeof friend.note === 'string' ? friend.note : '',
               text: item.text,
+              history,
               config: reply,
             });
           }

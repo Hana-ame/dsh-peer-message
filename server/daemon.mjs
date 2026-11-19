@@ -217,15 +217,16 @@ const API_DOC = {
     },
     actions: Object.keys(ACTIONS),
     fields: {
-      friend: ['id', 'name', 'alias', 'note', 'online', 'verified', 'fingerprint', 'unread', 'lastMsg', 'lastTs', 'lastOrigin', 'lastTrigger'],
+      friend: ['id', 'name', 'alias', 'note', 'online', 'verified', 'fingerprint', 'unread', 'lastMsg', 'lastTs', 'lastOrigin', 'lastTrigger', 'lastHumanOutAt'],
       message: ['from', 'text', 'ts', 'origin', 'trigger'],
       settings: ['allowBroadcast', 'allowIncoming', 'nickname', 'reply'],
       reply: ['mode', 'permission', 'provider', 'model', 'reasoningEffort', 'sessionMode', 'sessionId', 'cwd'],
     },
     notes: [
       'Peer ID is derived from the identity public key and never randomized.',
+      'Identity v2 persists a signaling token: the PeerJS cloud hands the ID registration to any reconnect carrying the same token, so our own stale registrations (network drop, restart, machine reboot) are reclaimed instantly and unavailable-id storms cannot self-sustain. ID-TAKEN now means a foreign token holds the ID (copied identity elsewhere or pre-upgrade stale registration, released by the cloud within ~40 min at most).',
       'verified/fingerprint are only ever written by a successful hello signature check (patchFriend cannot set them).',
-      'send trigger: "human" (normal) or "human-reply" (a person answering instead of the model).',
+      'send trigger: "human" (normal) or "human-reply" (a person answering instead of the model); both stamp friend.lastHumanOutAt, which the auto-reply pipeline uses to supersede model drafts the human has already answered.',
       'deliver meta.trigger: "auto" | "manual" | "agent".',
     ],
 };

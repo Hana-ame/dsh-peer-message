@@ -350,6 +350,18 @@ window.__ModuleLoader__.load({
       '.pm-peer-error-box{margin-top:8px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-state-error-primary,#ef4444);background:var(--dsw-alias-interactive-bg-hover-danger,rgba(239,68,68,.08));}',
       '.pm-peer-error-box .pm-peer-error{margin-top:0;font-size:10px;}',
       '.pm-peer-error-actions{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;}',
+      // 自我恢复中的等待提示：中性色（断网留下的云端旧登记会自动释放/被接管，不该用红色吓用户）。
+      '.pm-peer-wait{margin-top:8px;padding:6px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.25));background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.08));font-size:10px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit);}',
+      // 身份在另一处运行：警告色（不是故障红，是需要用户决策的黄）。
+      '.pm-peer-warn-box{margin-top:8px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);background:color-mix(in srgb,var(--dsw-alias-state-warning-primary,#f59e0b) 8%,transparent);}',
+      '.pm-peer-warn-box .pm-peer-error{color:color-mix(in srgb,var(--dsw-alias-state-warning-primary,#f59e0b) 80%,var(--dsw-alias-label-primary,#000));margin-top:0;font-size:10px;}',
+      // 聊天区内联：AI 正在组织回复 + 待批准内联卡片。
+      '.pm-ai-typing{align-self:flex-start;font-size:11px;color:var(--dsw-alias-label-secondary,inherit);padding:4px 10px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.1));}',
+      '.pm-reply-inline{margin:0 20px 8px;padding:10px 12px;border-radius:10px;border:1px solid var(--dsw-alias-state-warning-primary,#f59e0b);background:color-mix(in srgb,var(--dsw-alias-state-warning-primary,#f59e0b) 6%,transparent);display:flex;flex-direction:column;gap:6px;}',
+      '.pm-reply-inline-head{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dsw-alias-label-secondary,inherit);flex-wrap:wrap;}',
+      '.pm-reply-inline-text{font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;max-height:90px;overflow-y:auto;color:var(--dsw-alias-label-primary,inherit);}',
+      '.pm-reply-inline-btns{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;}',
+      '.pm-reply-status-sup{color:var(--dsw-alias-label-secondary,inherit);}',
       // 显示名称行：昵称 + 身份密钥入口
       '.pm-nick-row{display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11px;color:var(--dsw-alias-label-secondary,inherit);min-width:0;}',
       '.pm-nick-label{white-space:nowrap;flex:none;}',
@@ -528,6 +540,7 @@ window.__ModuleLoader__.load({
       peerStatus: 'connecting',    // connecting | online | offline | error | closed
       peerError: '',
       peerErrorType: '',
+      peerErrorSince: 0,           // 进入错误态的时间戳（daemon 快照）
       role: 'host',                // 连接由 DSH Host 进程持有
       identityFile: '',
       stateFile: '',
@@ -569,6 +582,7 @@ window.__ModuleLoader__.load({
             peerStatus: this.peerStatus,
             peerError: this.peerError,
             peerErrorType: this.peerErrorType,
+            peerErrorSince: this.peerErrorSince,
             toast: this.toast,
             settings: this.settings,
             reply: this.settings.reply,
@@ -621,6 +635,7 @@ window.__ModuleLoader__.load({
         if (typeof snap.peerStatus === 'string') this.peerStatus = snap.peerStatus;
         if (typeof snap.peerError === 'string') this.peerError = snap.peerError;
         if (typeof snap.peerErrorType === 'string') this.peerErrorType = snap.peerErrorType;
+        if (typeof snap.peerErrorSince === 'number') this.peerErrorSince = snap.peerErrorSince;
         if (typeof snap.identityFile === 'string') this.identityFile = snap.identityFile;
         if (typeof snap.stateFile === 'string') this.stateFile = snap.stateFile;
         this.identity = { secured: !!snap.secured, fingerprint: snap.fingerprint || '', peerId: snap.myId || '' };
@@ -867,7 +882,8 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ id }),
           });
           const data = await res.json().catch(() => ({}));
-          if (data && data.ok) this.showToast(kind === 'approve' ? '已批准并发送该回复' : '已拒绝该回复请求');
+          if (data && data.ok) this.showToast(kind === 'approve' ? '已批准，正在生成并发送该回复' : '已拒绝该回复请求');
+          else if (data && data.error === 'superseded-by-human') this.showToast('你已在聊天中直接回复，该模型草稿已自动取消');
           else this.showToast('操作失败');
           this.pollReplies();
           return data;
@@ -1092,8 +1108,8 @@ window.__ModuleLoader__.load({
             h('div', { className: 'pm-modal-section-title' }, '最近结果'),
             h('div', { className: 'pm-reply-status-list' },
               recentItems.map(item => h('div', { className: 'pm-reply-status-row', key: item.id },
-                h('span', { className: item.status === 'sent' ? 'pm-reply-status-ok' : item.status === 'failed' ? 'pm-reply-status-bad' : '' },
-                  item.status === 'sent' ? '已投递' : item.status === 'failed' ? '失败' : item.status),
+                h('span', { className: item.status === 'sent' ? 'pm-reply-status-ok' : item.status === 'failed' ? 'pm-reply-status-bad' : item.status === 'superseded' ? 'pm-reply-status-sup' : '' },
+                  item.status === 'sent' ? '已投递' : item.status === 'failed' ? '失败' : item.status === 'superseded' ? '已被人工回复取代' : item.status),
                 h('span', null, shortId(item.peerId) + (item.finishedAt ? ' · ' + fmtTime(item.finishedAt) : '')),
                 h('span', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
                   item.reply || item.error || ''),
@@ -1112,6 +1128,7 @@ window.__ModuleLoader__.load({
       const peerStatus = snap.peerStatus;
       const peerError = snap.peerError;
       const peerErrorType = snap.peerErrorType;
+      const peerErrorSince = snap.peerErrorSince || 0;
       const role = snap.role || 'candidate';
       const secured = !!snap.secured;
       const identityFingerprint = snap.fingerprint || '';
@@ -1145,6 +1162,8 @@ window.__ModuleLoader__.load({
       const [ctxMenu, setCtxMenu] = React.useState(null);
       // 删除确认：{ id, name }。确认框打开前不会有任何 removeFriend 调用。
       const [confirmDel, setConfirmDel] = React.useState(null);
+      // 内联「人工回复」输入框（当前会话有待批准草稿时显示在输入区上方）。
+      const [inlineHumanDraft, setInlineHumanDraft] = React.useState('');
       const chatRef = React.useRef(null);
 
       const openReplySettings = () => {
@@ -1217,6 +1236,22 @@ window.__ModuleLoader__.load({
 
       const active = activeFriend ? state.friends.find(f => f.id === activeFriend) : null;
       const activeMsgs = activeFriend ? (state.messages[activeFriend] || []) : [];
+      // 当前会话的自动回复活动：待批准草稿（内联卡片）与生成中（「AI 正在输入」）。
+      // 让人一眼看到「AI 即将作答」，避免人与 AI 同时答复同一条消息。
+      const activeReplyPending = activeFriend ? replyPending.filter(p => p && p.peerId === activeFriend) : [];
+      const activeReplyRunning = activeFriend && Array.isArray(snap.replyRunning) ? snap.replyRunning.filter(r => r && r.peerId === activeFriend) : [];
+      const latestPending = activeReplyPending.length ? activeReplyPending[activeReplyPending.length - 1] : null;
+      const sendInlineHuman = () => {
+        const text = inlineHumanDraft.trim();
+        if (!text || !active) return;
+        pmService.sendHumanMessage(active.id, text, 'human-reply').then((ok) => {
+          if (!ok) return;
+          setInlineHumanDraft('');
+          // 人工已经回复，这条（些）模型草稿不再需要批准。
+          for (const p of activeReplyPending) pmService.rejectReply(p.id);
+          pmService.showToast('已发送人工回复（模型草稿已丢弃）');
+        });
+      };
 
       const selectFriend = (id) => {
         setActiveFriend(id);
@@ -1283,14 +1318,35 @@ window.__ModuleLoader__.load({
                 : '身份未启用（后台密钥缺失）'),
               h('span', { className: 'pm-link-btn' }, '查看'),
             ),
-            // 错误提示放在折叠区之外：连接故障不属于「可选设置」，必须可见。
-            peerError ? h('div', { className: 'pm-peer-error-box' },
-              h('div', { className: 'pm-peer-error' }, peerError),
-              h('div', { className: 'pm-peer-error-actions' },
-                h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.retryPeer() }, '重试连接'),
-                peerErrorType === 'unavailable-id' ? h('button', { className: 'pm-btn small', type: 'button', onClick: () => setShowIdentity(true) }, '身份密钥') : null,
-              ),
-            ) : null,
+            // 连接状态分级显示（放在折叠区之外，必须可见）：
+            //  1) unavailable-id 且 <120s：断网留下的云端旧登记会被同 token 自动接管/释放，
+            //     属于可自愈的等待 —— 中性提示，不亮红灯；
+            //  2) identity-elsewhere：同一身份在另一处运行（复制体互相挤下线）—— 警告色，
+            //     需要用户决策（关掉另一处或轮换身份），不是故障；
+            //  3) 其余错误 / 持续 ≥120s 的真冲突 —— 红色错误框。
+            peerError ? (() => {
+              const waitedSec = peerErrorSince ? Math.max(0, Math.round((Date.now() - peerErrorSince) / 1000)) : 0;
+              if (peerErrorType === 'unavailable-id' && waitedSec < 120) {
+                return h('div', { className: 'pm-peer-wait' },
+                  '等待云端释放旧登记：自动接管/恢复中（已等待 ' + waitedSec + 's，通常几十秒内恢复），Peer ID 不会更换。');
+              }
+              if (peerErrorType === 'identity-elsewhere') {
+                return h('div', { className: 'pm-peer-warn-box' },
+                  h('div', { className: 'pm-peer-error' }, peerError),
+                  h('div', { className: 'pm-peer-error-actions' },
+                    h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.retryPeer() }, '立即重连'),
+                    h('button', { className: 'pm-btn small', type: 'button', onClick: () => setShowIdentity(true) }, '身份密钥'),
+                  ),
+                );
+              }
+              return h('div', { className: 'pm-peer-error-box' },
+                h('div', { className: 'pm-peer-error' }, peerError),
+                h('div', { className: 'pm-peer-error-actions' },
+                  h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.retryPeer() }, '重试连接'),
+                  peerErrorType === 'unavailable-id' ? h('button', { className: 'pm-btn small', type: 'button', onClick: () => setShowIdentity(true) }, '身份密钥') : null,
+                ),
+              );
+            })() : null,
             // 展开/收起「更多设置」（默认收起）
             h('button', {
               className: 'pm-more-toggle',
@@ -1416,7 +1472,33 @@ window.__ModuleLoader__.load({
                       h('div', { className: 'pm-msg-body' }, m.text),
                       h('div', { className: 'pm-msg-time' }, fmtTime(m.ts)),
                     )),
+                // 「AI 正在输入」指示：模型正在为当前会话组织回复时可见，
+                // 人看到后可选择等它、或直接人工回复（草稿会自动让位）。
+                activeReplyRunning.length ? h('div', { className: 'pm-ai-typing' }, 'AI 正在组织回复…（你直接回复的话，它的草稿会自动让位）') : null,
               ),
+              // 待批准内联卡片：不用翻弹窗，在当前会话里直接处理。
+              latestPending ? h('div', { className: 'pm-reply-inline' },
+                h('div', { className: 'pm-reply-inline-head' },
+                  h('span', { className: 'pm-pending-origin' }, 'AI · 待批准'),
+                  h('span', null, '对方 ' + fmtTime(latestPending.ts) + ' 发来消息，等待你决定是否让 AI 回复'),
+                ),
+                h('div', { className: 'pm-reply-inline-text' }, latestPending.text),
+                h('div', { className: 'pm-reply-inline-btns' },
+                  h('button', { className: 'pm-btn small', type: 'button', onClick: () => pmService.rejectReply(latestPending.id) }, '忽略'),
+                  h('button', { className: 'pm-btn small primary', type: 'button', onClick: () => pmService.approveReply(latestPending.id) }, '批准 AI 回复'),
+                ),
+                h('textarea', {
+                  className: 'pm-pending-human-input',
+                  placeholder: '或者你直接人工回复（发送后模型草稿自动让位）…',
+                  maxLength: MAX_TEXT_LEN,
+                  value: inlineHumanDraft,
+                  onChange: e => setInlineHumanDraft(e.target.value),
+                  onKeyDown: e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendInlineHuman(); } },
+                }),
+                h('div', { className: 'pm-reply-inline-btns' },
+                  h('button', { className: 'pm-btn small', type: 'button', disabled: !inlineHumanDraft.trim(), onClick: sendInlineHuman }, '发送人工回复'),
+                ),
+              ) : null,
               h('div', { className: 'pm-chat-input' },
                 h('textarea', { className: 'pm-chat-textarea', placeholder: active.online ? '输入消息…' : '对方离线，消息无法送达', value: draft, onChange: e => setDraft(e.target.value), onKeyDown: e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); trySend(); } }, disabled: !active.online }),
                 h('button', { className: 'pm-send-btn', onClick: trySend, disabled: !draft.trim() || !active.online }, '发送'),

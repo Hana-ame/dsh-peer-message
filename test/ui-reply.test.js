@@ -81,7 +81,8 @@ test('client-reply: 待批准/忽略走 Host 路由并刷新列表', () => {
   // approve/reject 统一走 postReplyControl(kind)，路由在运行时拼接。
   assert.ok(SRC.includes("const API_ACTION = '/api/pm-net/action'") === false || true);
   assert.ok(SRC.includes("fetch('/api/pm-reply/' + kind"), '缺少 approve/reject 路由调用');
-  assert.ok(SRC.includes("kind === 'approve' ? '已批准并发送该回复' : '已拒绝该回复请求'"));
+  assert.ok(SRC.includes("kind === 'approve' ? '已批准，正在生成并发送该回复' : '已拒绝该回复请求'"), '缺少批准/拒绝提示');
+  assert.ok(SRC.includes("data.error === 'superseded-by-human'"), '缺少「人工已回复取代」的友好提示');
   assert.ok(SRC.includes("fetch('/api/pm-reply/requests'"), '缺少待批准轮询');
   assert.ok(SRC.includes('approveReply(') && SRC.includes('rejectReply('));
 });

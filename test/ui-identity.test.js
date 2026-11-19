@@ -125,15 +125,16 @@ test('identity: 身份文件首次生成后稳定，重启不变 Peer ID', () =>
   assert.ok(NET.includes("logger.warn('[peer-message] identity file malformed; regenerating')"));
 });
 
-test('identity: unavailable-id 提示说明 Host 侧单持有，不再随机换 ID', () => {
+test('identity: unavailable-id 提示区分自愈等待与他方持有，不再随机换 ID', () => {
   const err = slice(NET, "peer.on('error', (error) => {", "peer.on('close'");
   assert.ok(err.includes("type === 'unavailable-id'"));
-  assert.ok(err.includes('Peer ID 被占用'));
-  // 文案区分短时（多半本机多进程）与长时（云端旧登记）两种原因，且永远不换随机 ID。
-  assert.ok(err.includes('不会随机更换') || err.includes('不会随机'), '未声明不随机换 ID');
+  assert.ok(err.includes('被占用'), '缺少占用提示');
+  // 文案区分短时（同 token 接管，几十秒自愈）与长时（他方不同 token / 升级前旧登记），
+  // 且永远不换随机 ID。
+  assert.ok(err.includes('不会随机更换') || err.includes('绝不换 ID'), '未声明不随机换 ID');
   assert.ok(err.includes('sinceUnavailable'), '缺少占用时长判定');
-  assert.ok(err.includes('云端仍保留着这个 ID 的旧登记'), '未解释长时间占用的真实原因');
-  assert.ok(err.includes('同一身份重试'), '未说明持续用同一身份重试');
+  assert.ok(err.includes('升级前的旧登记'), '未解释长时间占用的真实原因');
+  assert.ok(err.includes('同一身份') && err.includes('重试'), '未说明持续用同一身份重试');
   assert.ok(CLIENT.includes("onClick: () => pmService.retryPeer() }, '重试连接'"));
   assert.ok(CLIENT.includes("onClick: () => setShowIdentity(true) }, '身份密钥'"));
   assert.ok(!CLIENT.includes('重置 Peer ID'), '仍存在随机重置入口');
