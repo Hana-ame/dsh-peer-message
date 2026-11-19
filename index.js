@@ -118,6 +118,11 @@ export function apply(ctx) {
             for (const friend of friends) activity[friend.id] = { lastHumanOutAt: friend.lastHumanOutAt || 0 };
             try { runner.notePeerActivity(activity); } catch (error) { /* ignore */ }
           }
+          // 排队续跑兜底：run 很短时泵到达总看到 running=空，finally 的续跑触发
+          // 已经错过 → 没有这一步第二条及以后的消息会被静默吞掉（E2E 实测复现）。
+          if (runner && typeof runner.pumpQueued === 'function') {
+            try { runner.pumpQueued(); } catch (error) { /* ignore */ }
+          }
           const pending = Array.isArray(snapshot.inbound) ? snapshot.inbound : [];
           if (!pending.length) return;
           const settings = (snapshot.state && snapshot.state.settings) || {};

@@ -506,3 +506,39 @@ test('runner: 会话历史进入 prompt（带角色标签，模型不再盲答�
   assert.ok(promptText.includes('[我（人工）] 今晚加班，改明天'), '人工条目角色标签错误');
   assert.ok(promptText.includes('[我（AI·自动回复）]'), 'AI 条目角色标签错误');
 });
+
+test('runner: 泵兜底——run 结束后才到达的消息经 pumpQueued 续跑，绝不静默吞掉', async () => {
+  // 复刻 E2E 实测 bug：run 进行中第二条进 dirty；run 很短，finally 里窗口满被
+  // checkContinuation 拒 → 留槽；之后泵到达时 running=空，没有 pumpQueued 这条
+  // 消息永远不见天日。用「窗口=每 peer 1 条/分钟」精确复现留槽路径。
+  const controller = makeController();
+  controller.prompt = (request) => {
+    controller.prompts.push(request);
+    const turnNo = controller.prompts.length;
+    const session = controller.sessionOf(request.sessionId);
+    return new Promise((resolve) => {
+      controller['turn' + turnNo] = () => {
+        controller.bus.emit('session/event', session, { type: 'turn/start', data: { turn: turnNo } });
+        controller.bus.emit('session/event', session, { type: 'assistant/message', data: { turn: turnNo, message: { content: [{ type: 'text', text: '回复' + turnNo }] } } });
+        controller.bus.emit('session/event', session, { type: 'turn/end', data: { turn: turnNo } });
+        resolve({ accepted: true });
+      };
+    });
+  };
+  const { runner, outbox, advance } = makeRunner(controller, { rateOptions: { perPeerMs: 0, maxPerPeer: 1, maxGlobal: 1000, windowMs: 60000 } });
+  runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: '第一', config: CONFIG });
+  await waitFor(() => controller.prompts.length === 1);
+  const second = runner.request({ peerId: 'dsh-pm-aaaaaaaa-1', text: '第二', config: CONFIG });
+  assert.equal(second.queued, true, 'run 进行中第二条必须进 dirty 槽');
+  controller.turn1(); // run1 结束 → finally 续跑被窗口拒 → 留槽
+  await waitFor(() => outbox.length === 1);
+  assert.equal(runner.snapshot().running.length, 0, '此刻没有 run 在跑（泵看到的就是这个状态）');
+  assert.equal(controller.prompts.length, 1, '没有泵兜底第二条永远不会被 prompt');
+  assert.equal(runner.pumpQueued(), 0, '窗口满时 pumpQueued 不强行放行');
+  advance(61000); // 窗口滑出
+  assert.equal(runner.pumpQueued(), 1, '窗口滑出后泵兜底必须放行滞留消息');
+  await waitFor(() => controller.prompts.length === 2);
+  controller.turn2();
+  await waitFor(() => outbox.length === 2);
+  assert.match(outbox[1].text, /回复2/);
+});

@@ -353,27 +353,45 @@ export function createReplyRunner(deps) {
       // 不并发：同一 peer 两个 run 会互相踩上下文，也会产生重复回复。
       const followup = dirtyByPeer.get(record.peerId);
       if (followup && !disposed) {
-        dirtyByPeer.delete(record.peerId);
-        // 续跑闸口：不卡 5s 冷却（续跑是对同一会话新消息的延续应答，不是新一轮
-        // 触发；互刷循环已由「模型标记不再触发」挡住），只卡窗口限制。
-        const gate = typeof rate.checkContinuation === 'function' ? rate.checkContinuation(record.peerId, now()) : rate.check(record.peerId, now());
-        if (gate.ok && !humanOutAfter(followup)) {
-          startRun(followup);
-        } else {
-          remember({
-            id: 'reply-' + uuid(),
-            requestId: followup.id,
-            peerId: followup.peerId,
-            status: 'superseded',
-            startedAt: followup.ts,
-            finishedAt: now(),
-            text: followup.text.slice(0, 500),
-            error: humanOutAfter(followup) ? '人工已直接回复，模型草稿取消' : '触发频率限制，未续跑（' + gate.reason + '）',
-          });
-        }
+        // 只负责出槽，是否续跑由 tryStartQueued 统一判定（泵轮询时也会调用，
+        // 覆盖「泵到的时候 run 已经跑完」这条消息绝不能被静默吞掉的路径）。
+        tryStartQueued(record.peerId);
       }
     }
     return entry;
+  }
+
+  /**
+   * 尝试为 peerId 启动 dirty 槽里的排队 run。
+   * 两个调用方：run 的 finally（跑完立即续）、Host 泵每个轮询周期（兜底——
+   * 泵到达时 run 往往早已跑完，没有泵兜底这条消息会被静默吞掉）。
+   * @returns {boolean} 是否启动了续跑
+   */
+  function tryStartQueued(peerId) {
+    const followup = dirtyByPeer.get(peerId);
+    if (!followup || disposed) return false;
+    if (runningByPeer.has(peerId)) return false; // 还有 run 在跑，等它的 finally
+    if (humanOutAfter(followup)) {
+      dirtyByPeer.delete(peerId);
+      remember({
+        id: 'reply-' + uuid(),
+        requestId: followup.id,
+        peerId,
+        status: 'superseded',
+        startedAt: followup.ts,
+        finishedAt: now(),
+        text: followup.text.slice(0, 500),
+        error: '人工已直接回复，模型草稿取消',
+      });
+      return false;
+    }
+    // 续跑闸口：不卡 5s 冷却（续跑是对同一会话新消息的延续应答，不是新一轮
+    // 触发；互刷循环已由「模型标记不再触发」挡住），只卡窗口限制。
+    const gate = typeof rate.checkContinuation === 'function' ? rate.checkContinuation(peerId, now()) : rate.check(peerId, now());
+    if (!gate.ok) return false; // 窗口满：留槽，下个泵周期再试
+    dirtyByPeer.delete(peerId);
+    startRun(followup);
+    return true;
   }
 
   /** 启动一个 run（run() 内部会登记 runningByPeer；auto 直接调用，manual 批准后调用）。 */
@@ -480,6 +498,19 @@ export function createReplyRunner(deps) {
         peerActivity.set(peerId, { lastHumanOutAt: Number.isFinite(lastHumanOutAt) ? lastHumanOutAt : 0 });
       }
       sweepSupersededPending();
+    },
+
+    /**
+     * 泵兜底：为有排队消息的 peer 尝试续跑。Host 入站泵每个轮询周期调用——
+     * run 往往早已跑完（窗口内），没有这一步排队消息会被静默吞掉。
+     * @returns {number} 本次启动的续跑数量
+     */
+    pumpQueued() {
+      let started = 0;
+      for (const peerId of [...dirtyByPeer.keys()]) {
+        if (tryStartQueued(peerId)) started += 1;
+      }
+      return started;
     },
 
     /** Drop one parked manual request. */
