@@ -36,19 +36,23 @@ const STUN = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:global.stu
 /**
  * 信令服务器配置。
  *
- * 默认仍走 PeerJS 云端（0.peerjs.com）；设置 PM_SIGNAL_URL 则改走自建信令
- * （api-pack 的 internal/service/pmsignal，peerjs 1.5.4 线协议兼容）：
+ * **默认走自建信令 `https://signal.moonchan.xyz/`**（api-pack 的 pm-signal，
+ * peerjs 1.5.4 线协议兼容；nginx 反代 + CF 橙云已部署实测）。
+ * 用户裁定（2026-11-20）：message 插件默认就用自己的信令，不再依赖
+ * 0.peerjs.com 云端——自建信令同 Peer ID 新连接直接顶掉旧的、15s 无心跳
+ * 即释放 ID，unavailable-id 风暴的土壤（旧登记残留 35 分钟）整体消失。
  *
- *   PM_SIGNAL_URL=http://127.0.0.1:9600/     # 本机
- *   PM_SIGNAL_URL=https://signal.example.com/ # 远端反代
- *
- * 自建信令的行为差异（刻意设计）：同 Peer ID 新连接直接顶掉旧的、15s 无心跳即
- * 释放 ID。云端则按 token 判占用、旧登记可残留 35 分钟——那是 unavailable-id
- * 风暴的来源；持久 token（身份 v2）已在客户端侧兜住，两者可叠加使用。
+ * 覆盖方式：
+ *   PM_SIGNAL_URL=https://signal.moonchan.xyz/   # 改默认（任何 http(s)://…/ 均可）
+ *   PM_SIGNAL_URL=cloud                          # 特殊值：显式回落 PeerJS 云端
+ *   PM_SIGNAL_KEY                                # 客户端 key（默认 peerjs）
  */
+const DEFAULT_SIGNAL_URL = 'https://signal.moonchan.xyz/';
+
 function signalingOptions(logger) {
-  const raw = typeof process.env.PM_SIGNAL_URL === 'string' ? process.env.PM_SIGNAL_URL.trim() : '';
-  if (!raw) return null;
+  let raw = typeof process.env.PM_SIGNAL_URL === 'string' ? process.env.PM_SIGNAL_URL.trim() : '';
+  if (raw === 'cloud') return null; // 显式要求云端
+  if (!raw) raw = DEFAULT_SIGNAL_URL; // 未设置 → 默认自建信令
   try {
     const url = new URL(raw);
     const secure = url.protocol === 'https:' || url.protocol === 'wss:';
@@ -63,8 +67,13 @@ function signalingOptions(logger) {
       key: url.searchParams.get('key') || process.env.PM_SIGNAL_KEY || 'peerjs',
     };
   } catch (error) {
-    logger.warn?.(`[peer-message] PM_SIGNAL_URL 解析失败，回落 PeerJS 云端：${String(error && error.message || error)}`);
-    return null;
+    // 解析失败不回落云端：按裁定保住「默认就是自建信令」，由 initPeer 重试兜底。
+    logger.warn?.(`[peer-message] PM_SIGNAL_URL 解析失败（${String(error && error.message || error)}），使用默认 ${DEFAULT_SIGNAL_URL}`);
+    try {
+      return { secure: true, host: new URL(DEFAULT_SIGNAL_URL).hostname, port: 443, path: '/', key: 'peerjs' };
+    } catch {
+      return null;
+    }
   }
 }
 
