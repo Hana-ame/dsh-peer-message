@@ -1,3 +1,11 @@
+# dsh-peer-message bundle patch：**按包名挂载**，不写死任何机器上的绝对路径。
+#
+# 历史缺陷（2026-11-19 修）：这里曾是
+#   name: 'file:///home/lumin/dsh-plugins/dsh-peer-message/index.js?rev=20261111-reply'
+# 于是任何别的机器 / 容器 / 从别处拷出来的 DSH_HOME 都解析不到该模块：
+# 容器里表现就是 `/api/pm-net/*` 全部 404、日志 `peer-message … failed to import`
+# （dsh-docker 构建排障时的第 4 个阻塞点）。包名会从 profile 的 node_modules
+# 解析（`dsh plugin --profile web add dsh-peer-message` 装出来的位置）。
 - insert:
     - id: peer-message
-      name: 'file:///home/lumin/dsh-plugins/dsh-peer-message/index.js?rev=20261111-reply'
+      name: 'dsh-peer-message'

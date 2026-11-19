@@ -1,11 +1,12 @@
 // 真实集成：Host(createNetwork, 真 wrtc+peerjs) ↔ Node 真实对端，双向消息 + hello 验签 + 落盘。
 import { createRequire } from 'node:module';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { webcrypto, randomUUID } from 'node:crypto';
 import { mkdtempSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-const ROOT = '/home/lumin/dsh-plugins/dsh-peer-message';
+// 仓库根 = 本文件所在目录的上一级（不写死任何机器的绝对路径）
+const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');
 const req = createRequire(join(ROOT, 'index.js'));
 
 const wrtcM = await import(join(ROOT, 'node_modules/@roamhq/wrtc/lib/index.js'));

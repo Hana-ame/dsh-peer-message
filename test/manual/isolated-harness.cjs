@@ -9,8 +9,30 @@
 // sessionStorage，生产 daemon 完全不受影响。
 // 测试脚本共享的隔离环境：用 fetch 拦截把 /api/pm-net/* 全部变成内存态，
 // 永不写入生产 daemon 的 state.json。
-const { chromium } = require('/home/lumin/.dsh/plugins/dsh-browser/node_modules/playwright-core');
+// Playwright 解析顺序：显式 env → 常规 require → dsh-browser 插件自带的副本。
+// **不写死任何机器的绝对路径**（原实现写死 /home/lumin/...，换机器/换用户即失效）。
+const path = require('path');
 const fs = require('fs');
+
+function loadPlaywright() {
+  const candidates = [
+    process.env.PLAYWRIGHT_CORE,
+    'playwright-core',
+    'playwright',
+    path.join(require('os').homedir(), '.dsh/plugins/dsh-browser/node_modules/playwright-core'),
+  ].filter(Boolean);
+  const errors = [];
+  for (const candidate of candidates) {
+    try {
+      return require(candidate);
+    } catch (error) {
+      errors.push(`${candidate}: ${error.code || error.message}`);
+    }
+  }
+  throw new Error(`找不到 playwright-core；可设置 PLAYWRIGHT_CORE 指向它。尝试过：\n  ${errors.join('\n  ')}`);
+}
+
+const { chromium } = loadPlaywright();
 
 function isolatedInitScript() {
   return `
@@ -75,7 +97,12 @@ function isolatedInitScript() {
 
 async function newIsolatedPage(url, opts) {
   const o = opts || {};
-  const browser = await chromium.launch({ executablePath: '/home/lumin/.cache/ms-playwright/chromium-1248/chrome-linux64/chrome', headless: true, args: ['--no-sandbox'] });
+  // 浏览器二进制由 Playwright 自己解析（可用 PLAYWRIGHT_CHROME 覆盖），不写死版本目录
+  const browser = await chromium.launch({
+    executablePath: process.env.PLAYWRIGHT_CHROME || chromium.executablePath(),
+    headless: true,
+    args: ['--no-sandbox'],
+  });
   const context = await browser.newContext({ viewport: o.viewport || { width: 1280, height: 900 }, colorScheme: o.theme || 'dark' });
   await context.addInitScript(isolatedInitScript());
   const page = await context.newPage();
