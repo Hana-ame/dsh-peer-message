@@ -121,3 +121,34 @@ test('spawnDaemon: 残留 spawn.lock 必须按年龄清理（pid 被复用会死
   // statSync 必须真的被 import
   assert.ok(src.includes('statSync'), 'statSync 未导入');
 });
+
+test('friend session control: 默认禁止，未授权好友的控制请求被丢弃', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../server/network.js', import.meta.url), 'utf8');
+  // 1) friend 默认 canControlSession=false
+  assert.ok(src.includes('canControlSession: false'), 'friend 默认值应 false');
+  // 2) control-request 处理必须先查权限
+  const block = src.slice(src.indexOf("data.type === 'control-request'"), src.indexOf("data.type === 'SOCIAL-NOTICE'"));
+  assert.ok(block.includes("ctrlFriend.canControlSession !== true"), '缺少权限校验');
+  assert.ok(block.includes('未授权'), '缺少未授权拒绝日志');
+  // 3) 未授权时直接 return，不入队
+  const beforePush = block.slice(0, block.indexOf('net.controlRequests.push'));
+  assert.ok(beforePush.includes('return'), '未授权路径必须提前 return');
+  // 4) patchFriend 可设置该权限（本人操作）
+  assert.ok(src.includes("friend.canControlSession = patch.canControlSession"), 'patchFriend 未支持该字段');
+  // 5) daemon 暴露入口
+  const dm = readFileSync(new URL('../server/daemon.mjs', import.meta.url), 'utf8');
+  for (const a of ['controlRequests', 'clearControlRequests', 'requestControl']) {
+    assert.ok(dm.includes(`${a}:`), `daemon 缺 action ${a}`);
+  }
+  assert.ok(dm.includes('snapshot.controlRequests'), '/state 未附 controlRequests');
+});
+
+test('friend session control: 授权后才入队（逻辑顺序验证）', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../server/network.js', import.meta.url), 'utf8');
+  const block = src.slice(src.indexOf("data.type === 'control-request'"), src.indexOf("data.type === 'SOCIAL-NOTICE'"));
+  const guardIdx = block.indexOf('canControlSession !== true');
+  const pushIdx = block.indexOf('net.controlRequests.push');
+  assert.ok(guardIdx > 0 && pushIdx > guardIdx, '权限检查必须在入队之前');
+});

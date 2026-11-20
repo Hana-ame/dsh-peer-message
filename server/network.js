@@ -353,6 +353,8 @@ export function createNetwork(options) {
     takeoverHints: 0,
     openWatchdog: null,
     peerInitBusy: false,
+    // 好友发来的本地 session 控制请求（仅 canControlSession=true 的好友可入队）。
+    controlRequests: [],
     // 自建信令配置（PM_SIGNAL_URL）；null = 用 PeerJS 云端默认值。
     signal: signalOpt,
     // 文件是否由本次启动新建：只有「自动生成」的身份/状态才允许被旧
@@ -484,7 +486,9 @@ export function createNetwork(options) {
   function upsertFriend(id, patch) {
     let friend = findFriend(id);
     if (!friend) {
-      friend = { id, name: id.slice(0, 8), alias: '', note: '', online: false, unread: 0, lastMsg: '', lastTs: Date.now(), verified: false, fingerprint: '', lastHumanOutAt: 0 };
+      friend = { id, name: id.slice(0, 8), alias: '', note: '', online: false, unread: 0, lastMsg: '', lastTs: Date.now(), verified: false, fingerprint: '', lastHumanOutAt: 0,
+        // canControlSession：该好友是否被允许控制本机本地 session（默认 false，需本人显式开启）。
+        canControlSession: false };
       net.state.friends.push(friend);
       if (net.state.friends.length > MAX_FRIENDS) net.state.friends = net.state.friends.slice(-MAX_FRIENDS);
     }
@@ -551,6 +555,27 @@ export function createNetwork(options) {
       }
       touch();
       void friend;
+      return;
+    }
+    if (data && typeof data === 'object' && data.type === 'control-request') {
+      // 好友控制本地 session 的入口：**只有 friend.canControlSession=true 才接受**。
+      // 权限是「被控方」（本机）的字段，由本人在好友设置里显式开启；默认 false。
+      // 拒绝时不回任何东西（避免给对端探测信号），只记日志。
+      const ctrlFriend = findFriend(remoteId);
+      if (!ctrlFriend || ctrlFriend.canControlSession !== true) {
+        logger.warn?.(`[peer-message] 拒绝 ${remoteId.slice(0, 12)}… 的本地 session 控制请求（未授权）`);
+        return;
+      }
+      const req = data.payload && typeof data.payload === 'object' ? data.payload : {};
+      net.controlRequests.push({
+        peerId: remoteId,
+        action: typeof req.action === 'string' ? sanitizeText(req.action, 200) : '',
+        args: req.args && typeof req.args === 'object' ? req.args : {},
+        ts: Date.now(),
+      });
+      if (net.controlRequests.length > 50) net.controlRequests = net.controlRequests.slice(-50);
+      logger.info?.(`[peer-message] 收到已授权好友 ${remoteId.slice(0, 12)}… 的 session 控制请求: ${req.action}`);
+      touch();
       return;
     }
     if (data && typeof data === 'object' && data.type === 'SOCIAL-NOTICE') {
@@ -928,6 +953,12 @@ export function createNetwork(options) {
       if (!friend) return { ok: false, error: 'not-found' };
       if (typeof patch.alias === 'string') friend.alias = (sanitizeName(patch.alias) || '');
       if (typeof patch.note === 'string') friend.note = sanitizeNote(patch.note);
+      // 好友对本地 session 的控制权限：只有本人（本机 UI/API）能改，方向是
+      // 「我允许这个好友控制我的 session」。默认 false。
+      if (typeof patch.canControlSession === 'boolean') {
+        friend.canControlSession = patch.canControlSession;
+        logger.info?.(`[peer-message] 好友 ${id.slice(0, 12)}… 的本地 session 控制权限 → ${patch.canControlSession}`);
+      }
       touch();
       return { ok: true };
     },
@@ -1021,6 +1052,26 @@ export function createNetwork(options) {
       await social.refresh();
       return { ok: true, ...social.snapshot() };
     },
+    /** 待处理的「好友控制本机 session」请求（仅已授权好友可入队）。 */
+    controlRequests() { return net.controlRequests.slice(-50); },
+    clearControlRequests() { net.controlRequests = []; touch(); return { ok: true }; },
+    /**
+     * 向某个好友发起「控制其本地 session」请求。是否被接受由**对端**的
+     * friend.canControlSession 决定（对端默认 false 会静默拒绝）。
+     */
+    requestControl(id, action, args) {
+      const friend = findFriend(id);
+      if (!friend) return { ok: false, error: 'not-found' };
+      if (!friend.online) return { ok: false, error: 'offline' };
+      const payload = {
+        type: 'control-request',
+        payload: { action: sanitizeText(String(action || ''), 200), args: args && typeof args === 'object' ? args : {} },
+      };
+      const sent = pushToPeer(id, payload);
+      if (sent) logger.info?.(`[peer-message] 已向 ${id.slice(0, 12)}… 发起 session 控制请求: ${action}`);
+      return { ok: sent, error: sent ? undefined : 'send-failed' };
+    },
+
     /** 服务端好友登记（信令门禁放行 OFFER 的前提）。addFriend 调它，也可手动。 */
     async socialServerAddFriend(id) {
       if (!social) return { ok: true, skipped: true };

@@ -210,6 +210,10 @@ const ACTIONS = {
   socialSetProfile: (net, body) => net.socialSetProfile(body?.patch || {}),
   socialServerAddFriend: (net, body) => net.socialServerAddFriend(body?.id),
   socialServerRemoveFriend: (net, body) => net.socialServerRemoveFriend(body?.id),
+  // ── 好友控制本地 session ──────────────────────────────────
+  controlRequests: (net) => net.controlRequests(),
+  clearControlRequests: (net) => net.clearControlRequests(),
+  requestControl: (net, body) => net.requestControl(body?.id, body?.controlAction, body?.args),
 };
 
 const API_DOC = {
@@ -239,6 +243,7 @@ const API_DOC = {
       'deliver meta.trigger: "auto" | "manual" | "agent".',
       'social actions: social (snapshot), socialRefresh, socialGreet {to,text}, socialSetProfile {patch:{name,bio,tags,allowGreet,canControl}}, socialServerAddFriend {id}, socialServerRemoveFriend {id}.',
       'signaling friend gate: only friends can exchange OFFER/ANSWER/CANDIDATE on self-hosted signaling (POST /friends/{peerId}); greetings go through the server inbox instead.',
+      'session control: friend.canControlSession (default false, set via patchFriend) gates inbound control-request; actions controlRequests/clearControlRequests/requestControl {id,controlAction,args}.',
     ],
 };
 
@@ -250,6 +255,8 @@ const server = createServer(async (request, response) => {
       // 只窥视不消费：HMR/多标签页各自轮询时不能互相抢走待处理消息。
       const snapshot = net.snapshot();
       snapshot.inbound = net.peekInbound();
+      snapshot.social = net.social();
+      snapshot.controlRequests = net.controlRequests();
       return send(response, 200, snapshot);
     }
     if (request.method === 'POST' && path === '/deliver') {
