@@ -105,3 +105,19 @@ test('ensureNet: 失败后必须清掉缓存，daemon 后起也能恢复（不�
   // 预热调用存在（冷启动主动拉起）
   assert.ok(src.includes('\n  ensureNet();'), '缺少启动预热');
 });
+
+test('spawnDaemon: 残留 spawn.lock 必须按年龄清理（pid 被复用会死锁）', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const start = src.indexOf('const spawnDaemon = () => {');
+  const block = src.slice(start, start + 3000);
+  // 必须有年龄判定
+  assert.ok(block.includes('SPAWN_LOCK_STALE_MS'), '缺少 spawn.lock 年龄常量');
+  assert.ok(block.includes('statSync(spawnLock)'), '未读取锁文件年龄');
+  assert.ok(block.includes('mtimeMs'), '未比较 mtime');
+  // 过期必须清理并重入（否则永远 return true 不 spawn）
+  assert.ok(block.includes('return spawnDaemon()'), '过期锁未重入抢锁');
+  assert.ok(block.includes('removing stale spawn lock'), '缺少残留锁清理日志');
+  // statSync 必须真的被 import
+  assert.ok(src.includes('statSync'), 'statSync 未导入');
+});

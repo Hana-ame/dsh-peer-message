@@ -19,7 +19,7 @@
  * guard and per-session sandbox/approval events.
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -231,18 +231,35 @@ export function apply(ctx) {
     // 否则多个 daemon 同时向 PeerJS 注册同一 Peer ID，互相踢下线。
     const dir = dataDir();
     const spawnLock = join(dir, 'spawn.lock');
+    // 锁最长有效年龄：超过它一律视为残留。spawn 本身只需几秒到几十秒，90s 足够。
+    // 必须加这个判定，否则踩「锁 pid 被复用」死锁：容器重启后 spawn.lock 里可能是
+    // pid 1（dsh 自己）或被其它进程复用的 pid，process.kill(pid,0) 成功 →
+    // 永远认为「别人在拉起」→ 永不 spawn，API 恒返 host-network-unavailable
+    // （2026-11-20 两容器开关测试实测复现）。
+    const SPAWN_LOCK_STALE_MS = 90000;
     try {
       mkdirSync(dir, { recursive: true });
       try {
         writeFileSync(spawnLock, String(process.pid), { flag: 'wx', mode: 0o600 });
       } catch (error) {
         if (error.code === 'EEXIST') {
-          // 别人刚在拉起：等它把自己的锁变成 daemon 的 net.lock 即可。
+          // 先判年龄：过期即残留，清掉后重入抢锁。
+          let stale = false;
+          try {
+            const st = statSync(spawnLock);
+            if (Date.now() - st.mtimeMs > SPAWN_LOCK_STALE_MS) stale = true;
+          } catch (e) { stale = true; }
+          if (stale) {
+            ctx.logger.warn?.('[peer-message] removing stale spawn lock (>' + SPAWN_LOCK_STALE_MS + 'ms)');
+            try { rmSync(spawnLock); } catch (e) { /* ignore */ }
+            return spawnDaemon();
+          }
+          // 锁还新鲜：确认持有者活着就等它，否则清理后继续。
           try {
             const other = Number.parseInt(readFileSync(spawnLock, 'utf8').trim(), 10);
             if (Number.isInteger(other) && other > 0) { process.kill(other, 0); }
             ctx.logger.info?.('[peer-message] another process is spawning the daemon; waiting');
-          } catch (e) { /* 持有者已退出：清理后继续 */ try { rmSync(spawnLock); } catch (e2) { /* ignore */ } }
+          } catch (e) { try { rmSync(spawnLock); } catch (e2) { /* ignore */ } }
           return true;
         }
         throw error;
