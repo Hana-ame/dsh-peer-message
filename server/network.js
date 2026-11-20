@@ -78,6 +78,152 @@ function signalingOptions(logger) {
 }
 
 
+// ── 社交层（自建信令服务器的发现/推荐/profile/好友/打招呼）──────────────
+// 仅当走自建信令（signal 非 null）时启用；PeerJS 云端没有这些 API。
+// 周期轮询 + 事件推送（SOCIAL-NOTICE 经信令 WS）双通道，daemon 是唯一权威。
+function createSocialHub({ signal, logger, getState, touch, getMyToken, addFriendLike }) {
+  if (!signal) return null; // 云端模式：社交层不可用
+  const base = `${signal.secure ? 'https' : 'http'}://${signal.host}:${signal.port}${signal.path}`;
+  const headers = () => ({ 'x-peer-id': net0.myId, 'x-peer-token': getMyToken() });
+  let net0; // 延迟绑定（net 对象在 createNetwork 里构造）
+  const bind = (n) => { net0 = n; };
+  let timer = null;
+  let socialCache = { people: [], recommended: [], greetings: [], friends: [] };
+
+  async function call(method, path, body) {
+    const opts = { method, headers: { ...headers(), 'content-type': 'application/json' } };
+    if (body !== undefined) opts.body = JSON.stringify(body);
+    const res = await fetch(base + path, opts);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw Object.assign(new Error(data.error || res.statusText), { code: res.status, data });
+    return data;
+  }
+
+  // 连接 URL 上的 profile（服务端 onConnect 读取）。改动后重连生效。
+  function profileQuery() {
+    const state = getState();
+    const s = state.settings || {};
+    const prof = {
+      name: s.nickname || '',
+      bio: s.bio || '',
+      tags: s.tags || '',
+      allowGreet: s.allowGreet !== false,
+      canControl: s.canControl === true,
+    };
+    return '&profile=' + encodeURIComponent(JSON.stringify(prof));
+  }
+
+  // 好友/打招呼事件：信令 WS 收到 SOCIAL-NOTICE 时由 handleSignalNotice 转进来。
+  function onNotice(fromId, payload) {
+    if (!payload || typeof payload !== 'object') return;
+    if (payload.event === 'greet') {
+      socialCache.greetings.push({ from: fromId, text: String(payload.text || ''), at: Date.now() });
+      touch();
+    } else if (payload.event === 'friend-added') {
+      addFriendLike(fromId); // 对端加我为好友 → 本地也加（对等模型）
+      touch();
+    } else if (payload.event === 'friend-removed') {
+      const st = getState();
+      st.friends = (st.friends || []).filter((f) => f.id !== fromId);
+      delete (st.messages || {})[fromId];
+      touch();
+    }
+  }
+
+  async function refresh() {
+    try {
+      const [disc, rec, box] = await Promise.all([
+        call('GET', 'discover').catch(() => null),
+        call('GET', 'recommend').catch(() => null),
+        call('GET', 'greetings').catch(() => null),
+      ]);
+      if (disc && disc.ok) socialCache.people = disc.people || [];
+      if (rec && rec.ok) socialCache.recommended = rec.recommended || [];
+      // 收件箱兜底：WS 推送（SOCIAL-NOTICE）可能被 peerjs 客户端丢弃（它的
+      // default 分支只 warn 未知消息），所以每次 refresh 都拉一次 /greetings
+      // （服务器 drain 语义：取走即清）。重复消息由 onNotice 与这里合并去重。
+      if (box && box.ok && Array.isArray(box.greetings)) {
+        for (const g of box.greetings) {
+          const dup = socialCache.greetings.some((x) => x.from === g.from && x.text === g.text);
+          if (!dup) socialCache.greetings.push({ from: g.from, text: g.text, at: Date.parse(g.at) || Date.now() });
+        }
+        touch();
+      }
+      const me = getState();
+      const onlineIds = new Set(socialCache.people.map((p) => p.peerId));
+      // 好友列表：以服务端为准合并（服务器记的是对等关系）。
+      try {
+        const fl = await call('GET', 'friends');
+        if (fl && fl.ok && Array.isArray(fl.friends)) {
+          socialCache.friends = fl.friends;
+        }
+      } catch (e) { /* 服务器无好友或未启用：保持本地 */ }
+      touch();
+    } catch (error) {
+      logger.warn?.(`[peer-message] social refresh failed: ${String(error && error.message || error)}`);
+    }
+  }
+
+  // greet：陌生人打招呼（服务端收件箱，在线即时推）。
+  async function greet(to, text) {
+    await call('POST', 'greet', { to, text: String(text || '').slice(0, 200) });
+    await refresh();
+  }
+
+  // setProfile：改自己的档案（重连后随 URL 广播）。
+  async function setProfile(patch) {
+    const s = getState().settings || {};
+    const next = { ...s, ...patch };
+    await call('PATCH', 'profile', {
+      name: next.nickname || '',
+      bio: next.bio || '',
+      tags: next.tags || '',
+      allowGreet: next.allowGreet !== false,
+      canControl: next.canControl === true,
+    });
+    await refresh();
+  }
+
+  // addFriend：本地 + 服务端双侧登记（信令门禁放行 OFFER）。
+  async function serverAddFriend(otherId) {
+    try {
+      await call('POST', `friends/${otherId}`);
+      await refresh();
+    } catch (error) {
+      logger.warn?.(`[peer-message] server addFriend failed: ${String(error && error.message || error)}`);
+    }
+  }
+
+  async function serverRemoveFriend(otherId) {
+    try {
+      await call('DELETE', `friends/${otherId}`);
+      await refresh();
+    } catch (error) {
+      logger.warn?.(`[peer-message] server removeFriend failed: ${String(error && error.message || error)}`);
+    }
+  }
+
+  function start() {
+    if (timer) return;
+    timer = setInterval(() => { void refresh(); }, 15000);
+    timer.unref?.();
+    void refresh();
+  }
+  function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+  function snapshot() {
+    return {
+      available: true,
+      people: socialCache.people,
+      recommended: socialCache.recommended,
+      greetings: socialCache.greetings,
+      friends: socialCache.friends,
+    };
+  }
+  return { bind, onNotice, refresh, greet, setProfile, serverAddFriend, serverRemoveFriend, profileQuery, start, stop, snapshot };
+}
+
 const DEFAULT_SETTINGS = { allowBroadcast: false, allowIncoming: true, nickname: '' };
 const DEFAULT_REPLY = {
   mode: 'off', permission: 'read', provider: '', model: '', reasoningEffort: '',
@@ -160,7 +306,7 @@ function atomicWriteJson(path, value) {
 const SINGLETON_ROOT = Symbol.for('dsh-peer-message.host-network');
 
 export function createNetwork(options) {
-  const { dataDir, loadPeerJS, wrtc, logger = console } = options;
+  const { dataDir, loadPeerJS, wrtc, logger = console } = options; // options.signal 由调用方传入（见 daemon.mjs）
   // 单例按 dataDir 区分：同一进程 + 同一数据目录 = 同一个传输。
   const registry = globalThis[SINGLETON_ROOT] || (globalThis[SINGLETON_ROOT] = new Map());
   const existing = registry.get(dataDir);
@@ -171,6 +317,16 @@ export function createNetwork(options) {
   const identityPath = join(dataDir, 'identity.json');
   const statePath = join(dataDir, 'state.json');
   const files = { identityPath, statePath, dataDir };
+
+  // 社交层：自建信令才有（signal 非 null）。需要 net.myId/token，故先构造再 bind。
+  const social = createSocialHub({
+    signal: options.signal,
+    logger,
+    getState: () => net.state,
+    touch: () => touch(),
+    getMyToken: () => (net.identity && net.identity.token) || '',
+    addFriendLike: (id) => { upsertFriend(id, {}); connectTo(id); },
+  });
 
   const net = {
     files,
@@ -197,7 +353,7 @@ export function createNetwork(options) {
     openWatchdog: null,
     peerInitBusy: false,
     // 自建信令配置（PM_SIGNAL_URL）；null = 用 PeerJS 云端默认值。
-    signal: signalingOptions(logger),
+    signal: options.signal || signalingOptions(logger),
     // 文件是否由本次启动新建：只有「自动生成」的身份/状态才允许被旧
     // localStorage 迁移覆盖，已经有真实文件时绝不覆盖。
     identityAutoGenerated: false,
@@ -396,6 +552,11 @@ export function createNetwork(options) {
       void friend;
       return;
     }
+    if (data && typeof data === 'object' && data.type === 'SOCIAL-NOTICE') {
+      // 服务端社交事件（打招呼/好友变更）经信令 WS 推送：转给社交层处理。
+      if (social) social.onNotice(remoteId, data.payload);
+      return;
+    }
     if (data && typeof data === 'object' && data.type === 'hello') {
       const verified = await verifyHello(remoteId, data);
       const friend = findFriend(remoteId);
@@ -548,6 +709,9 @@ export function createNetwork(options) {
       ...(net.signal ? net.signal : {}),
       ...(net.identity && isValidToken(net.identity.token) ? { token: net.identity.token } : {}),
     });
+    // profile 同步：peerjs 1.5.4 的 WS URL 不支持附加 query（Socket._baseUrl 固定
+    // 拼 `path + "peerjs?key="`），因此档案在 peer open 后立即经 HTTP PATCH /profile
+    // 推送（social.setProfile），服务端 onConnect 先落默认档案、PATCH 覆盖。
     net.peer = peer;
     peer.on('open', (id) => {
       if (net.openWatchdog) { clearTimeout(net.openWatchdog); net.openWatchdog = null; }
@@ -565,6 +729,18 @@ export function createNetwork(options) {
       setTimeout(() => { if (net.lastOpenAt === openMark && net.peerStatus === 'online') net.takeoverHints = 0; }, 60000).unref?.();
       touch();
       reconnectAll();
+      // open 后立即把档案推给信令服务器（PUT 语义的 PATCH /profile）+ 拉一次发现列表。
+      if (social) {
+        const st = net.state;
+        void social.setProfile({
+          name: st.settings && st.settings.nickname,
+          bio: st.settings && st.settings.bio,
+          tags: st.settings && st.settings.tags,
+          allowGreet: !st.settings || st.settings.allowGreet !== false,
+          canControl: !!(st.settings && st.settings.canControl),
+        }).catch(() => {});
+        void social.refresh().catch(() => {});
+      }
     });
     armOpenWatchdog();
     peer.on('connection', handleIncoming);
@@ -635,6 +811,7 @@ export function createNetwork(options) {
     async start() {
       if (net.started) return;
       net.started = true;
+      if (social) { social.bind(net); social.start(); }
       net.identity = await loadOrCreateIdentity();
       net.myId = net.identity.peerId;
       net.stateFileExisted = existsSync(statePath);
@@ -653,6 +830,7 @@ export function createNetwork(options) {
     /** 真正停掉传输（只应由最后一个挂载点调用）。 */
     stop() {
       net.started = false;
+      if (social) social.stop();
       if (net.retryTimer) { clearTimeout(net.retryTimer); net.retryTimer = null; }
       if (net.openWatchdog) { clearTimeout(net.openWatchdog); net.openWatchdog = null; }
       if (net.persistTimer) { clearTimeout(net.persistTimer); net.persistTimer = null; }
@@ -713,6 +891,8 @@ export function createNetwork(options) {
       upsertFriend(id, {});
       touch();
       connectTo(id);
+      // 自建信令的服务端好友登记（信令门禁只放行好友间的 OFFER）。
+      if (social) { void social.serverAddFriend(id); }
       return { ok: true };
     },
 
@@ -724,6 +904,8 @@ export function createNetwork(options) {
       net.state.friends = net.state.friends.filter((f) => f.id !== id);
       delete net.state.messages[id];
       touch();
+      // 同步断开服务端好友关系（信令门禁随即关闭）。
+      if (social) { void social.serverRemoveFriend(id); }
       return { ok: true };
     },
 
@@ -803,6 +985,47 @@ export function createNetwork(options) {
     },
 
     hasConn(id) { const conn = net.conns.get(id); return !!(conn && conn.open); },
+
+    /** 社交层（自建信令才有）：发现/推荐/profile/打招呼/好友同步。 */
+    social() {
+      if (!social) return { available: false, people: [], recommended: [], greetings: [], friends: [] };
+      return social.snapshot();
+    },
+    async socialGreet(to, text) {
+      if (!social) return { ok: false, error: 'social-unavailable' };
+      try { await social.greet(to, text); return { ok: true }; }
+      catch (error) { return { ok: false, error: String(error && error.message || error) }; }
+    },
+    async socialSetProfile(patch) {
+      if (!social) return { ok: false, error: 'social-unavailable' };
+      try {
+        await social.setProfile(patch);
+        const st = net.state; const se = st.settings = st.settings || {};
+        if (typeof patch.nickname === 'string') se.nickname = patch.nickname;
+        if (typeof patch.bio === 'string') se.bio = patch.bio;
+        if (typeof patch.tags === 'string') se.tags = patch.tags;
+        if (typeof patch.allowGreet === 'boolean') se.allowGreet = patch.allowGreet;
+        if (typeof patch.canControl === 'boolean') se.canControl = patch.canControl;
+        touch();
+        return { ok: true };
+      } catch (error) { return { ok: false, error: String(error && error.message || error) }; }
+    },
+    async socialRefresh() {
+      if (!social) return { ok: false, error: 'social-unavailable' };
+      await social.refresh();
+      return { ok: true, ...social.snapshot() };
+    },
+    /** 服务端好友登记（信令门禁放行 OFFER 的前提）。addFriend 调它，也可手动。 */
+    async socialServerAddFriend(id) {
+      if (!social) return { ok: true, skipped: true };
+      await social.serverAddFriend(id);
+      return { ok: true };
+    },
+    async socialServerRemoveFriend(id) {
+      if (!social) return { ok: true, skipped: true };
+      await social.serverRemoveFriend(id);
+      return { ok: true };
+    },
 
     /** Which peers are currently connected (daemon-side outbox routing). */
     connectedIds() { return [...net.conns.entries()].filter(([, c]) => c && c.open).map(([id]) => id); },

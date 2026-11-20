@@ -89,6 +89,8 @@ const net = createNetwork({
   wrtc,
   logger: { info: (...a) => log(...a), warn: (...a) => log('WARN', ...a) },
   loadPeerJS: async () => Peer,
+  // 自建信令（network.js 内部会解析 PM_SIGNAL_URL；显式传入便于单测）。
+  signal: undefined,
 });
 await net.start();
 log('network started; Peer ID =', net.snapshot().myId);
@@ -228,6 +230,8 @@ const API_DOC = {
       'verified/fingerprint are only ever written by a successful hello signature check (patchFriend cannot set them).',
       'send trigger: "human" (normal) or "human-reply" (a person answering instead of the model); both stamp friend.lastHumanOutAt, which the auto-reply pipeline uses to supersede model drafts the human has already answered.',
       'deliver meta.trigger: "auto" | "manual" | "agent".',
+      'social actions: social (snapshot), socialRefresh, socialGreet {to,text}, socialSetProfile {patch:{name,bio,tags,allowGreet,canControl}}, socialServerAddFriend {id}, socialServerRemoveFriend {id}.',
+      'signaling friend gate: only friends can exchange OFFER/ANSWER/CANDIDATE on self-hosted signaling (POST /friends/{peerId}); greetings go through the server inbox instead.',
     ],
 };
 
