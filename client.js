@@ -809,7 +809,7 @@ window.__ModuleLoader__.load({
       async setFriendAlias(id, raw) { return this.setFriendProfile(id, raw, undefined); },
       async setFriendNote(id, raw) { return this.setFriendProfile(id, undefined, raw); },
 
-      async setFriendProfile(id, aliasRaw, noteRaw) {
+      async setFriendProfile(id, aliasRaw, noteRaw, canControlSession) {
         const patch = {};
         if (aliasRaw !== undefined) {
           const text = aliasRaw == null ? '' : String(aliasRaw).trim();
@@ -822,9 +822,15 @@ window.__ModuleLoader__.load({
           if (text.length > MAX_NOTE_LEN) { this.showToast('备注最多 ' + MAX_NOTE_LEN + ' 字'); return false; }
           patch.note = text;
         }
+        // 控制权限是分人的：只在显式传入时提交（undefined = 不改）。
+        if (typeof canControlSession === 'boolean') patch.canControlSession = canControlSession;
         const r = await this.postAction('patchFriend', { id, patch });
-        if (r && r.ok === false) { this.showToast('好友备注保存失败'); return false; }
-        this.showToast('好友备注已保存');
+        if (r && r.ok === false) { this.showToast('好友设置保存失败'); return false; }
+        const parts = [];
+        if (patch.alias !== undefined) parts.push('备注名');
+        if (patch.note !== undefined) parts.push('备注');
+        if (patch.canControlSession !== undefined) parts.push(patch.canControlSession ? '已授权控制 session' : '已收回控制权限');
+        this.showToast('已保存' + (parts.length ? '：' + parts.join('、') : ''));
         return true;
       },
 
@@ -1448,7 +1454,7 @@ window.__ModuleLoader__.load({
 
       const openFriendEdit = (f) => {
         setCtxMenu(null);
-        setEditFriend({ id: f.id, alias: f.alias || '', note: f.note || '' });
+        setEditFriend({ id: f.id, alias: f.alias || '', note: f.note || '', canControlSession: f.canControlSession === true });
       };
 
       const requestDeleteFriend = (f) => {
@@ -1809,10 +1815,23 @@ window.__ModuleLoader__.load({
               }),
               h('div', { className: 'pm-hint' }, '只保存在本机，最多 ' + MAX_NOTE_LEN + ' 字。生成自动回复时会作为「可信的本机上下文」注入 prompt；对方消息正文仍按不可信内容处理。'),
             ),
+            // 控制权限是**分人的**：这里只对这一个好友生效，不影响其他好友。
+            h('div', { className: 'pm-field' },
+              h('label', { className: 'pm-field-label' }, '允许该好友控制本机 session'),
+              h('label', { className: 'pm-discover-check' },
+                h('input', {
+                  type: 'checkbox',
+                  checked: editFriend.canControlSession === true,
+                  onChange: e => setEditFriend(prev => Object.assign({}, prev, { canControlSession: e.target.checked })),
+                }),
+                ' 仅对「' + (editFriend.alias || shortId(editFriend.id)) + '」生效',
+              ),
+              h('div', { className: 'pm-hint' }, '默认关闭。开启后该好友可向本机发送控制请求（如列出/操作本地 session）；其他好友仍然无权。每次授权独立保存。'),
+            ),
             h('div', { className: 'pm-modal-btns' },
               h('button', { className: 'pm-btn', type: 'button', onClick: () => setEditFriend(null) }, '取消'),
               h('button', { className: 'pm-btn primary', type: 'button', onClick: () => {
-                if (pmService.setFriendProfile(editFriend.id, editFriend.alias, editFriend.note)) setEditFriend(null);
+                if (pmService.setFriendProfile(editFriend.id, editFriend.alias, editFriend.note, editFriend.canControlSession)) setEditFriend(null);
               } }, '保存'),
             ),
           ),

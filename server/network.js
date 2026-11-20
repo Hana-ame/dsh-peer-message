@@ -108,7 +108,8 @@ function createSocialHub({ signal, logger, getState, touch, getMyToken, addFrien
       bio: s.bio || '',
       tags: s.tags || '',
       allowGreet: s.allowGreet !== false,
-      canControl: s.canControl === true,
+      // 注意：**控制本地 session 的权限是分人的**（friend.canControlSession），
+      // 不是全局开关，因此不放进 profile 广播——否则对端会误以为「谁都能控制」。
     };
     return '&profile=' + encodeURIComponent(JSON.stringify(prof));
   }
@@ -179,7 +180,6 @@ function createSocialHub({ signal, logger, getState, touch, getMyToken, addFrien
       bio: next.bio || '',
       tags: next.tags || '',
       allowGreet: next.allowGreet !== false,
-      canControl: next.canControl === true,
     });
     await refresh();
   }
@@ -763,7 +763,6 @@ export function createNetwork(options) {
           bio: st.settings && st.settings.bio,
           tags: st.settings && st.settings.tags,
           allowGreet: !st.settings || st.settings.allowGreet !== false,
-          canControl: !!(st.settings && st.settings.canControl),
         }).catch(() => {});
         void social.refresh().catch(() => {});
       }
@@ -1042,7 +1041,6 @@ export function createNetwork(options) {
         if (typeof patch.bio === 'string') se.bio = patch.bio;
         if (typeof patch.tags === 'string') se.tags = patch.tags;
         if (typeof patch.allowGreet === 'boolean') se.allowGreet = patch.allowGreet;
-        if (typeof patch.canControl === 'boolean') se.canControl = patch.canControl;
         touch();
         return { ok: true };
       } catch (error) { return { ok: false, error: String(error && error.message || error) }; }

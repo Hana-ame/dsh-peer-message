@@ -152,3 +152,36 @@ test('friend session control: 授权后才入队（逻辑顺序验证）', async
   const pushIdx = block.indexOf('net.controlRequests.push');
   assert.ok(guardIdx > 0 && pushIdx > guardIdx, '权限检查必须在入队之前');
 });
+
+test('session control: 权限分人——A 授权、B 未授权，仅 A 的控制请求入队', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../server/network.js', import.meta.url), 'utf8');
+  // 权限必须挂在 friend 对象上（分人），不能是全局 settings 开关
+  assert.ok(src.includes('canControlSession: false }'), 'friend 应带 per-friend 默认 false');
+  const gate = src.slice(src.indexOf("data.type === 'control-request'"), src.indexOf("data.type === 'SOCIAL-NOTICE'"));
+  assert.ok(gate.includes('findFriend(remoteId)'), '门禁必须按 remoteId 取该好友');
+  assert.ok(gate.includes('ctrlFriend.canControlSession !== true'), '门禁必须查该好友的字段');
+  // 不能有全局 canControl 参与门禁
+  assert.ok(!gate.includes('settings.canControl'), '门禁不得用全局开关');
+  // profile 广播里不能带 canControl（否则对端误以为谁都能控）
+  const pq = src.slice(src.indexOf('function profileQuery()'), src.indexOf('function onNotice('));
+  // 只禁「字段形式」（canControl: ...），允许注释里说明「权限是分人的」
+  assert.ok(!/canControl\s*:/.test(pq), 'profile 不应广播全局 canControl 字段');
+  // patchFriend 按 id 改该好友
+  const pf = src.slice(src.indexOf('patchFriend(id, patch) {'), src.indexOf('patchFriend(id, patch) {') + 900);
+  assert.ok(pf.includes('friend.canControlSession = patch.canControlSession'), 'patchFriend 未按好友写权限');
+});
+
+test('session control: 前端可按好友开关（编辑弹窗内独立勾选）', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  // 打开编辑时读取该好友当前值
+  assert.ok(src.includes("canControlSession: f.canControlSession === true"), '打开弹窗未读当前好友权限');
+  // 弹窗内独立勾选框，文案点明只对这一个好友生效
+  assert.ok(src.includes('允许该好友控制本机 session'), '缺少权限开关标题');
+  assert.ok(src.includes("' 仅对「'"), '缺少「仅对该好友生效」提示');
+  // 保存时提交
+  assert.ok(src.includes('setFriendProfile(editFriend.id, editFriend.alias, editFriend.note, editFriend.canControlSession)'), '保存未带上权限');
+  // setFriendProfile 只在显式传 boolean 时提交
+  assert.ok(src.includes("if (typeof canControlSession === 'boolean') patch.canControlSession = canControlSession"), '未做 undefined 保护');
+});

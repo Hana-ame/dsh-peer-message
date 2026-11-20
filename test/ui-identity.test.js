@@ -69,7 +69,7 @@ test('identity: 备注名优先级 alias > name > Peer ID 前缀', () => {
 });
 
 test('identity: 备注入口把 alias 写进 Host 并持久化', () => {
-  const setter = slice(CLIENT, 'async setFriendProfile(id, aliasRaw, noteRaw) {', 'async retryPeer() {');
+  const setter = slice(CLIENT, 'async setFriendProfile(id, aliasRaw, noteRaw, canControlSession) {', 'async retryPeer() {');
   assert.ok(setter.includes('patch.alias = alias'));
   assert.ok(setter.includes("this.postAction('patchFriend'"), '备注未写给 Host');
   const hostPatch = slice(NET, 'patchFriend(id, patch) {', 'patchSettings(patch) {');
