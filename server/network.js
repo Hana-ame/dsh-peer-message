@@ -893,7 +893,12 @@ export function createNetwork(options) {
       touch();
       connectTo(id);
       // 自建信令的服务端好友登记（信令门禁只放行好友间的 OFFER）。
-      if (social) { void social.serverAddFriend(id); }
+      // 注册完成后再拨一次：connectTo 的首拨发生在服务端登记完成之前时，
+      // OFFER 会被门禁拒（时序竞态）；登记后重拨才能建通道（实测复现：
+      // 重新加好友后 15 分钟无 OFFER，双方都不再拨）。
+      if (social) {
+        void social.serverAddFriend(id).then(() => { connectTo(id); });
+      }
       return { ok: true };
     },
 
