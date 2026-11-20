@@ -326,11 +326,17 @@ This is a DSH bundle. From a DSH Web profile:
 npm install --save /path/to/dsh-peer-message
 ```
 
-Then enable the bundle `dsh-peer-message` and the preset bundle
-`dsh-peer-preset` in the DSH plugin manager, or declare the preset's plugin:
+Then enable the bundle `dsh-peer-message` in the DSH plugin manager. Enabling
+that single bundle gives you both the P2P host plugin **and** the bundled
+**Peer Chat** agent preset (web search + web fetch + `pm_send` only).
+
+The preset used to live in a separate `dsh-peer-preset` bundle. It was merged
+into this one on 2026-11-21: the bundle patch now declares the preset inline,
+so there is no second bundle to enable and no cross-repo coupling. The
+equivalent declaration lives in this bundle's `cordis.patch.yml`:
 
 ```yaml
-# dsh-peer-preset/cordis.patch.yml
+# dsh-peer-message/cordis.patch.yml (excerpt)
 - insert:
     - id: preset-peer
       name: '@deepseek-ai/dsh-agent-preset'
@@ -350,7 +356,15 @@ Then enable the bundle `dsh-peer-message` and the preset bundle
               fetch: true
               searchTimeoutMs: 60000
           - id: peer-tool
-            name: 'file:///abs/path/dsh-peer-message/tool.js?rev=1'
+            name: 'dsh-peer-message/tool'
+```
+
+If you don't want the preset (only the chat UI and the daemon), override the
+row with `disabled: true` in your profile's patch layer:
+
+```yaml
+- id: preset-peer
+  disabled: true
 ```
 
 ## How it works

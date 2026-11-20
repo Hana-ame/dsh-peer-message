@@ -6,6 +6,33 @@
 # 容器里表现就是 `/api/pm-net/*` 全部 404、日志 `peer-message … failed to import`
 # （dsh-docker 构建排障时的第 4 个阻塞点）。包名会从 profile 的 node_modules
 # 解析（`dsh plugin --profile web add dsh-peer-message` 装出来的位置）。
+#
+# ── preset 已并入本 bundle（2026-11-21）───────────────────────────────────
+# 原先 preset 单独放在 `@local/dsh-peer-preset` 仓库，是本 bundle 之外的第二个
+# bundle，用户要分别启用两个 bundle 才能得到完整能力。现在把 preset 声明
+# （`preset-peer`，挂 `persona` + `tool-web` + 本包的 `peer-tool`）并进来：
+# 启用 `dsh-peer-message` 一个 bundle 就同时得到 P2P 宿主与 Peer Chat 预设。
+# 注意 `peer-tool` 用包名 `dsh-peer-message/tool` 引用本包的 tool 子路径导出，
+# 与本 bundle 同源，不存在路径写死问题。
 - insert:
     - id: peer-message
       name: 'dsh-peer-message'
+    - id: preset-peer
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: peer
+        name: Peer Chat
+        description: Web search, web fetch, and P2P chat only.
+        order: 20
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a peer-chat assistant with web search and P2P messaging. Use web_search/web_fetch for research, and pm_send to message a friend peer.
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: peer-tool
+            name: 'dsh-peer-message/tool'
