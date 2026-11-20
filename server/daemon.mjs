@@ -203,6 +203,13 @@ const ACTIONS = {
   patchSettings: (net, body) => net.patchSettings(body?.patch || {}),
   retryPeer: (net) => net.retryPeer(),
   rotateIdentity: (net) => net.rotateIdentity(),
+  // ── 社交层（自建信令）─────────────────────────────────────
+  social: (net) => net.social(),
+  socialRefresh: (net) => net.socialRefresh(),
+  socialGreet: (net, body) => net.socialGreet(body?.to, body?.text),
+  socialSetProfile: (net, body) => net.socialSetProfile(body?.patch || {}),
+  socialServerAddFriend: (net, body) => net.socialServerAddFriend(body?.id),
+  socialServerRemoveFriend: (net, body) => net.socialServerRemoveFriend(body?.id),
 };
 
 const API_DOC = {
