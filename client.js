@@ -339,6 +339,19 @@ window.__ModuleLoader__.load({
       // 来源 SVG 图标：垂直居中、不参与文字基线偏移；颜色跟随徽标 currentColor。
       '.pm-origin-svg{display:block;flex:none;}',
       '.pm-origin-fish{margin-top:.5px;}',
+      // 发现面板
+      '.pm-discover-section{margin-top:14px;border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.15));padding-top:10px;}',
+      '.pm-discover-row{display:flex;gap:8px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.1));}',
+      '.pm-discover-info{flex:1;min-width:0;}',
+      '.pm-discover-name{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;}',
+      '.pm-discover-sub{font-size:11px;color:var(--dsw-alias-label-secondary,inherit);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+      '.pm-discover-badge{font-size:9px;padding:1px 5px;border-radius:6px;background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.15));font-weight:500;}',
+      '.pm-badge-muted{opacity:.6;}',
+      '.pm-discover-actions{display:flex;flex-direction:column;gap:4px;min-width:150px;}',
+      '.pm-greet-box{display:flex;gap:4px;}',
+      '.pm-greet-input{flex:1;min-width:0;padding:4px 8px;font-size:11px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.25));background:var(--dsw-alias-bg-base,transparent);color:inherit;}',
+      '.pm-profile-grid{display:flex;flex-direction:column;gap:6px;}',
+      '.pm-discover-check{display:flex;align-items:center;gap:6px;font-size:12px;}',
       '.pm-chat-input{padding:12px 20px;border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.15));display:flex;gap:8px;align-items:flex-end;}',
       '.pm-chat-textarea{flex:1;min-height:40px;max-height:120px;padding:8px 12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.25));background:var(--dsw-specific-input-major,var(--dsw-alias-bg-layer-1,transparent));color:var(--dsw-alias-label-primary,inherit);font-size:13px;resize:none;outline:none;font-family:inherit;}',
       '.pm-chat-textarea:focus{border-color:var(--dsw-alias-brand-primary,inherit);}',
@@ -575,6 +588,9 @@ window.__ModuleLoader__.load({
       replyRunning: [],
       replyRecent: [],
       replyUnavailable: false,
+      // 社交层快照（自建信令才有）：发现/推荐/打招呼/好友/控制请求
+      social: { available: false, people: [], recommended: [], greetings: [], friends: [] },
+      controlRequests: [],
       started: false,
       version: 0,
       _snap: null,
@@ -616,6 +632,8 @@ window.__ModuleLoader__.load({
             replyRunning: this.replyRunning,
             replyRecent: this.replyRecent,
             replyUnavailable: this.replyUnavailable,
+            social: this.social,
+            controlRequests: this.controlRequests,
             version: this.version,
           };
         }
@@ -670,6 +688,9 @@ window.__ModuleLoader__.load({
           this.state = snap.state;
           pmUnreadStore.publish(computeUnreadTotal(snap.state.friends));
         }
+        // 社交层（Host 透传 daemon）：发现/推荐/打招呼/控制请求
+        if (snap.social && typeof snap.social === 'object') this.social = snap.social;
+        if (Array.isArray(snap.controlRequests)) this.controlRequests = snap.controlRequests;
         // 自动回复由 Host 侧的入站泵触发（关掉所有标签页也生效），
         // 浏览器不再重复触发，避免多标签页各触发一次。
         if (changed) this.emit();
@@ -897,6 +918,22 @@ window.__ModuleLoader__.load({
             this.emit();
           }
         }).catch(() => { /* 静默：不阻塞聊天 */ });
+      },
+
+      // ── 社交层 ──────────────────────────────────────────────────
+      async refreshSocial() {
+        const r = await this.postAction('socialRefresh');
+        if (r && r.people) { this.social = r; this.emit(); }
+        return r || {};
+      },
+      async greetPeer(peerId, text) {
+        return this.postAction('socialGreet', { to: peerId, text });
+      },
+      async setSocialProfile(patch) {
+        return this.postAction('socialSetProfile', { patch: patch || {} });
+      },
+      async clearControlRequests() {
+        return this.postAction('clearControlRequests');
       },
 
       async postReplyControl(kind, id) {
@@ -1146,6 +1183,121 @@ window.__ModuleLoader__.load({
     }
 
     // ── 主面板（纯视图，网络全在 pmService） ─────────────────────────────
+    // ── 发现/推荐面板（自建信令的社交层）──────────────────────────────
+    // 在线人员列表 + 推荐 + 陌生人打招呼 + 自己的 profile（昵称/简介/标签/接客开关）。
+    // 打招呼走服务器收件箱（对方不在线也能收到），加好友后才有 WebRTC 通道。
+    function DiscoverPanel({ social, myId, onClose }) {
+      const people = Array.isArray(social.people) ? social.people : [];
+      const recommended = Array.isArray(social.recommended) ? social.recommended : [];
+      const settings = pmService.settings || {};
+      const [self, setSelf] = React.useState({
+        nickname: settings.nickname || '', bio: settings.bio || '', tags: settings.tags || '',
+        allowGreet: settings.allowGreet !== false,
+      });
+      const [greetDraft, setGreetDraft] = React.useState({});
+      const [saving, setSaving] = React.useState(false);
+
+      React.useEffect(() => { void pmService.refreshSocial(); }, []);
+
+      const saveProfile = () => {
+        setSaving(true);
+        pmService.setSocialProfile(self).then((r) => {
+          setSaving(false);
+          pmService.showToast(r && r.ok ? '资料已更新（在线好友可见）' : '资料保存失败');
+        });
+      };
+
+      const sendGreet = (peerId) => {
+        const text = (greetDraft[peerId] || '').trim();
+        if (!text) return;
+        pmService.greetPeer(peerId, text).then((r) => {
+          if (r && r.ok) {
+            setGreetDraft((prev) => Object.assign({}, prev, { [peerId]: '' }));
+            pmService.showToast('已打招呼（对方上线后会收到）');
+          } else {
+            pmService.showToast('打招呼失败：' + String((r && r.error) || '未知原因'));
+          }
+        });
+      };
+
+      const row = (p, isRec) => h('div', { className: 'pm-discover-row', key: p.peerId },
+        h('div', { className: 'pm-avatar', style: { background: avatarColor(p.peerId), width: 30, height: 30, fontSize: 12 } },
+          ((p.name || p.peerId).slice(0, 1) || '?').toUpperCase()),
+        h('div', { className: 'pm-discover-info' },
+          h('div', { className: 'pm-discover-name' },
+            p.name || shortId(p.peerId),
+            isRec ? h('span', { className: 'pm-discover-badge' }, '推荐') : null,
+            p.allowGreet === false ? h('span', { className: 'pm-discover-badge pm-badge-muted' }, '不收招呼') : null,
+          ),
+          h('div', { className: 'pm-discover-sub' }, p.bio || p.tags || shortId(p.peerId)),
+          h('div', { className: 'pm-discover-sub' }, p.peerId),
+        ),
+        h('div', { className: 'pm-discover-actions' },
+          h('button', {
+            className: 'pm-btn small', type: 'button',
+            onClick: () => pmService.addFriend(p.peerId),
+        }, '加好友'),
+          p.allowGreet === false ? null : h('div', { className: 'pm-greet-box' },
+            h('input', {
+              className: 'pm-greet-input', placeholder: '打招呼…', maxLength: 200,
+              value: greetDraft[p.peerId] || '',
+              onChange: (e) => setGreetDraft((prev) => Object.assign({}, prev, { [p.peerId]: e.target.value })),
+              onKeyDown: (e) => { if (e.key === 'Enter') sendGreet(p.peerId); },
+            }),
+            h('button', { className: 'pm-btn small', type: 'button', onClick: () => sendGreet(p.peerId) }, '发送'),
+          ),
+        ),
+      );
+
+      return h('div', { className: 'pm-modal-overlay', onMouseDown: onClose },
+        h('div', { className: 'pm-modal pm-modal-wide', style: { position: 'relative' }, onMouseDown: (e) => e.stopPropagation() },
+          h('button', { className: 'pm-icon-btn pm-modal-close', type: 'button', onClick: onClose }, '✕'),
+          h('div', { className: 'pm-modal-title' }, '发现 · 在线的人'),
+          social.available === false
+            ? h('div', { className: 'pm-warn' }, '社交层不可用：当前信令不是自建服务器（PM_SIGNAL_URL）。发现/推荐/打招呼需要自建信令。')
+            : null,
+          // 自己的 profile
+          h('div', { className: 'pm-discover-section' },
+            h('div', { className: 'pm-field-label' }, '我的资料（在线好友可见）'),
+            h('div', { className: 'pm-profile-grid' },
+              h('input', {
+                className: 'pm-greet-input', placeholder: '昵称', maxLength: 32, value: self.nickname,
+                onChange: (e) => setSelf(Object.assign({}, self, { nickname: e.target.value })),
+              }),
+              h('input', {
+                className: 'pm-greet-input', placeholder: '一句话简介', maxLength: 200, value: self.bio,
+                onChange: (e) => setSelf(Object.assign({}, self, { bio: e.target.value })),
+              }),
+              h('input', {
+                className: 'pm-greet-input', placeholder: '标签（逗号分隔）', maxLength: 100, value: self.tags,
+                onChange: (e) => setSelf(Object.assign({}, self, { tags: e.target.value })),
+              }),
+              h('label', { className: 'pm-discover-check' },
+                h('input', {
+                  type: 'checkbox', checked: self.allowGreet,
+                  onChange: (e) => setSelf(Object.assign({}, self, { allowGreet: e.target.checked })),
+                }),
+                ' 接受陌生人打招呼',
+              ),
+              h('button', { className: 'pm-btn small primary', type: 'button', disabled: saving, onClick: saveProfile }, saving ? '保存中…' : '保存资料'),
+            ),
+          ),
+          // 推荐
+          recommended.length ? h('div', { className: 'pm-discover-section' },
+            h('div', { className: 'pm-field-label' }, '推荐给你（在线且可打招呼）'),
+            recommended.map((p) => row(p, true)),
+          ) : null,
+          // 全部在线
+          h('div', { className: 'pm-discover-section' },
+            h('div', { className: 'pm-field-label' }, '在线的人（' + people.length + '）'),
+            people.length === 0
+              ? h('div', { className: 'pm-hint' }, '现在没有其他人在线。')
+              : people.filter((p) => p.peerId !== myId).map((p) => row(p, false)),
+          ),
+        ),
+      );
+    }
+
     function PeerMessagePanel() {
       const snap = usePmService();
       const state = snap.state;
@@ -1182,6 +1334,7 @@ window.__ModuleLoader__.load({
       const [nicknameDraft, setNicknameDraft] = React.useState('');
       const [editFriend, setEditFriend] = React.useState(null); // { id, alias, note }
       const [showIdentity, setShowIdentity] = React.useState(false);
+      const [showDiscover, setShowDiscover] = React.useState(false);
 
       // 右键菜单：{ id, left, top }。右键只负责开菜单，绝不直接改好友数据。
       const [ctxMenu, setCtxMenu] = React.useState(null);
@@ -1331,6 +1484,7 @@ window.__ModuleLoader__.load({
               h('button', { className: 'pm-icon-btn', title: '复制 Peer ID', onClick: copyMyId }, '⧉'),
               h('button', { className: 'pm-icon-btn', title: '显示二维码', onClick: () => setShowQR(true), disabled: !myId }, '▦'),
               h('button', { className: 'pm-icon-btn', title: '自动回复设置', onClick: openReplySettings }, '⚙'),
+              h('button', { className: 'pm-icon-btn', title: '发现在线的人 / 我的资料', onClick: () => setShowDiscover(true) }, '🧭'),
             ),
             // 密钥身份的持续表达：始终显示身份是否启用 + 公钥指纹短形式。
             h('div', {
@@ -1698,6 +1852,12 @@ window.__ModuleLoader__.load({
           ),
         ) : null,
 
+        // 发现/推荐/打招呼/profile 弹窗（自建信令社交层）
+        showDiscover ? h(DiscoverPanel, {
+          social: snap.social || { available: false, people: [], recommended: [] },
+          myId,
+          onClose: () => setShowDiscover(false),
+        }) : null,
         // 自动回复设置 / 待批准审核弹窗
         showReplySettings ? h(ReplySettingsModal, {
           initial: reply,

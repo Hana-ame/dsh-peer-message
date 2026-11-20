@@ -148,3 +148,26 @@ test('origin icon: 人工=人形 SVG，AI=DSH 鱼形 mark（不再用 emoji）',
   // 渲染点仍把图标放进 aria-hidden 的 span（纯装饰，文案在旁）
   assert.ok(src.includes("h('span', { className: 'pm-origin-icon', 'aria-hidden': 'true' }, originIcon(m.trigger))"));
 });
+
+test('discover UI: 发现面板接线完整（入口/组件/pmService/状态透传）', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  // 侧栏入口
+  assert.ok(src.includes("title: '发现在线的人 / 我的资料'"), '缺少发现入口按钮');
+  assert.ok(src.includes('const [showDiscover, setShowDiscover] = React.useState(false)'), '缺少 showDiscover 状态');
+  // 组件存在且渲染
+  assert.ok(src.includes('function DiscoverPanel({ social, myId, onClose })'), '缺少 DiscoverPanel 组件');
+  assert.ok(src.includes('showDiscover ? h(DiscoverPanel'), 'DiscoverPanel 未渲染');
+  // 组件内容：profile 编辑 + 推荐 + 在线列表 + 打招呼
+  const block = src.slice(src.indexOf('function DiscoverPanel('), src.indexOf('function PeerMessagePanel()'));
+  for (const kw of ['我的资料', '推荐给你', '在线的人', '打招呼', 'allowGreet', '加好友']) {
+    assert.ok(block.includes(kw), `DiscoverPanel 缺要素: ${kw}`);
+  }
+  // pmService 方法
+  for (const m of ['refreshSocial', 'greetPeer', 'setSocialProfile']) {
+    assert.ok(src.includes(`async ${m}(`) || src.includes(`async ${m}(`), `pmService 缺 ${m}`);
+  }
+  // 状态透传：snapshot → pmService → panel
+  assert.ok(src.includes('social: this.social'), 'getSnapshot 未暴露 social');
+  assert.ok(src.includes('this.social = snap.social'), 'applySnapshot 未接收 social');
+});
