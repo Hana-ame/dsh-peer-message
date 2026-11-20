@@ -185,3 +185,27 @@ test('session control: 前端可按好友开关（编辑弹窗内独立勾选）
   // setFriendProfile 只在显式传 boolean 时提交
   assert.ok(src.includes("if (typeof canControlSession === 'boolean') patch.canControlSession = canControlSession"), '未做 undefined 保护');
 });
+
+test('session control: 纯 P2P——控制请求载荷不含授权状态，服务器不广播', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../server/network.js', import.meta.url), 'utf8');
+
+  // 1) control-request 载荷只有 action + args，不带 canControlSession
+  const rc = src.slice(src.indexOf('requestControl(id, action, args) {'), src.indexOf('requestControl(id, action, args) {') + 900);
+  assert.ok(rc.includes("type: 'control-request'"), '缺少控制请求类型');
+  assert.ok(rc.includes('action: sanitizeText'), '载荷应只有 action');
+  assert.ok(rc.includes('args:'), '载荷应只有 args');
+  assert.ok(!rc.includes('canControlSession'), '发起方不应知道/声明对方是否授权（纯 P2P 单向）');
+
+  // 2) hello 握手不广播控制权限
+  const hello = src.slice(src.indexOf('async function buildHello()'), src.indexOf('async function buildHello()') + 600);
+  assert.ok(!hello.includes('canControl'), 'hello 不应广播控制权限');
+
+  // 3) social profile 推送不含该字段（前一轮已删字段，这里防回归）
+  const push = src.slice(src.indexOf('void social.setProfile({'), src.indexOf('void social.setProfile({') + 500);
+  assert.ok(!/canControl\s*:/.test(push), 'social profile 不应包含 canControl 字段');
+
+  // 4) 授权状态只由「被控方」本机持有：门禁读 findFriend(remoteId)
+  const gate = src.slice(src.indexOf("data.type === 'control-request'"), src.indexOf("data.type === 'SOCIAL-NOTICE'"));
+  assert.ok(gate.includes('findFriend(remoteId)'), '授权判定必须在被控方本地');
+});
