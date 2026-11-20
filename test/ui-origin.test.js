@@ -129,3 +129,22 @@ test('origin: 人可以直接人工回复（待批准弹窗内写回复替代模
   // 明确的来源文案：人 vs AI
   assert.ok(CLIENT.includes("'人工 · 你'") && CLIENT.includes("'人工 · 对方'"));
 });
+
+test('origin icon: 人工=人形 SVG，AI=DSH 鱼形 mark（不再用 emoji）', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+  // 常量 FISH_LOGO_* 定义在 originIcon 之前，切片要从常量起。
+  const block = src.slice(src.indexOf('const FISH_LOGO_PATH'), src.indexOf('// 是否是「人写的」消息'));
+  // 不再返回 emoji 字符
+  assert.ok(!block.includes("'👤'"), '仍在用 👤 emoji');
+  assert.ok(!block.includes("return 'AI'"), 'AI 仍是纯文字');
+  // 人工分支：人形（circle 头 + path 肩）
+  assert.ok(block.includes("h('circle'"), '缺少人形头部');
+  assert.ok(block.includes("M4.8 20.2"), '缺少人形肩部 path');
+  // AI 分支：DSH 官方鱼形 path + viewBox
+  assert.ok(block.includes('FISH_LOGO_PATH'), '缺少鱼形 path 常量');
+  assert.ok(block.includes("FISH_LOGO_VIEWBOX = '0 0 23.16 17.04'"), '鱼形 viewBox 不对');
+  assert.ok(block.includes('pm-origin-fish'), '缺少鱼形 class');
+  // 渲染点仍把图标放进 aria-hidden 的 span（纯装饰，文案在旁）
+  assert.ok(src.includes("h('span', { className: 'pm-origin-icon', 'aria-hidden': 'true' }, originIcon(m.trigger))"));
+});
